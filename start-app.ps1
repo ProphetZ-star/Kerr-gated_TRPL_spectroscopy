@@ -2,7 +2,7 @@ param([switch]$SetupOnly)
 $ErrorActionPreference='Stop'
 Set-Location -LiteralPath $PSScriptRoot
 . (Join-Path $PSScriptRoot 'bootstrap.ps1')
-$appPython=Initialize-KerrEnvironment $PSScriptRoot @('webview','fastapi','uvicorn','scipy','h5py','websockets') 'requirements-desktop.txt'
+$appPython=Initialize-KerrEnvironment $PSScriptRoot @('webview','clr','clr_loader','bottle','proxy_tools','fastapi','uvicorn','numpy','scipy','h5py','pydantic','websockets') 'requirements-desktop.txt'
 if(-not $SetupOnly){
     $windowPython=Join-Path $PSScriptRoot '.venv\Scripts\pythonw.exe'
     if(-not(Test-Path -LiteralPath $windowPython)){$windowPython=$appPython}

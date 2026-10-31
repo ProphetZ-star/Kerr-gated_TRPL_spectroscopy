@@ -35,7 +35,9 @@ cd Kerr-gated_TRPL_spectroscopy
 .\start-app.cmd
 ~~~
 
-第一次启动会探测 64 位 Python 3.12+（py -3.12、py -3、python、python3），创建项目 .venv 并安装 requirements-desktop.txt。环境准备完成后，日常双击 **start-app.vbs** 即可打开无地址栏的独立窗口。
+第一次启动会探测 64 位 Python 3.12+（py -3.12、py -3、python、python3），创建项目 .venv 并安装 requirements-desktop.txt。双击 **start-app.vbs** 会先检查 Python 版本/位数及桌面依赖；环境缺失或依赖不完整时，自动打开 start-app.cmd 显示安装进度，准备完成后启动独立窗口。环境完整时直接隐藏启动。
+
+如果旧下载副本提示 `No module named 'webview'`，请先运行一次 **start-app.cmd** 补装 requirements-desktop.txt，再使用 VBS。网页版 requirements.txt 不包含桌面依赖；GitHub 不分发 .venv，依赖需在本机安装。
 
 仅准备环境而不打开窗口：
 
@@ -119,6 +121,8 @@ node --experimental-vm-modules tests/reported-bugs.cjs
 ~~~
 
 样本默认写入 test-output/data-flow-fixtures.json。独立验证流水线可设置 KERR_FIXTURE_PATH 为各自路径，Python 和 Node 应使用相同值。实验数据、生成样本与测试输出不随源码发布。
+
+桌面依赖自检另有 6 项针对性回归通过（`python -m pytest -q tests/test_desktop_setup.py`）；使用 Windows 脚本宿主和启动替身验证分支，未打开 GUI 或执行真实安装。
 
 可选浏览器检查脚本需要另外安装 playwright 和 Edge；常规数据流检查不需要这些浏览器依赖。早期原型截图和旧 UI-only 校准检查未作为当前实现的验收结果发布。
 
