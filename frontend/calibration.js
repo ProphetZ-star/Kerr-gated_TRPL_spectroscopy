@@ -56,7 +56,7 @@ function renderPairs(){const table=$('calPairs');table.replaceChildren();for(let
  $('calLineCount').textContent=pairs.filter(p=>p.enabled).length+' enabled lines';
 }
 async function fit(){
- const request={...extractionRequest(),degree:Number($('calOrder').value),convention:$('calConvention').value,reference_name:referenceName,reference_source:source,pairs:pairs.map(p=>({pixel:p.pixel,wavelength_nm:p.wave,enabled:p.enabled}))};
+ const request={...extractionRequest(),degree:Number($('calOrder').value),convention:$('calConvention').value,reference_name:referenceName,reference_source:source,pairs:pairs.filter(p=>p.enabled).map(p=>({pixel:p.pixel,wavelength_nm:p.wave,enabled:true}))};
  if(request.pairs.some(p=>!Number.isFinite(p.pixel)||!Number.isFinite(p.wavelength_nm)))throw Error('Assign finite pixels and wavelengths to each line.');
  const wire=await api('/calibration/fit',request),at=p=>wire.coefficients.reduce((sum,c,i)=>sum+c*((p-wire.pixel_origin)/wire.pixel_scale)**i,0);
  solution={wire,at,axis:wire.wavelengths_nm,coefficients:wire.coefficients,degree:wire.degree,rms:wire.rms_nm,max:wire.max_error_nm,range:wire.pixel_range};

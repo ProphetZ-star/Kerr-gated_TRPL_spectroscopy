@@ -1,4 +1,4 @@
-import {api,initialize,requestId,subscribe} from './api.js';
+import {api,initialize,requestId,subscribe,download} from './api.js';
 import {store,axisForRun} from './store.js';
 import {drawAll,clickWave} from './charts.js';
 import {initAnalysis,renderAnalysis,fitOptions,analysisFitState} from './analysis.js';
@@ -11,10 +11,11 @@ function renderViews(){drawAll();renderAnalysis();renderCalibration();}
 let fitRunId=null;
 let fitSelection=null;
 const seenFits=new Set();
+const hiddenFits=new Set();
 let updating=false,pending=false,fetching=false,planTimer,toastTimer,fitTask=null;
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,6000);}
 async function action(fn){if(pending)return;pending=true;try{await fn();await refresh();}catch(e){toast(e.message);}finally{pending=false;}}
-function modal(title,body){$('modalTitle').textContent=title;$('modalBody').replaceChildren(body);$('modal').showModal();}
+function modal(title,body){$('modalTitle').textContent=title;$('modalBody').replaceChildren(body);if(!$('modal').open)$('modal').showModal();}
 function renderSegments(){
  $('segments').replaceChildren();segments.forEach((segment,index)=>{const row=document.createElement('div');row.className='segment-row';
  for(const key of ['start','end','step']){const input=document.createElement('input');input.type='number';input.step='any';input.value=segment[key];input.dataset.index=index;input.dataset.key=key;input.setAttribute('aria-label',`Segment ${index+1} ${key}`);input.oninput=()=>{segments[index][key]=input.value===''?NaN:Number(input.value);schedulePlan();};row.append(input);}
@@ -37,6 +38,9 @@ async function syncRecords(){
  if(fetching||!store.run)return;fetching=true;
  try{const id=store.run.run_id;
   while(id===store.run?.run_id){const page=await api(`/runs/${id}/records?offset=${store.records.length}&limit=100`);if(id!==store.run?.run_id)break;store.records.push(...page.records);if(!page.records.length||store.records.length>=page.total)break;}
+ }catch(error){
+  if(error.status===404||error.status===409){store.run=null;store.records=[];store.fit=null;analysisFitState(false);toast('Experiment changed on the backend. Reloading its current state.');}
+  else throw error;
  }finally{fetching=false;renderViews();}
 }
 function renderStatus(s){
@@ -54,7 +58,7 @@ function renderStatus(s){
  $('runStatus').textContent=label.charAt(0).toUpperCase()+label.slice(1);$('runStatus').className='run-sub '+(run?.status==='error'?'status-danger':'status-neutral');
  $('run').textContent=active?(['paused','pausing'].includes(run.status)?'▶ Resume':'Ⅱ Pause'):'▶ Start';
  $('run').disabled=headerLocked()||!store.online||(busy&&!active)||(['preparing','stopping','finalizing'].includes(run?.status)&&active)||(!s.connected);
- $('stop').disabled=headerLocked()||(!active&&s.busy!=='move')||run?.status==='stopping';
+ $('stop').disabled=headerLocked()||!['scan','move','background','preview'].includes(s.busy)||run?.status==='stopping';
  $('autosave').disabled=busy;$('savePath').disabled=busy;$('path').disabled=busy;
  if(run){
   const pct=100*run.completed_points/run.plan.total_points;
@@ -62,17 +66,21 @@ function renderStatus(s){
   $('saveStatus').textContent=run.error?`Error · ${run.error}`:run.saved?`Saved · ${run.path}`:run.request.autosave?`Writing · ${run.committed_frames} frames`:'Memory only · Not saved';
  }else{$('saveStatus').textContent='No experiment saved';}
  $('saveStatus').title=$('saveStatus').textContent;
- $('export').disabled=!store.records.length;$('saveRun').disabled=busy||!run||run.saved;$('fit').disabled=busy||!store.records.length||!axisForRun();
+ $('export').disabled=!store.records.length||!axisForRun();$('saveRun').disabled=busy||!run||run.saved;$('fit').disabled=busy||!store.records.length||!axisForRun();
  $('runFit').disabled=busy||!store.records.length||!axisForRun();$('discardRun').disabled=busy||!run;
  $('subtractBackground').disabled=!run?.metadata?.background||run.metadata.background.exposure_s!==run.request.exposure_s;
- const cal=s.calibration;$('calibrationState').textContent=cal.wavelengths_nm?`${cal.source} · ${cal.calibration_id}`:'No wavelength calibration · pixel axis';
+ if($('subtractBackground').disabled){$('subtractBackground').checked=false;store.subtract=false;}
+ const cal=s.calibration;$('calibrationState').textContent=s.calibration_warning|| (cal.wavelengths_nm?`${cal.source} · ${cal.calibration_id}`:'No wavelength calibration · pixel axis');
+ $('calibrationState').classList.toggle('error',!!s.calibration_warning);
  $('cameraFacts').textContent=`${s.camera.pixels} pixels · FVB · 16 bit · Andor Newton DU920P simulation`;
  $('frameContext').textContent=s.latest?`Last acquired frame · ${s.latest.delay_ps.toFixed(3)} ps · ${s.latest.exposure_s} s exposure${Math.abs(s.latest.delay_ps-s.stage.delay_ps)>.001?' · Stage moved since this frame':''}`:'No acquired frame';
 }
 async function refresh(){
- if(updating)return;updating=true;
+ if(updating)return;updating=true;let reachable=false;
  try{
-  const s=await api('/status');const first=!store.snapshot;store.online=true;store.snapshot=s;
+  const s=await api('/status');reachable=true;const first=!store.snapshot;
+  if(store.snapshot&&store.snapshot.worker_session_id!==s.worker_session_id){await initialize();store.records=[];store.run=null;store.fit=null;fitTask=null;analysisFitState(false);}
+  store.online=true;store.snapshot=s;
   const changed=s.run?.run_id!==store.run?.run_id;
   if(changed){seenFits.clear();store.records=[];store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;
    $('roundSelect').replaceChildren(new Option('All rounds','all'));for(let i=0;i<(s.run?.plan.rounds??0);i++)$('roundSelect').add(new Option(`Round ${i+1}`,String(i)));store.round='all';
@@ -86,7 +94,7 @@ async function refresh(){
   store.run=s.run;
   if(!fitTask){const restored=newestUnseenFit(store.run,seenFits);if(restored)showFit(restored);}
   renderStatus(s);await syncRecords();renderViews();
- }catch(e){store.online=false;$('runStatus').textContent='Service offline';$('run').disabled=true;$('stop').disabled=true;document.querySelector('.badge').textContent='SERVICE OFFLINE';}
+ }catch(e){if(reachable){toast(e.message);return;}store.online=false;$('runStatus').textContent=e.status===503?'Backend unavailable · restart local service':'Service offline';$('run').disabled=true;$('stop').disabled=true;document.querySelector('.badge').textContent=e.status===503?'BACKEND UNAVAILABLE · Restart local service':'SERVICE OFFLINE';}
  finally{updating=false;}
 }
 async function startFit(){
@@ -95,7 +103,8 @@ async function startFit(){
  catch(e){analysisFitState(false,e.message);throw e;}
 }
 async function checkFit(){
- if(!fitTask)return;const result=await api('/tasks/'+fitTask);if(result.status==='running')return;seenFits.add(fitTask);fitTask=null;
+ if(!fitTask)return;const id=fitTask,result=await api('/tasks/'+id);if(result.status==='running')return;seenFits.add(id);fitTask=null;
+ if(hiddenFits.has(id)||result.status==='cancelled'){analysisFitState(false);return;}
  if(fitRunId!==store.run?.run_id){analysisFitState(false);return;}
  if(fitSelection!==JSON.stringify(fitOptions())){analysisFitState(false,'Fit controls changed; run the fit again to display a matching result.');return;}
  if(result.status==='error'){store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;analysisFitState(false,result.error);toast(result.error);renderViews();return;}
@@ -113,7 +122,7 @@ $('run').onclick=()=>action(async()=>{
  if(store.snapshot?.busy==='scan'){await api(`/runs/${store.run.run_id}/${['paused','pausing'].includes(store.run.status)?'resume':'pause'}`,{});return;}
  await api('/runs',request());
 });
-$('stop').onclick=()=>{if(!headerLocked())return action(()=>api(store.snapshot?.busy==='move'?'/stage/stop':`/runs/${store.run.run_id}/stop`,{}));};
+$('stop').onclick=()=>{if(!headerLocked())return action(()=>api(({move:'/stage/stop',preview:'/preview/stop',background:'/backgrounds/stop'})[store.snapshot?.busy]??`/runs/${store.run?.run_id}/stop`,{}));};
 $('moveAbsolute').onclick=()=>action(()=>api('/stage/move',{delay_ps:n('delay'),relative:false,request_id:requestId()}));
 $('delay').onkeydown=e=>{if(e.key==='Enter')$('moveAbsolute').click();};
 document.querySelectorAll('[data-jog]').forEach(b=>b.onclick=()=>action(()=>api('/stage/move',{delay_ps:Number(b.dataset.jog),relative:true,request_id:requestId()})));
@@ -131,7 +140,7 @@ $('waveSelect').onchange=()=>{store.wave=n('waveSelect');store.fit=null;$('fit')
 $('windowSelect').onchange=()=>{store.halfWindow=n('windowSelect');store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;renderViews();};
 $('roundSelect').onchange=()=>{store.round=$('roundSelect').value;renderViews();};
 $('subtractBackground').onchange=()=>{store.subtract=$('subtractBackground').checked;store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;renderViews();};
-$('fit').onchange=()=>{if($('fit').checked)action(startFit);else{store.fit=null;$('tauValues').hidden=true;renderViews();}};
+$('fit').onchange=()=>{if($('fit').checked)action(startFit);else{if(fitTask){hiddenFits.add(fitTask);seenFits.add(fitTask);void api('/tasks/'+fitTask+'/cancel',{}).catch(e=>toast(e.message));}store.fit=null;$('tauValues').hidden=true;renderViews();}};
 $('runFit').onclick=()=>action(startFit);
 for(const [id,key]of [['spectrumScale','specScale'],['mapScale','mapScale']])document.querySelectorAll('#'+id+' button').forEach(b=>b.onclick=()=>{store[key]=b.dataset.scale;document.querySelectorAll('#'+id+' button').forEach(x=>x.classList.toggle('selected',x===b));renderViews();});
 for(const id of ['spectrum','map'])$(id).onclick=e=>{clickWave(id,e.clientX);$('fit').checked=false;$('tauValues').hidden=true;};
@@ -139,11 +148,11 @@ $('theme').onclick=()=>{document.body.classList.toggle('light');renderViews();};
 function navigate(){const name=['analysis','calibration'].includes(location.hash.slice(1))?location.hash.slice(1):'acquisition';setHeaderPage(name);document.querySelector('.workspace').hidden=name!=='acquisition';document.querySelector('.foot').hidden=name!=='acquisition';$('analysisPage').hidden=name!=='analysis';$('calibrationPage').hidden=name!=='calibration';for(const id of ['acquisition','analysis','calibration'])$(id).classList.toggle('active',id===name);if(store.snapshot){renderStatus(store.snapshot);if(acquisitionPage()&&!store.run&&!store.snapshot.busy)plan();}requestAnimationFrame(renderViews);}
 for(const id of ['acquisition','analysis','calibration'])$(id).onclick=()=>location.hash=id;window.addEventListener('hashchange',navigate);
 $('path').onclick=()=>{const p=document.createElement('p');p.textContent='Enter an output filename in the Save path field. A blank path creates a unique .h5 file in the project data folder. Paths refer to this Windows computer.';modal('Local output path',p);};
-$('export').onclick=async()=>{if(!store.run)return;const url=`/api/v1/runs/${store.run.run_id}/export?center_nm=${store.wave}&half_window_nm=${store.halfWindow}`;try{const r=await fetch(url);if(!r.ok)throw Error((await r.json()).detail);const a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download=`kerr_${store.run.run_id}_simulation.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}catch(e){toast(e.message);}};
+$('export').onclick=async()=>{if(!store.run||!axisForRun())return;const url=`/runs/${store.run.run_id}/export?center_nm=${store.wave}&half_window_nm=${store.halfWindow}`;try{const r=await download(url);const a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download=`kerr_${store.run.run_id}_simulation.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}catch(e){toast(e.message);}};
 $('saveRun').onclick=()=>action(()=>api(`/runs/${store.run.run_id}/save`,{path:$('savePath').value.trim()||`data/${store.run.run_id}.h5`}));
 $('discardRun').onclick=()=>{const box=document.createElement('div'),p=document.createElement('p'),b=document.createElement('button');p.textContent='Discard the in-memory experiment? Existing files are retained.';b.textContent='Discard memory';b.onclick=()=>action(async()=>{await api(`/runs/${store.run.run_id}/discard`,{});$('modal').close();});box.append(p,b);modal('Discard experiment',box);};
 $('openRun').onclick=()=>action(async()=>{await api('/runs/open',{path:$('openPath').value});store.run=null;store.records=[];});
 initAnalysis(renderViews);initCalibration(refresh);renderSegments();navigate();new ResizeObserver(renderViews).observe(document.querySelector('.data'));
-try{await initialize();store.online=true;await refresh();await plan();subscribe(message=>{if(message.type==='spectrum.preview'&&store.snapshot){store.snapshot.latest=message.payload;renderViews();}if(message.type==='run.error')toast(message.payload.message);},connected=>{store.online=connected;});}
+try{await initialize();store.online=true;await refresh();await plan();subscribe(message=>{if(message.type==='stream.gap')void refresh();if(message.type==='spectrum.preview'&&store.snapshot){store.snapshot.latest=message.payload;renderViews();}if(message.type==='run.error')toast(message.payload.message);},connected=>{if(connected)store.online=true;});}
 catch(e){toast('Start the local service using start-sim.ps1. '+e.message);}
 setInterval(async()=>{await refresh();try{await checkFit();}catch(e){fitTask=null;analysisFitState(false,e.message);toast(e.message);}},600);

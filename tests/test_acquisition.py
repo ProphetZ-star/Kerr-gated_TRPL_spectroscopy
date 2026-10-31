@@ -15,11 +15,13 @@ from backend.drivers.sim import SimCamera
 
 
 @pytest.fixture(scope='module')
-def client():
-    with TestClient(app) as c:
-        token=c.get('/api/v1/session').json()['token']
-        c.headers['X-Session-Token']=token
-        yield c
+def client(tmp_path_factory):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv('KERR_STATE_DIR',str(tmp_path_factory.mktemp('acquisition-state')))
+        with TestClient(app) as c:
+            token=c.get('/api/v1/session').json()['token']
+            c.headers['X-Session-Token']=token
+            yield c
 
 
 def request(tmp_path,**changes):

@@ -38,6 +38,8 @@ export function renderAnalysis(){
  let text=fitBusy?'Fitting':fitError?'Fit failed':f?(f.warnings?.length?'Review warnings':'Converged'):!run?'No data':!axis?'Calibration required':'Ready to fit';
  $('analysisFitState').textContent=text;$('analysisFitState').dataset.state=fitError?'error':f?(f.warnings?.length?'warning':'success'):'neutral';
  $('fitStatus').textContent=fitError|| (fitBusy?'Optimizing the selected observed curve…':!run?'Open an experiment or finish an acquisition.':!axis?'This experiment has no recorded wavelength calibration. Applying a new calibration affects future acquisitions only.':store.snapshot?.busy?'Finish acquisition before fitting.':'');
+ const saturated=store.records.filter(r=>r.saturated_pixels&&($('fitStart').value===''||r.delay_ps>=Number($('fitStart').value))&&($('fitEnd').value===''||r.delay_ps<=Number($('fitEnd').value))).length;
+ if(saturated&&!fitError&&!fitBusy)$('fitStatus').textContent=saturated+' saturated frames in the selected time window. Exclude them with Fit start / end, or reacquire at lower exposure.';
  $('fitSampleCount').textContent=f?f.delays_ps.length+' fitted delays':'No fit result';
  $('fitRmse').textContent=f?fmt(Math.sqrt(f.residuals.reduce((s,v)=>s+v*v,0)/f.residuals.length)):'—';
  $('fitCondition').textContent=f?fmt(f.jacobian_condition,3):'—';

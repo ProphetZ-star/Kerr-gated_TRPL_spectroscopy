@@ -122,7 +122,7 @@ class FitRequest(_StrictModel):
     wavelength_nm: float = 600.0
     half_window_nm: float = Field(default=5.0, gt=0)
     model: Literal["single", "double"] = "double"
-    irf_fwhm_ps: float = Field(default=0.25, gt=0)
+    irf_fwhm_ps: float = Field(default=0.25, ge=0.0001, le=100)
     min_delay_ps: float | None = None
     max_delay_ps: float | None = None
 

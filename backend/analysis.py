@@ -3,24 +3,34 @@ import numpy as np
 from .drivers.sim import convolved_decay
 
 
-def fit_records(records, axis, options):
+def fit_records(records, axis, options, cancel=None):
     from scipy.optimize import least_squares
+    from .models import FitRequest
+    from .storage.export import finite_number
+    options=FitRequest(**options.model_dump())
     if axis is None:
         raise ValueError('A valid wavelength calibration is required')
-    wavelengths = np.asarray(axis)
+    wavelengths = np.asarray(axis,dtype=float)
+    if wavelengths.ndim!=1 or not len(wavelengths) or not np.isfinite(wavelengths).all() or np.any(wavelengths<=0):raise ValueError('Wavelength axis must be positive and finite')
     mask = abs(wavelengths-options.wavelength_nm) <= options.half_window_nm
     if not mask.any():
         raise ValueError('No pixels in the selected wavelength window')
     groups = {}
     for r in records:
-        if r['saturated_pixels']:
-            raise ValueError('Saturated records must be excluded before lifetime fitting')
-        t = r['delay_ps']
+        if not isinstance(r,dict) or not {'delay_ps','exposure_s','spectrum','saturated_pixels'}<=r.keys():raise ValueError('Fit record is missing required fields')
+        t=finite_number(r['delay_ps'],'delay_ps')
         if options.min_delay_ps is not None and t < options.min_delay_ps:
             continue
         if options.max_delay_ps is not None and t > options.max_delay_ps:
             continue
-        groups.setdefault(t,[]).append(float(np.mean(np.asarray(r['spectrum'])[mask]))/r['exposure_s'])
+        if r['saturated_pixels']:
+            raise ValueError('Selected fit window includes saturated frames. Narrow the time window to exclude them or reacquire at lower exposure.')
+        exposure=finite_number(r['exposure_s'],'exposure_s',True)
+        spectrum=np.asarray(r['spectrum'],dtype=float)
+        if spectrum.shape!=wavelengths.shape or not np.isfinite(spectrum).all():raise ValueError('Fit spectrum must match the axis and contain only finite counts')
+        value=float(np.mean(spectrum[mask]))/exposure
+        if not np.isfinite(value):raise ValueError('Exposure-normalized counts are non-finite')
+        groups.setdefault(t,[]).append(value)
     t = np.array(sorted(groups))
     if len(t) < (12 if options.model=='double' else 8) or len(t[t>0])<5:
         raise ValueError('Insufficient distinct delays for this model')
@@ -43,7 +53,11 @@ def fit_records(records, axis, options):
             a,tau,t0,c=p
             return a*convolved_decay(t-t0,tau,sigma)+c
         names=['amplitude','tau_ps','t0_ps','offset_counts_s']
-    result=least_squares(lambda p:(predict(p)-y)/scale,initial,bounds=(lower,upper),max_nfev=3000,x_scale='jac')
+    initial=np.clip(initial,np.asarray(lower)+1e-8,np.asarray(upper)-1e-8)
+    def objective(p):
+        if cancel is not None and cancel.is_set():raise ValueError('Fit cancelled')
+        return (predict(p)-y)/scale
+    result=least_squares(objective,initial,bounds=(lower,upper),max_nfev=3000,x_scale='jac')
     if not result.success:
         raise ValueError('Fit did not converge: '+result.message)
     covariance=np.linalg.pinv(result.jac.T@result.jac)*np.sum(result.fun**2)/max(1,len(t)-len(initial))
@@ -56,6 +70,8 @@ def fit_records(records, axis, options):
             standard_errors[a],standard_errors[b]=standard_errors[b],standard_errors[a]
     condition=float(np.linalg.cond(result.jac))
     warnings=[]
+    if options.model=='double' and (values['tau_2_ps']/values['tau_1_ps']<1.5 or min(values['amplitude_1'],values['amplitude_2'])/max(values['amplitude_1']+values['amplitude_2'],1e-12)<.05):
+        warnings.append('The two lifetime components are not well separated or one has negligible amplitude; compare with a single-exponential fit')
     if condition>1e8 or np.any(result.active_mask):
         warnings.append('Ill-conditioned fit or parameter at bound; lifetime uncertainty is unreliable')
     return dict(model=options.model,parameters=values,standard_errors=standard_errors,

@@ -2,7 +2,7 @@
 
 用于光学 Kerr 门时间分辨光致发光（TRPL）的 Python 控制与分析软件，提供独立 Windows 桌面窗口和浏览器工作台。
 
-**当前版本为模拟采集版本。真实仪器尚未联机验证，硬件采集模式没有开放。** 所有模拟信号、运动反馈、温度及校准全图均有模拟来源标记。
+**当前版本 0.1.1 为模拟采集版本。真实仪器尚未联机验证，硬件采集模式没有开放。** 所有模拟信号、运动反馈、温度及校准全图均有模拟来源标记。
 
 ## 已实现
 
@@ -35,7 +35,7 @@ cd Kerr-gated_TRPL_spectroscopy
 .\start-app.cmd
 ~~~
 
-第一次启动会创建项目 .venv 并安装 requirements-desktop.txt。环境准备完成后，日常双击 **start-app.vbs** 即可打开无地址栏的独立窗口。
+第一次启动会探测 64 位 Python 3.12+（py -3.12、py -3、python、python3），创建项目 .venv 并安装 requirements-desktop.txt。环境准备完成后，日常双击 **start-app.vbs** 即可打开无地址栏的独立窗口。
 
 仅准备环境而不打开窗口：
 
@@ -58,7 +58,11 @@ cd Kerr-gated_TRPL_spectroscopy
 .\start-sim.ps1 -Port 8766
 ~~~
 
-已有同项目服务时会复用；其他程序占用端口时会报错。隐藏网页入口自己启动的后端会保持运行，关闭标签页不会停止采集。App 若自行启动后端，退出时会确认活动操作和未保存数据，并关闭它拥有的后端；复用其他入口的服务时不会关闭该服务。
+已有同项目、同代码版本服务时会复用；其他程序或旧版服务占用端口时会报错。升级前请从原窗口或控制台正常停止旧服务。隐藏网页入口自己启动的后端会保持运行，关闭标签页不会停止采集。App 若自行启动后端，退出时会确认活动操作和未保存数据，并关闭它拥有的后端；复用其他入口的服务时不会关闭该服务。
+
+关闭隐藏网页服务可运行 **stop-web.cmd** 或 `start-sim.cmd -Stop -NoBrowser`；若有活动采集或未保存实验，会拒绝关闭，请先停止并保存/丢弃数据。
+
+Windows 虚拟环境启动器与实际 Python 进程可以有不同 PID；现在通过每次启动的独立 launch_id 识别所属服务，避免误关后端造成 127.0.0.1 拒绝连接。launch_id 不用于认证。
 
 也可手动安装、运行：
 
@@ -88,7 +92,7 @@ HDF5 保留 /raw/spectra、/raw/record_index、/raw/record_meta、/raw/committed
 
 Apply 按服务端 solution_id 安装已验证结果，只用于未来采集。**旧实验始终使用采集时保存的波长轴**，不会被当前标定追溯修改。安装标定与手动光谱仪记录保存在 data/installed-calibration.json；原始校准图像和未应用草稿仅在内存缓存中。模拟帧产生的标定始终标为 synthetic。
 
-Analysis 使用所有帧和轮次的原始计数/曝光；显示扣背景和 Acquisition 的显示轮次筛选不改变拟合输入。IRF 是用户指定高斯宽度，参数误差为局部 Jacobian 近似，不是严格置信区间。尚未支持实测 IRF、bootstrap 或自定义坏点剔除。
+Analysis 使用所有帧和轮次的原始计数/曝光；显示扣背景和 Acquisition 的显示轮次筛选不改变拟合输入。IRF 是用户指定高斯宽度，参数误差为局部 Jacobian 近似，不是严格置信区间。IRF FWHM 范围为 0.0001–100 ps。拟合支持协作取消，最多 4 个运行/排队任务，内存保留最近 64 个结果；已写入 HDF5 的结果全部保留。尚未支持实测 IRF、bootstrap 或自定义坏点剔除。
 
 ## 无界面检查
 
@@ -102,7 +106,19 @@ Analysis 使用所有帧和轮次的原始计数/曝光；显示扣背景和 Acq
 node --experimental-vm-modules tests/workbench-flow.cjs
 ~~~
 
-截至 2026-10-31，相关 Python 检查 15 项通过，最新前端模块检查 24 项通过，校准互斥接口回归通过。接口测试使用隔离临时目录和真实 spawn 工作进程；Node 使用最小 DOM 和真实接口响应样本，不打开浏览器或 App。它们不代表视觉和真实硬件验收。
+上述为可选开发检查命令，先前的 15 项 Python / 24 项前端通过记录属于旧版，不能作为本版全量验收。本版按 BUG 报告仅做专项回归：68 项 Python、17 项前端检查通过；随后启动连接修复的 7 项相关检查通过（其中 4 项为新增启动回归，3 项复用报告用例）。没有打开浏览器或 App 窗口，也未连接真实仪器。
+
+专项回归复现（Windows、Node.js）：
+
+~~~powershell
+# 先停止当前 checkout 的服务，避免项目实例锁冲突
+.\.venv\Scripts\python.exe -m pytest -q tests/test_reported_bugs.py tests/test_launcher_connection.py
+# 只生成前端检查所需的合成接口响应样本
+.\.venv\Scripts\python.exe -m pytest -q tests/test_workbench_flow.py::test_calibration_analysis_hdf5_roundtrip
+node --experimental-vm-modules tests/reported-bugs.cjs
+~~~
+
+样本默认写入 test-output/data-flow-fixtures.json。独立验证流水线可设置 KERR_FIXTURE_PATH 为各自路径，Python 和 Node 应使用相同值。实验数据、生成样本与测试输出不随源码发布。
 
 可选浏览器检查脚本需要另外安装 playwright 和 Edge；常规数据流检查不需要这些浏览器依赖。早期原型截图和旧 UI-only 校准检查未作为当前实现的验收结果发布。
 
@@ -113,6 +129,8 @@ node --experimental-vm-modules tests/workbench-flow.cjs
 - desktop.py / desktop_service.py：桌面宿主及本地服务生命周期。
 - browser.py / start-*：网页和桌面入口。
 - tests/：Python 接口/存储测试、Node 前端模块检查与可选浏览器检查。
+- [BUG 修复与专项回归](docs/BUG修复与专项回归.md)：按原报告编号记录修复与边界。
+- [启动连接修复](docs/启动连接修复.md)：Windows PID 归属问题与 HTTP 回归。
 - [数据流检查](docs/数据流检查.md)：接口、元数据和验证边界。
 - [原项目说明](docs/PROJECT_OVERVIEW.md)：仓库原有的项目背景与初始规划。
 - docs/design/：历史设计记录，功能状态以当前 README 为准。

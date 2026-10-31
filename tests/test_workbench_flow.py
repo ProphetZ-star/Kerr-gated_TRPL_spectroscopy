@@ -8,6 +8,8 @@ import re
 import threading
 import time
 import uuid
+import os
+import tempfile
 
 import h5py
 import numpy as np
@@ -118,12 +120,16 @@ def test_calibration_analysis_hdf5_roundtrip(client, tmp_path):
     assert client.post('/api/v1/calibration/apply', json=dict(solution_id=solution['solution_id'])).status_code == 409
 
     # Genuine backend outputs are also consumed by the no-browser JavaScript contract check.
-    artifact = Path(__file__).resolve().parents[1] / 'test-output' / 'data-flow-fixtures.json'
-    artifact.parent.mkdir(exist_ok=True)
-    artifact.write_text(json.dumps(dict(initial_status=initial, frame=frame, extracted=extracted,
+    artifact = Path(os.environ.get('KERR_FIXTURE_PATH',Path(__file__).resolve().parents[1] / 'test-output' / 'data-flow-fixtures.json'))
+    artifact.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=artifact.parent,prefix='.fixture-',suffix='.tmp',delete=False) as stream:
+        temporary=Path(stream.name)
+        stream.write(json.dumps(dict(initial_status=initial, frame=frame, extracted=extracted,
                                        mapping_request=mapping_request, solution=solution, applied_status=applied,
                                        exported=exported, run=reopened, records=records, fit_request=fit_request,
-                                       task=result), allow_nan=False), encoding='utf-8')
+                                       task=result), allow_nan=False))
+    try:os.replace(temporary,artifact)
+    finally:temporary.unlink(missing_ok=True)
 
 
 def test_calibration_validation_busy_and_stale_frames(client, tmp_path):
@@ -135,7 +141,7 @@ def test_calibration_validation_busy_and_stale_frames(client, tmp_path):
     extracted = post(client, '/calibration/extract', dict(frame_id=frame['frame_id']))
     body = calibration_body(frame, extracted)
     duplicate = json.loads(json.dumps(body)); duplicate['pairs'][1]['pixel'] = duplicate['pairs'][0]['pixel']
-    assert client.post('/api/v1/calibration/fit', json=duplicate).status_code == 409
+    assert client.post('/api/v1/calibration/fit', json=duplicate).status_code == 422
     boolean = json.loads(json.dumps(body)); boolean['pairs'][0]['pixel'] = True
     assert client.post('/api/v1/calibration/fit', json=boolean).status_code == 422
     solution = post(client, '/calibration/fit', body)
@@ -164,7 +170,7 @@ def test_analysis_rejects_missing_axis_and_invalid_range(client, tmp_path):
     task = post(client, path, dict(model='single'))
     result = wait_until(lambda: client.get('/api/v1/tasks/' + task['task_id']).json(), lambda t: t['status'] != 'running')
     assert result['status'] == 'error' and 'calibration' in result['error']
-    assert client.get('/api/v1/tasks/missing').status_code == 409
+    assert client.get('/api/v1/tasks/missing').status_code == 404
 
 
 @pytest.mark.parametrize('descending', [False, True])
@@ -236,9 +242,9 @@ def test_fit_completing_during_save_is_persisted(tmp_path, monkeypatch):
     fit_started = threading.Event(); release_fit = threading.Event()
     save_started = threading.Event(); release_save = threading.Event()
     real_fit, real_writer = worker.fit_records, worker.HDFWriter
-    def slow_fit(*args):
+    def slow_fit(*args,**kwargs):
         fit_started.set(); assert release_fit.wait(10)
-        return real_fit(*args)
+        return real_fit(*args,**kwargs)
     def slow_writer(*args):
         writer = real_writer(*args)
         save_started.set(); assert release_save.wait(10)

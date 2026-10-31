@@ -25,7 +25,8 @@ def _coerce_exposure(value: object) -> float:
         value, (int, float, np.integer, np.floating)
     ):
         raise ValueError('exposure_s must be a finite number from 0.001 to 3600')
-    result = float(value)
+    try:result = float(value)
+    except (OverflowError,ValueError,TypeError) as exc:raise ValueError('exposure_s must be a finite number from 0.001 to 3600') from exc
     if not math.isfinite(result) or result < 0.001 or result > 3600.0:
         raise ValueError('exposure_s must be a finite number from 0.001 to 3600')
     return result

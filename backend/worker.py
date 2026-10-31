@@ -15,6 +15,7 @@ from .storage.hdf5 import HDFWriter, choose_path, read_run, append_analysis
 from .storage.export import export_csv
 from .analysis import fit_records
 from .calibration_service import CalibrationWorkbench
+from .errors import CommandError,error_status
 
 
 def now():
@@ -54,6 +55,7 @@ class Engine:
         self.analysis_lock=RLock()
         self.current=None;self.runs={};self.stop=Event();self.pause=Event();self.job=None
         self.commands={};self.tasks={};self.pool=ThreadPoolExecutor(max_workers=1);self.last_preview=0
+        self.task_controls={}
 
     def emit(self, kind, payload):
         with self.lock:
@@ -82,9 +84,18 @@ class Engine:
                         latest=serial(self.latest),live_axis=self.latest_axis,background=serial(self.background),
                         run=self.public_run(self.runs[self.current]) if self.current else None)
 
-    def idle(self):
-        if not self.connected:raise ValueError('Devices are disconnected')
-        if self.busy:raise ValueError('Devices are busy: '+self.busy)
+    def idle(self,devices=True):
+        if devices and not self.connected:raise CommandError('Devices are disconnected')
+        if self.busy:raise CommandError('Devices are busy: '+self.busy)
+
+    def set_exposure(self,exposure):
+        if self.camera.exposure_s!=exposure:
+            self.camera.exposure_s=exposure;self.background=None;self.revision+=1
+
+    def prune_tasks(self):
+        finished=[key for key,value in self.tasks.items() if value['status']!='running']
+        for key in finished[:-64]:
+            self.tasks.pop(key,None);self.task_controls.pop(key,None)
 
     def wait(self,physical_s,speedup):
         if self.stop.wait(max(.001,physical_s/speedup)):
@@ -116,7 +127,7 @@ class Engine:
         self.emit('stage.position',dict(moving=False,controller_reported_mm=target,delay_ps=mm_to_delay(target,self.zero)))
 
     def metadata(self,request,plan,run_id):
-        return dict(meta=dict(schema_version=1,software_version='0.1.0',source_mode='simulation',run_id=run_id,created_utc=now()),
+        return dict(meta=dict(schema_version=1,software_version='0.1.1',source_mode='simulation',run_id=run_id,created_utc=now()),
                     config=dict(request=request,plan=plan,applied=dict(read_mode='fvb',exposure_s=request['exposure_s'],hbin=1)),
                     devices=dict(camera=self.camera.capabilities(),stage=dict(model='PI M-414.32S (simulated)',position_source='simulated_controller')),
                     coordinates=dict(zero_mm=self.zero,zero_version=self.zero_version,path_multiplier=2,delay_sign=1),
@@ -172,7 +183,7 @@ class Engine:
                         self.emit('storage.status',dict(committed_frames=run['committed_frames'],on_disk=bool(writer)))
                     with self.lock:run['completed_points']+=1
                     self.emit('point.committed',dict(completed_points=run['completed_points'],total_points=plan['total_points']))
-                    if self.pause.is_set():
+                    if self.pause.is_set() and run['completed_points']<plan['total_points']:
                         with self.lock:run['status']='paused';run['step']='paused'
                         self.emit('run.state',self.public_run(run))
                         while self.pause.is_set():self.wait(.05,1)
@@ -184,7 +195,9 @@ class Engine:
             terminal='error';run['error']=str(exc)
             self.emit('run.error',dict(message=str(exc),committed_frames=len(run['records'])))
         finally:
-            with self.lock:run['status']='finalizing';run['step']='finalizing'
+            with self.lock:
+                if terminal=='completed' and self.stop.is_set():terminal='stopped'
+                run['status']='finalizing';run['step']='finalizing'
             self.emit('run.state',self.public_run(run))
             try:
                 if writer:
@@ -245,7 +258,7 @@ class Engine:
         if name=='disconnect':
             self.idle();self.connected=False;return self.status()
         if name=='configure':
-            self.idle();self.camera.exposure_s=data['exposure_s'];self.revision+=1;self.background=None
+            self.idle();self.set_exposure(data['exposure_s'])
             return dict(exposure_s=self.camera.exposure_s)
         if name=='move':
             current=mm_to_delay(self.stage.position_mm,self.zero)
@@ -259,12 +272,13 @@ class Engine:
                 empty=dict(calibration_id=None,source=None,wavelengths_nm=None)
                 self.calibration_workbench.persist(empty,data)
                 self.spectrograph=data;self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
+                self.latest_axis=None
                 self.calibration_workbench.invalidate()
                 self.background=None;self.revision+=1
             return self.status()
         if name=='calibration':
             self.idle();self.calibration_workbench.persist(data,self.spectrograph)
-            self.calibration=data;self.revision+=1;return self.status()
+            self.calibration=data;self.latest_axis=copy.deepcopy(data['wavelengths_nm']);self.revision+=1;return self.status()
         if name=='calibration_frame':
             return self.calibration_workbench.current_frame()
         if name=='calibration_capture':
@@ -283,6 +297,7 @@ class Engine:
         if name=='calibration_apply':
             self.idle()
             self.calibration=self.calibration_workbench.installation(data['solution_id'],self.spectrograph)
+            self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm'])
             self.revision+=1
             self.emit('calibration.applied',dict(calibration_id=self.calibration['calibration_id']))
             return self.status()
@@ -297,6 +312,8 @@ class Engine:
                 raise ValueError('Save or explicitly discard the previous memory-only run before starting another')
             run_id=uuid.uuid4().hex[:16]
             path=choose_path(request.save_path,run_id,plan['estimated_bytes']) if request.autosave else None
+            self.set_exposure(request.exposure_s)
+            plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
             metadata=self.metadata(data,plan,run_id);metadata['config']['center_nm']=self.spectrograph['center_nm']
             run=dict(run_id=run_id,status='preparing',step='preparing',request=data,plan=plan,records=[],
                      metadata=metadata,path=str(path) if path else None,saved=False,created_utc=now(),ended_utc=None,
@@ -304,24 +321,32 @@ class Engine:
             self.runs={run_id:run};self.current=run_id;self.camera.exposure_s=request.exposure_s
             self.launch('scan',self.run_scan,run);return self.public_run(run)
         if name in {'pause','resume','stop'}:
-            run=self.runs.get(data['run_id'])
-            if not run or self.current!=data['run_id'] or self.busy!='scan':raise ValueError('No matching active run')
-            if name=='pause':
-                if run['status']!='running':raise ValueError('Run is not running')
-                self.pause.set();run['status']='pausing'
-            elif name=='resume':
-                if run['status'] not in {'paused','pausing'}:raise ValueError('Run is not paused')
-                self.pause.clear();run['status']='running'
-            else:
-                self.stop.set();self.pause.clear();run['status']='stopping'
+            with self.lock:
+                run=self.runs.get(data['run_id'])
+                if not run or self.current!=data['run_id'] or self.busy!='scan':raise CommandError('No matching active run')
+                if run['status'] not in {'running','paused','pausing','stopping'}:raise CommandError('Run is finalizing or already finished')
+                if name=='pause':
+                    if run['status'] in {'paused','pausing'}:return self.public_run(run)
+                    if run['status']!='running':raise CommandError('Run is stopping')
+                    self.pause.set();run['status']='pausing'
+                elif name=='resume':
+                    if run['status']=='running':return self.public_run(run)
+                    if run['status'] not in {'paused','pausing'}:raise CommandError('Run is not paused')
+                    self.pause.clear();run['status']='running'
+                else:
+                    self.stop.set();self.pause.clear();run['status']='stopping'
             self.emit('run.state',self.public_run(run));return self.public_run(run)
         if name=='preview_start':self.launch('preview',self.preview);return dict(accepted=True)
-        if name in {'preview_stop','stage_stop'}:
-            if self.busy not in {'preview','move',None}:raise ValueError('Stop the active scan using its run ID')
+        if name in {'preview_stop','stage_stop','background_stop'}:
+            expected={'preview_stop':'preview','stage_stop':'move','background_stop':'background'}[name]
+            if self.busy is None:return dict(accepted=True)
+            if self.busy!=expected:
+                hint='Stop the active scan using its run ID' if self.busy=='scan' else f'Use the {self.busy} stop operation'
+                raise CommandError(hint)
             self.stop.set();return dict(accepted=True)
         if name=='background':self.launch('background',self.acquire_background,data);return dict(accepted=True)
         if name=='open':
-            self.idle()
+            self.idle(devices=False)
             if self.current and not self.runs[self.current]['saved'] and self.runs[self.current]['records']:raise ValueError('Save or discard the current run first')
             metadata,records,terminal=read_run(data['path']);run_id=metadata['meta']['run_id']
             run=dict(run_id=run_id,status=terminal,step='idle',metadata=metadata,records=records,
@@ -331,18 +356,20 @@ class Engine:
                      created_utc=metadata['meta']['created_utc'],ended_utc=None,error=None)
             self.runs={run_id:run};self.current=run_id;self.latest=records[-1] if records else None
             self.latest_axis=metadata['calibration']['wavelengths_nm']
+            self.set_exposure(run['request']['exposure_s'])
             return self.public_run(run)
         if name in {'get_run','records','export','save','fit','discard'}:
             run=self.runs.get(data.get('run_id',self.current))
-            if not run:raise ValueError('Run not found')
+            if not run:raise CommandError('Run not found',404)
             if name=='get_run':return self.public_run(run)
             if name=='records':
                 offset=data.get('offset',0);limit=data.get('limit',100)
                 return dict(records=serial(run['records'][offset:offset+limit]),total=len(run['records']))
             if name=='export':
-                return export_csv(serial(run['records']),run['metadata']['calibration']['wavelengths_nm'],data['center_nm'],data['half_window_nm'],run['metadata']['meta']['source_mode'])
+                if run['metadata']['calibration']['wavelengths_nm'] is None:raise CommandError('Wavelength calibration is required for export')
+                return export_csv(run['records'],run['metadata']['calibration']['wavelengths_nm'],data['center_nm'],data['half_window_nm'],run['metadata']['meta']['source_mode'])
             if name=='save':
-                self.idle()
+                self.idle(devices=False)
                 with self.analysis_lock:
                     if run['saved']:return self.public_run(run)
                     path=choose_path(data.get('path'),run['run_id'],run['plan']['estimated_bytes'])
@@ -353,28 +380,45 @@ class Engine:
                         writer.call('close','error');raise
                     run['path']=writer.call('close',run['status']);run['saved']=True;return self.public_run(run)
             if name=='discard':
-                self.idle();self.runs={};self.current=None;return dict(discarded=True)
+                self.idle(devices=False);self.runs={};self.current=None;self.latest=None;self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm']);return dict(discarded=True)
             if name=='fit':
-                self.idle()
+                self.idle(devices=False)
+                self.prune_tasks()
+                if sum(t['status']=='running' for t in self.tasks.values())>=4:raise CommandError('Four fit tasks are already running or queued; wait or cancel a task')
+                if not run['saved'] and len(run['metadata'].get('analysis',{}))+sum(t['status']=='running' and t.get('run_id')==run['run_id'] for t in self.tasks.values())>=64:
+                    raise CommandError('Save this memory-only experiment before creating more than 64 fit results')
                 options=FitRequest(**data['options']);task_id=uuid.uuid4().hex[:16]
                 records=list(run['records']);axis=copy.deepcopy(run['metadata']['calibration']['wavelengths_nm'])
                 self.tasks[task_id]=dict(status='running',run_id=run['run_id'])
+                cancel=Event();self.task_controls[task_id]=dict(cancel=cancel)
                 def fit():
                     try:
-                        result=fit_records(records,axis,options)
+                        result=fit_records(records,axis,options,cancel=cancel)
                         result['request']=options.model_dump()
                         result['run_id']=run['run_id'];result['task_id']=task_id
                         result['record_count']=len(records)
                         result['finished_utc']=now()
+                        if cancel.is_set():raise ValueError('Fit cancelled')
                         with self.analysis_lock:
                             if run['saved']:append_analysis(run['path'],task_id,result)
-                            with self.lock:run['metadata'].setdefault('analysis',{})[task_id]=result
+                            with self.lock:
+                                history=run['metadata'].setdefault('analysis',{});history[task_id]=result
+                                if run['saved']:
+                                    while len(history)>64:history.pop(next(iter(history)))
                             self.tasks[task_id]=dict(status='completed',run_id=run['run_id'],result=result)
-                    except Exception as exc:self.tasks[task_id]=dict(status='error',error=str(exc))
+                    except Exception as exc:self.tasks[task_id]=dict(status='cancelled' if cancel.is_set() else 'error',run_id=run['run_id'],error=str(exc))
                     self.emit('analysis.ready',dict(task_id=task_id,**self.tasks[task_id]))
-                self.pool.submit(fit);return dict(task_id=task_id)
+                    self.prune_tasks()
+                self.task_controls[task_id]['future']=self.pool.submit(fit);return dict(task_id=task_id)
+        if name=='task_cancel':
+            task=self.tasks.get(data['task_id'])
+            if task is None:raise CommandError('Task not found',404)
+            if task['status']=='running':
+                control=self.task_controls[data['task_id']];control['cancel'].set()
+                if control['future'].cancel():task['status']='cancelled'
+            return dict(task_id=data['task_id'],**task)
         if name=='task':
-            if data['task_id'] not in self.tasks:raise ValueError('Task not found')
+            if data['task_id'] not in self.tasks:raise CommandError('Task not found',404)
             return self.tasks[data['task_id']]
         raise ValueError('Unknown command: '+name)
 
@@ -385,11 +429,12 @@ def worker_main(commands,responses,events):
         message=commands.get()
         if message['name']=='shutdown':
             engine.stop.set();engine.pause.clear()
+            for control in engine.task_controls.values():control['cancel'].set()
             if engine.job:engine.job.join(10)
-            engine.pool.shutdown(wait=False,cancel_futures=True)
+            engine.pool.shutdown(wait=True,cancel_futures=True)
             return
         try:
             result=engine.handle(message['name'],message['data'])
             responses.put(dict(id=message['id'],result=serial(result)))
         except Exception as exc:
-            responses.put(dict(id=message['id'],error=str(exc),error_type=type(exc).__name__))
+            responses.put(dict(id=message['id'],error=str(exc),error_type=type(exc).__name__,status_code=error_status(exc,message['name'])))

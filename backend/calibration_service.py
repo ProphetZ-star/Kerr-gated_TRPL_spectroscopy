@@ -6,8 +6,14 @@ import json
 import os
 import tempfile
 import uuid
+import time
+from threading import Lock,RLock
 
 from .models import CalibrationRequest, SpectrographConfig
+from .errors import CommandError
+
+_LOCKS={}
+_LOCKS_GUARD=Lock()
 
 
 def timestamp():
@@ -18,6 +24,7 @@ class CalibrationWorkbench:
     def __init__(self):
         self.directory = Path(os.environ.get('KERR_STATE_DIR', Path(__file__).resolve().parents[1] / 'data'))
         self.path = self.directory / 'installed-calibration.json'
+        with _LOCKS_GUARD:self.persistence_lock=_LOCKS.setdefault(str(self.path.resolve()),RLock())
         self.frame = None
         self.solutions = {}
         self.warning = None
@@ -34,14 +41,19 @@ class CalibrationWorkbench:
 
     def restore(self, spectrograph):
         if not self.path.exists():
+            self.warning=None
             return None
         try:
-            payload = json.loads(self.path.read_text(encoding='utf-8'))
+            with self.persistence_lock:payload = json.loads(self.path.read_text(encoding='utf-8'))
             if payload['version'] != 1 or payload['spectrograph'] != spectrograph:
                 raise ValueError('Saved calibration does not match the manual spectrograph settings')
             calibration = payload['calibration']
+            if not isinstance(calibration,dict) or not {'calibration_id','source','wavelengths_nm'}<=calibration.keys():raise ValueError('Calibration is missing required fields')
             if calibration['wavelengths_nm'] is not None:
                 CalibrationRequest(**{k: calibration[k] for k in ('calibration_id', 'source', 'wavelengths_nm')})
+            elif (calibration['calibration_id'],calibration['source'])!=(None,None):
+                CalibrationRequest(**{k:calibration[k] for k in ('calibration_id','source','wavelengths_nm')})
+            self.warning=None
             return calibration
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.warning = f'Saved calibration was not restored: {exc}'
@@ -58,7 +70,12 @@ class CalibrationWorkbench:
                           ensure_ascii=False, allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            with self.persistence_lock:
+                for attempt in range(10):
+                    try:os.replace(temporary,self.path);break
+                    except PermissionError as exc:
+                        if attempt==9:raise ValueError('Calibration file is in use. Close the external reader and retry; the previous calibration is retained.') from exc
+                        time.sleep(min(.01*2**attempt,.1))
             self.warning = None
         finally:
             if temporary is not None:
@@ -87,10 +104,10 @@ class CalibrationWorkbench:
 
     def require_frame(self, frame_id, spectrograph):
         if self.frame is None or self.frame['header']['frame_id'] != frame_id:
-            raise ValueError('Calibration frame expired; acquire or reload the current frame')
+            raise CommandError('Calibration frame expired; acquire or reload the current frame')
         if self.frame['header']['spectrograph'] != spectrograph:
-            raise ValueError('Spectrograph settings changed; acquire a new calibration frame')
-        return self.frame
+            raise CommandError('Spectrograph settings changed; acquire a new calibration frame')
+        return deepcopy(self.frame)
 
     def extract(self, data, spectrograph):
         from .calibration import ExtractRequest, extract_profile
@@ -105,7 +122,7 @@ class CalibrationWorkbench:
         frame = self.require_frame(request.frame_id, spectrograph)
         extraction = extract_profile(frame['image'], request.row_start, request.row_end)
         if extraction['saturated_pixels']:
-            raise ValueError('Calibration ROI contains saturated pixels; reduce exposure and acquire again')
+            raise CommandError('Calibration ROI contains saturated pixels; reduce exposure and acquire again')
         solution = fit_mapping(request)
         identifier = uuid.uuid4().hex
         solution.update(solution_id=identifier, calibration_id=f'spectral-{identifier}', source='synthetic',
@@ -120,7 +137,7 @@ class CalibrationWorkbench:
 
     def solution(self, identifier):
         if identifier not in self.solutions:
-            raise ValueError('Calibration solution expired; fit the mapping again')
+            raise CommandError('Calibration solution expired; fit the mapping again')
         return deepcopy(self.solutions[identifier])
 
     def installation(self, identifier, spectrograph):
@@ -132,4 +149,5 @@ class CalibrationWorkbench:
                            wavelengths_nm=solution['wavelengths_nm'], convention=solution['convention'],
                            installed_utc=timestamp(), provenance=solution | dict(applied=True))
         self.persist(calibration, spectrograph)
+        for cached in self.solutions.values():cached['applied']=cached['solution_id']==identifier
         return calibration

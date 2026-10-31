@@ -5,8 +5,35 @@ from queue import Queue
 from threading import Thread
 import json
 import shutil
+import heapq
 import h5py
 import numpy as np
+
+
+def strict_json(value):
+    def numpy_value(item):
+        if isinstance(item,np.generic):return item.item()
+        if isinstance(item,np.ndarray):return item.tolist()
+        raise TypeError(f'Unsupported metadata type: {type(item).__name__}')
+    return json.dumps(value,ensure_ascii=False,allow_nan=False,default=numpy_value)
+
+
+def parse_json(value):
+    def nonfinite(token):raise ValueError(f'Non-finite JSON value: {token}')
+    return json.loads(value,parse_constant=nonfinite)
+
+
+def validate_record(record):
+    from .export import finite_number
+    if not isinstance(record,dict) or not {'spectrum','record_id','round_index','point_index','frame_index','delay_ps','exposure_s'}<=record.keys():
+        raise ValueError('Experiment record is missing required fields')
+    spectrum=np.asarray(record['spectrum'])
+    if spectrum.shape!=(1024,) or spectrum.dtype.kind not in 'iu' or np.any(spectrum<np.iinfo(np.int32).min) or np.any(spectrum>np.iinfo(np.int32).max):
+        raise ValueError('Raw spectrum must contain exactly 1024 int32-compatible integer counts')
+    for key in ('record_id','round_index','point_index','frame_index'):
+        if isinstance(record[key],(bool,np.bool_)) or not isinstance(record[key],(int,np.integer)) or record[key]<0:
+            raise ValueError(f'{key} must be a nonnegative integer')
+    finite_number(record['delay_ps'],'delay_ps');finite_number(record['exposure_s'],'exposure_s',True)
 
 
 def choose_path(path, run_id, estimate=0):
@@ -24,13 +51,17 @@ def choose_path(path, run_id, estimate=0):
 
 class HDFWriter:
     def __init__(self, path, metadata):
+        strict_json(metadata)  # Validate before creating an output file.
         self.path = Path(path)
         self.partial = self.path.with_suffix('.partial.h5')
         self.tasks = Queue(maxsize=8)
         self.ready = Future()
         self.thread = Thread(target=self._loop, args=(metadata,), daemon=True, name='hdf-writer')
         self.thread.start()
-        self.ready.result(timeout=15)
+        try:self.ready.result(timeout=15)
+        except Exception:
+            self.thread.join(2)
+            raise
 
     def call(self, operation, value=None):
         future = Future()
@@ -40,12 +71,14 @@ class HDFWriter:
     def _loop(self, metadata):
         file = None
         log = None
+        created=False;initialized=False;created_log=False
         try:
             file = h5py.File(self.partial, 'x')
+            created=True
             text = h5py.string_dtype('utf-8')
             for key in ['meta','config','devices','coordinates','calibration','background','simulation']:
                 group = file.create_group(key)
-                group.attrs['json'] = json.dumps(metadata.get(key,{}), ensure_ascii=False)
+                group.attrs['json'] = strict_json(metadata.get(key,{}))
             file.create_group('derived')
             analysis=file.create_group('analysis')
             for task_id,result in metadata.get('analysis',{}).items():
@@ -57,7 +90,9 @@ class HDFWriter:
             committed = raw.create_dataset('committed',(0,),maxshape=(None,),dtype='?')
             events = file.create_dataset('events',(0,),maxshape=(None,),dtype=text)
             log = self.path.with_suffix('.events.jsonl').open('x',encoding='utf-8')
+            created_log=True
             file.flush()
+            initialized=True
             self.ready.set_result(True)
             failure = None
             while True:
@@ -67,6 +102,8 @@ class HDFWriter:
                         if failure:
                             raise RuntimeError(failure)
                         record = value
+                        validate_record(record)
+                        record_json=strict_json({k:v for k,v in record.items() if k not in {'spectrum','inject_write_failure'}})
                         if record.get('inject_write_failure'):
                             raise OSError('Injected disk write failure')
                         i = len(spectra)
@@ -74,16 +111,17 @@ class HDFWriter:
                         indices.resize(i+1,axis=0); committed.resize(i+1,axis=0)
                         committed[i] = False
                         spectra[i] = record['spectrum']
-                        record_meta[i] = json.dumps({k:v for k,v in record.items() if k not in {'spectrum','inject_write_failure'}})
+                        record_meta[i] = record_json
                         indices[i] = [record[k] for k in ['record_id','round_index','point_index','frame_index']]
                         file.flush()
                         committed[i] = True
                         file.flush()
                     elif operation == 'event':
+                        line=strict_json(value)
                         i = len(events); events.resize(i+1,axis=0)
-                        line = json.dumps(value,ensure_ascii=False)
                         events[i] = line; log.write(line+'\n'); log.flush(); file.flush()
                     elif operation == 'close':
+                        if value not in {'completed','stopped','error'}:raise ValueError('Invalid terminal status')
                         file['meta'].attrs['terminal_status'] = value
                         file.flush(); file.close(); file=None
                         log.close(); log=None
@@ -110,29 +148,58 @@ class HDFWriter:
                 file.close()
             if log is not None:
                 log.close()
+            if created and not initialized:
+                self.partial.unlink(missing_ok=True)
+                if created_log:self.path.with_suffix('.events.jsonl').unlink(missing_ok=True)
 
 
-def read_run(path):
+def _read_run(path):
     with h5py.File(path, 'r') as f:
         if 'raw/spectra' not in f or 'raw/committed' not in f:
             raise ValueError('Unsupported experiment file')
         if f['raw/spectra'].ndim!=2 or f['raw/spectra'].shape[1]!=1024:
             raise ValueError('This release reads 1024-pixel FVB files only')
+        if f['raw/spectra'].dtype.kind not in 'iu':raise ValueError('Raw spectra must have an integer dtype')
+        if f['raw/committed'].ndim!=1 or f['raw/record_meta'].ndim!=1:raise ValueError('Invalid raw record dimensions')
         valid = np.flatnonzero(f['raw/committed'][:])
         if len(valid)>25000:
             raise ValueError('File exceeds this release\'s 25,000-record limit')
+        if len(valid) and valid[-1]>=min(len(f['raw/spectra']),len(f['raw/record_meta'])):raise ValueError('Committed record exceeds available spectra/metadata')
         records=[]
         for i in valid:
-            meta=json.loads(f['raw/record_meta'][i])
+            meta=parse_json(f['raw/record_meta'][i])
             meta['spectrum']=f['raw/spectra'][i]
+            validate_record(meta)
             records.append(meta)
-        metadata={k:json.loads(f[k].attrs['json']) for k in ['meta','config','devices','coordinates','calibration','background','simulation']}
-        metadata['analysis']={name:json.loads(value[()]) for name,value in f.get('analysis',{}).items()}
-        return metadata,records,str(f['meta'].attrs.get('terminal_status','partial'))
+        metadata={k:parse_json(f[k].attrs['json']) for k in ['meta','config','devices','coordinates','calibration','background','simulation']}
+        if any(not isinstance(metadata[k],dict) for k in ['meta','config','devices','coordinates','calibration','simulation']):raise ValueError('Invalid experiment metadata shape')
+        from ..models import RunRequest
+        RunRequest(**metadata['config']['request'])
+        if not isinstance(metadata['meta']['run_id'],str) or not metadata['meta']['run_id'] or not metadata['meta']['created_utc']:raise ValueError('Invalid experiment identity')
+        if not isinstance(metadata['config']['plan'],dict):raise ValueError('Missing experiment scan plan')
+        if not {'rounds','total_points','total_frames','delays_ps'}<=metadata['config']['plan'].keys():raise ValueError('Incomplete experiment scan plan')
+        recent=[]
+        for name,value in f.get('analysis',{}).items():
+            result=parse_json(value[()])
+            if not isinstance(result,dict):raise ValueError('Invalid analysis result')
+            heapq.heappush(recent,(str(result.get('finished_utc','')),name,result))
+            if len(recent)>64:heapq.heappop(recent)
+        metadata['analysis']={name:result for _,name,result in sorted(recent)}
+        terminal=str(f['meta'].attrs.get('terminal_status','partial'))
+        if terminal not in {'completed','stopped','error','partial'}:raise ValueError('Invalid experiment terminal status')
+        return metadata,records,terminal
+
+
+def read_run(path):
+    if not Path(path).is_file():raise FileNotFoundError('Experiment file does not exist')
+    try:return _read_run(path)
+    except (OSError,KeyError,IndexError,TypeError,OverflowError,ValueError) as exc:
+        raise ValueError(f'Invalid or damaged experiment file: {exc}') from exc
 
 
 def append_analysis(path,task_id,result):
     """Only used after live acquisition has finalized and closed its writer."""
     with h5py.File(path,'r+') as file:
+        if task_id in file['analysis']:raise ValueError('Analysis task already exists in this experiment')
         file['analysis'].create_dataset(task_id,data=json.dumps(result,allow_nan=False),dtype=h5py.string_dtype('utf-8'))
         file.flush()

@@ -3,6 +3,8 @@ from html import escape
 from pathlib import Path
 import os
 import traceback
+from log_utils import rotate_file,CappedStream
+from desktop_instance import DesktopInstance
 
 ROOT=Path(__file__).resolve().parent
 ERROR_LOG=ROOT/'data'/'desktop-error.log'
@@ -50,7 +52,9 @@ def _error_page(exc):
 def _write_log(message,exc):
     try:
         ERROR_LOG.parent.mkdir(parents=True,exist_ok=True)
+        rotate_file(ERROR_LOG)
         with ERROR_LOG.open('a',encoding='utf-8') as stream:
+            stream=CappedStream(stream)
             stream.write(os.linesep)
             stream.write(message)
             stream.write(os.linesep)
@@ -77,6 +81,9 @@ def create_desktop(url,on_closing=None,on_started=None):
             return bool(on_closing(window))
         window.events.closing+=closing
     def run_started():
+        if getattr(getattr(webview,'guilib',None),'renderer','edgechromium')!='edgechromium':
+            error=RuntimeError('Microsoft Edge WebView2 Runtime is required. Install it and reopen Kerr Studio; the legacy MSHTML renderer is unsupported.')
+            _write_log('WebView2 unavailable',error);window.load_html(_error_page(error));return
         on_started(window)
     webview.start(func=run_started if on_started is not None else None,gui='edgechromium',
                   debug=False,private_mode=True,storage_path=str(storage))
@@ -84,6 +91,13 @@ def create_desktop(url,on_closing=None,on_started=None):
 
 
 def main():
+    instance=DesktopInstance(ROOT)
+    if not instance.acquire():return 0
+    try:return run_desktop()
+    finally:instance.close()
+
+
+def run_desktop():
     import threading
     from desktop_service import LocalService
     service=LocalService()
@@ -91,6 +105,8 @@ def main():
     startup_finished=threading.Event()
     startup_failed=threading.Event()
     gui_closed=threading.Event()
+    close_approved=threading.Event()
+    close_check=threading.Event()
 
     def bootstrap(window):
         startup_started.set()
@@ -111,21 +127,33 @@ def main():
                     pass
         finally:
             startup_finished.set()
+            if gui_closed.is_set():
+                try:service.close()
+                except Exception as exc:_write_log('Cancelled-startup cleanup failed',exc)
 
     def closing_window(window):
         if not startup_finished.is_set():
-            return False
+            gui_closed.set();service.cancel_startup.set()
+            return True
         if startup_failed.is_set():
             return True
-        return service.confirm_close(window)
+        if close_approved.is_set() or not service.owned:return True
+        if not close_check.is_set():
+            close_check.set()
+            def check():
+                try:
+                    if service.confirm_close(window):
+                        close_approved.set();window.destroy()
+                finally:close_check.clear()
+            threading.Thread(target=check,daemon=True).start()
+        return False
 
     try:
         return create_desktop(None,on_closing=closing_window,on_started=bootstrap)
     finally:
         gui_closed.set()
-        if startup_started.is_set():
-            startup_finished.wait()
-        service.close()
+        service.cancel_startup.set()
+        if startup_finished.is_set() or not startup_started.is_set():service.close()
 
 
 if __name__=='__main__':

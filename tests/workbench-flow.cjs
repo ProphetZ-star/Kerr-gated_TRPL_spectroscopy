@@ -1,7 +1,7 @@
 // Execute actual frontend modules in a minimal DOM, using genuine API fixtures. No browser/UI.
 const fs=require('fs'),path=require('path'),vm=require('vm'),assert=require('node:assert/strict');
 const root=path.resolve(__dirname,'..');
-const fixtures=JSON.parse(fs.readFileSync(path.join(root,'test-output/data-flow-fixtures.json'),'utf8'));
+const fixtures=JSON.parse(fs.readFileSync(process.env.KERR_FIXTURE_PATH||path.join(root,'test-output/data-flow-fixtures.json'),'utf8'));
 const clone=value=>JSON.parse(JSON.stringify(value));
 class Element{
  constructor(tag='div'){this.tagName=tag;this.children=[];this.value='';this.hidden=false;this.disabled=false;this.checked=false;this.textContent='';this.style={};this.dataset={};this.attrs={};this.classes=new Set();this.classList={toggle:(c,v)=>v===undefined?(this.classes.has(c)?this.classes.delete(c):this.classes.add(c)):v?this.classes.add(c):this.classes.delete(c),contains:c=>this.classes.has(c)};}

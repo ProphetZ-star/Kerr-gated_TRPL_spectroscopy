@@ -1,6 +1,15 @@
 import csv
 import io
 import math
+from numbers import Real, Integral
+
+
+def finite_number(value, name, positive=False):
+    if isinstance(value,bool) or not isinstance(value,Real):raise ValueError(f'{name} must be a number')
+    try:valid=math.isfinite(value)
+    except (TypeError,OverflowError):valid=False
+    if not valid or (positive and value<=0):raise ValueError(f'{name} must be finite'+(' and > 0' if positive else ''))
+    return float(value)
 
 
 def export_csv(
@@ -22,21 +31,12 @@ def export_csv(
     wavelengths = list(wavelengths_nm)
     if not wavelengths:
         raise ValueError("wavelength calibration is empty")
-    for w in wavelengths:
-        if not isinstance(w, (int, float)) or isinstance(w, bool):
-            raise ValueError("wavelengths_nm must contain numbers")
-        if not math.isfinite(w):
-            raise ValueError("wavelengths_nm must contain only finite values")
+    wavelengths=[finite_number(w,'wavelengths_nm',True) for w in wavelengths]
 
-    if not isinstance(half_window_nm, (int, float)) or isinstance(half_window_nm, bool):
-        raise ValueError("half_window_nm must be a number")
-    if not math.isfinite(half_window_nm) or half_window_nm <= 0:
-        raise ValueError("half_window_nm must be finite and > 0")
-
-    if not isinstance(center_nm, (int, float)) or isinstance(center_nm, bool):
-        raise ValueError("center_nm must be a number")
-    if not math.isfinite(center_nm):
-        raise ValueError("center_nm must be finite")
+    half_window_nm=finite_number(half_window_nm,'half_window_nm',True)
+    center_nm=finite_number(center_nm,'center_nm',True)
+    if not isinstance(source_mode,str) or not source_mode or any(ord(c)<32 or ord(c)==127 for c in source_mode):
+        raise ValueError('source_mode must be a nonempty single-line label')
 
     if not min(wavelengths) <= center_nm <= max(wavelengths):
         raise ValueError("center_nm is outside the calibrated range")
@@ -73,6 +73,10 @@ def export_csv(
     )
 
     for record in records:
+        required={'spectrum','record_id','round_index','point_index','frame_index','delay_ps','exposure_s'}
+        if not isinstance(record,dict) or not required<=record.keys():raise ValueError('CSV record is missing required fields')
+        for key in ('record_id','round_index','point_index','frame_index'):
+            if isinstance(record[key],bool) or not isinstance(record[key],Integral) or record[key]<0:raise ValueError(f'{key} must be a nonnegative integer')
         spectrum = record["spectrum"]
         if len(spectrum) != n_pixels:
             raise ValueError(
@@ -83,28 +87,13 @@ def export_csv(
         total = 0
         for i in included:
             value = spectrum[i]
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(
-                    f"record {record.get('record_id')!r}: non-numeric spectrum value"
-                )
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"record {record.get('record_id')!r}: non-finite spectrum value"
-                )
-            total += value
+            total += finite_number(value,'spectrum value')
 
         mean_counts = total / len(included)
 
-        delay_ps = record["delay_ps"]
-        exposure_s = record["exposure_s"]
-        if not math.isfinite(delay_ps):
-            raise ValueError(
-                f"record {record.get('record_id')!r}: non-finite delay_ps"
-            )
-        if not math.isfinite(exposure_s):
-            raise ValueError(
-                f"record {record.get('record_id')!r}: non-finite exposure_s"
-            )
+        if not math.isfinite(mean_counts):raise ValueError('Mean spectrum count is non-finite')
+        delay_ps=finite_number(record['delay_ps'],'delay_ps')
+        exposure_s=finite_number(record['exposure_s'],'exposure_s',True)
 
         writer.writerow(
             [

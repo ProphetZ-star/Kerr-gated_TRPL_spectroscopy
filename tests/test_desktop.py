@@ -27,7 +27,7 @@ def test_cancel_close_preserves_memory(monkeypatch):
 def test_close_stops_scan_before_exit(monkeypatch):
     service=LocalService();service.process=Mock()
     calls=[]
-    def request(path,body=None):
+    def request(path,body=None,**kwargs):
         calls.append((path,body))
         if len(calls)==1:return dict(busy='scan',run=dict(run_id='test',committed_frames=3,saved=False))
         return dict(busy=None)
@@ -42,6 +42,7 @@ def test_own_process_shutdown_file(tmp_path):
     service.process=process;service.stop_file=tmp_path/'stop';service.log=Mock()
     def wait(timeout):
         assert service.stop_file.exists()
+        process.poll.return_value=0
         return 0
     process.wait.side_effect=wait
     service.close()

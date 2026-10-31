@@ -4,6 +4,9 @@ import asyncio
 import json
 import os
 import secrets
+import math
+from datetime import datetime, timezone
+from fastapi.exceptions import RequestValidationError
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +16,8 @@ from .manager import WorkerManager
 from .models import (RunRequest, MoveRequest, CameraConfig, BackgroundRequest,
                      SpectrographConfig, CalibrationRequest, FitRequest)
 from .calibration_models import CaptureRequest, ExtractRequest, MappingRequest, ApplyRequest
+from .errors import CommandError
+from .identity import identity
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -49,15 +54,29 @@ def acquire_instance_lock():
 async def lifespan(app):
     instance=acquire_instance_lock()
     app.state.token=secrets.token_urlsafe(32)
-    app.state.worker=await asyncio.to_thread(WorkerManager)
-    try:yield
+    try:
+        app.state.worker=await asyncio.to_thread(WorkerManager)
+        yield
     finally:
-        await asyncio.to_thread(app.state.worker.close)
+        if hasattr(app.state,'worker'):await asyncio.to_thread(app.state.worker.close)
         instance.close()
 
 
-app=FastAPI(title='Kerr Studio local acquisition',version='0.1.0',lifespan=lifespan)
+app=FastAPI(title='Kerr Studio local acquisition',version='0.1.1',lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware,allowed_hosts=['127.0.0.1','localhost','testserver'])
+
+
+def json_safe(value):
+    if isinstance(value,float) and not math.isfinite(value):return str(value)
+    if isinstance(value,dict):return {str(k):json_safe(v) for k,v in value.items()}
+    if isinstance(value,(list,tuple)):return [json_safe(v) for v in value]
+    if value is None or isinstance(value,(str,int,float,bool)):return value
+    return str(value)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request,exc):
+    return JSONResponse(status_code=422,content={'detail':json_safe(exc.errors())})
 
 
 @app.middleware('http')
@@ -78,6 +97,7 @@ async def local_session(request:Request,call_next):
 
 async def call(name,data=None):
     try:return await asyncio.to_thread(app.state.worker.call,name,data or {})
+    except CommandError as exc:raise HTTPException(exc.status_code,str(exc)) from exc
     except ValueError as exc:raise HTTPException(409,str(exc)) from exc
     except (RuntimeError,TimeoutError) as exc:raise HTTPException(503,str(exc)) from exc
 
@@ -98,6 +118,27 @@ async def session():
 
 @app.get('/api/v1/status')
 async def status():return await call('status')
+
+
+@app.get('/api/v1/identity')
+async def service_identity():return identity()|dict(process_id=os.getpid(),launch_id=getattr(app.state,'launch_id',None))
+
+
+@app.get('/api/v1/health')
+async def service_health():
+    process=getattr(app.state.worker,'process',None)
+    return dict(worker_alive=process.is_alive() if process is not None else True)
+
+
+@app.post('/api/v1/service/stop')
+async def stop_service():
+    state=await call('status');run=state.get('run')
+    if state['busy'] or (run and run['committed_frames'] and not run['saved']):
+        raise HTTPException(409,'Stop acquisition and save or discard the memory experiment before stopping the service')
+    shutdown=getattr(app.state,'request_shutdown',None)
+    if shutdown is None:raise HTTPException(409,'This server must be stopped from its owning console')
+    asyncio.get_running_loop().call_later(.2,shutdown)
+    return dict(stopping=True)
 
 
 @app.get('/api/v1/devices/capabilities')
@@ -136,6 +177,10 @@ async def preview(action:str):
 
 @app.post('/api/v1/backgrounds')
 async def background(body:BackgroundRequest):return await call('background',body.model_dump())
+
+
+@app.post('/api/v1/backgrounds/stop')
+async def background_stop():return await call('background_stop')
 
 
 @app.post('/api/v1/spectrograph/config')
@@ -204,8 +249,14 @@ async def fit(run_id:str,body:FitRequest):return await call('fit',dict(run_id=ru
 async def task(task_id:str):return await call('task',dict(task_id=task_id))
 
 
+@app.post('/api/v1/tasks/{task_id}/cancel')
+async def cancel_task(task_id:str):return await call('task_cancel',dict(task_id=task_id))
+
+
 @app.get('/api/v1/runs/{run_id}/export')
 async def export(run_id:str,center_nm:float=600,half_window_nm:float=5):
+    if not math.isfinite(center_nm) or center_nm<=0 or not math.isfinite(half_window_nm) or half_window_nm<=0:
+        raise HTTPException(422,'Wavelength and half-window must be positive finite numbers')
     text=await call('export',dict(run_id=run_id,center_nm=center_nm,half_window_nm=half_window_nm))
     return PlainTextResponse(text,media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="kerr_{run_id}_simulation.csv"'})
 
@@ -223,16 +274,24 @@ async def events(websocket:WebSocket):
     if (origin and origin!=expected) or not secrets.compare_digest(websocket.cookies.get('kerr_session',''),app.state.token):
         await websocket.close(code=1008);return
     await websocket.accept()
-    snapshot=await call('status');seq=snapshot['seq']
-    await websocket.send_json(dict(type='snapshot',payload=snapshot,seq=seq))
     try:
+        snapshot=await call('status');seq=snapshot['seq']
+        def envelope(kind,payload=None):
+            return dict(type=kind,seq=seq,schema_version=1,worker_session_id=snapshot['worker_session_id'],
+                        timestamp_utc=datetime.now(timezone.utc).isoformat(),payload=payload or {})
+        await websocket.send_json(envelope('snapshot',snapshot))
         while True:
+            process=getattr(app.state.worker,'process',None)
+            if process is not None and not process.is_alive():
+                raise RuntimeError('Acquisition worker stopped. Restart the local backend.')
             batch=app.state.worker.after(seq)
             if batch:
                 for message in batch:
                     await websocket.send_json(message);seq=message['seq']
             else:
-                # Also detects a dead worker and recovers dropped presentation events.
-                await websocket.send_json(dict(type='heartbeat',seq=seq))
+                await websocket.send_json(envelope('heartbeat',dict(worker_alive=True)))
             await asyncio.sleep(.2)
-    except (WebSocketDisconnect,RuntimeError,OSError):pass
+    except WebSocketDisconnect:pass
+    except (HTTPException,RuntimeError,OSError,TimeoutError):
+        try:await websocket.close(code=1011,reason='Acquisition worker unavailable; restart the local backend')
+        except (RuntimeError,OSError):pass

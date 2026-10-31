@@ -25,7 +25,10 @@ function format(v){return Math.abs(v)>=1000?(v/1000).toFixed(1)+'k':Number(v.toF
 function line(q,data,color,dash=[]){
  const {ctx,p,x,y}=q;ctx.save();ctx.beginPath();ctx.rect(p.l,p.t,p.r-p.l,p.b-p.t);ctx.clip();ctx.beginPath();let started=false;
  for(const [a,b] of data){if(!Number.isFinite(a)||!Number.isFinite(b)){started=false;continue;}if(started)ctx.lineTo(x(a),y(b));else ctx.moveTo(x(a),y(b));started=true;}
- ctx.strokeStyle=color;ctx.lineWidth=2;ctx.setLineDash(dash);ctx.stroke();ctx.restore();
+ ctx.strokeStyle=color;ctx.lineWidth=2;ctx.setLineDash(dash);ctx.stroke();
+ const finite=data.filter(([a,b])=>Number.isFinite(a)&&Number.isFinite(b));
+ if(finite.length===1){ctx.beginPath();ctx.fillStyle=color;ctx.arc(x(finite[0][0]),y(finite[0][1]),2.5,0,Math.PI*2);ctx.fill();}
+ ctx.restore();
 }
 function empty(q,text){q.ctx.fillStyle=css('--muted');q.ctx.textAlign='center';q.ctx.fillText(text,(q.p.l+q.p.r)/2,(q.p.t+q.p.b)/2);}
 let spectrumQ,mapQ;
@@ -33,7 +36,7 @@ export function clickWave(id,clientX){
  const q=id==='spectrum'?spectrumQ:mapQ;if(!q)return;
  const c=$(id),px=clientX-c.getBoundingClientRect().left;
  if(px<q.p.l||px>q.p.r)return;
- const axis=id==='spectrum'?store.snapshot?.calibration?.wavelengths_nm:axisForRun();if(!axis)return;
+ const axis=id==='spectrum'?store.snapshot?.live_axis:axisForRun();if(!axis)return;
  store.wave=q.xmin+(px-q.p.l)/(q.p.r-q.p.l)*(q.xmax-q.xmin);
  $('waveSelect').value=store.wave.toFixed(2);store.fit=null;drawAll();
 }
