@@ -1,108 +1,122 @@
-# Kerr-gated TRPL Spectroscopy
+# Kerr-gated TRPL Spectroscopy · Kerr Studio
 
-Python software for controlling a **CCD-based spectrometer** and a **motorized optical delay stage** to perform **optical Kerr-gated time-resolved photoluminescence (TRPL) spectroscopy**.
+用于光学 Kerr 门时间分辨光致发光（TRPL）的 Python 控制与分析软件，提供独立 Windows 桌面窗口和浏览器工作台。
 
-> **Project status:** Under development. Hardware drivers, acquisition scripts, and command-line interfaces will be added as they are implemented. The workflows below describe the intended functionality, not currently available commands.
+**当前版本为模拟采集版本。真实仪器尚未联机验证，硬件采集模式没有开放。** 所有模拟信号、运动反馈、温度及校准全图均有模拟来源标记。
 
-## Overview
+## 已实现
 
-Optical Kerr gating enables ultrafast, time-resolved photoluminescence measurements by using a short gate pulse to induce transient birefringence in a Kerr medium. A pair of crossed polarizers suppresses the ungated photoluminescence, while the gate pulse briefly opens the optical gate. By scanning the relative delay between the gate pulse and the photoluminescence, a spectrometer and CCD record the time evolution of the emission spectrum.
+- **Acquisition**：实时光谱、非均匀延迟二维图、Single / Scan / Repeat、分段扫描、每点多帧、暂停/继续与停止。
+- **存储**：原始 int32 光谱、逐帧提交记录、HDF5 自动保存/内存保存、重开实验与 CSV 导出。
+- **Analysis**：按实验保存的波长轴提取原始计数/曝光曲线；单/双指数与用户给定高斯 IRF 卷积拟合、时间范围、参数近似误差、残差及 CSV。
+- **Spectral Calibration**：后端模拟 1024×255 CCD 全图、ROI 行均值提谱、亚像素找峰、参考 CSV、人工谱线配对、1–3 阶拟合、标定应用/导出与持久化。
+- **桌面入口**：pywebview + WebView2 独立窗口；先显示加载页，再后台启动/复用本机后端。
+- **互斥操作**：Analysis 顶栏正常工作；Spectral Calibration 在采集时锁定校准操作，空闲时锁定顶栏采集操作，暂停和收尾仍视为忙碌。
 
-This project aims to automate **delay-stage positioning**, **CCD/spectrometer acquisition**, and **data storage** in a single Python workflow.
+## 目标硬件
 
-## Planned Features
+| 部件 | 型号/连接 | 当前状态 |
+|---|---|---|
+| CCD | Andor Newton DU920P，1024 光谱像素 | 模拟 FVB；预留 pylablib → 官方 SDK2 适配入口，未联机验收 |
+| 延迟台 | PI M-414.32S，USB | 模拟控制；仍需确认配套控制器型号、轴号、参考状态及安装限位 |
+| 光谱仪 | Oriel 77400 / MS125 | 手动设置记录与波长标定；不发送光谱仪调节命令 |
 
-- Initialize and communicate with the CCD camera, spectrometer, and motorized delay stage.
-- Configure CCD acquisition settings, such as exposure time, number of accumulations, and readout parameters (where supported by the hardware).
-- Scan a user-defined range of pump–gate delays with configurable step size and settling time.
-- Acquire and average photoluminescence spectra at each delay.
-- Record dark/background spectra and optionally gate-off reference spectra.
-- Display spectra and a time–wavelength intensity map during acquisition.
-- Save raw measurements, experimental settings, and acquisition metadata for later analysis.
-- Handle hardware errors and provide a safe stop procedure.
+双程光路采用 $\Delta t=2\Delta x/c$，1 ps 对应约 0.149896229 mm 位移。延迟正负号、光学零点和真实运动限位需要在实际装置上确认。
 
-## Experimental Setup
+真实连接请求会明确报错，不会静默回退成模拟设备。模拟运行不需要 Andor SDK、pylablib 或 PI DLL；仓库不分发厂商 SDK。
 
-```text
-Excitation laser ──> Sample ──> PL collection optics ──> Polarizer 1 ──┐
-                                                                      │
-Gate laser ──> Motorized delay stage ───────────────────────────────> Kerr medium
-                                                                      │
-                                                               Polarizer 2
-                                                                      │
-                                                                 Spectrometer
-                                                                      │
-                                                                     CCD
-                                                                      │
-                                                                   Python
-```
+## Windows 安装与启动
 
-*The diagram is schematic. The actual beam geometry, delay-arm location, and optical components depend on the experiment.*
+需要 **64 位 Python 3.12+**。桌面模式还需要 Windows WebView2 Runtime。
 
-## Hardware and Software
+~~~powershell
+git clone https://github.com/ProphetZ-star/Kerr-gated_TRPL_spectroscopy.git
+cd Kerr-gated_TRPL_spectroscopy
+.\start-app.cmd
+~~~
 
-**Hardware interfaces to be configured:**
+第一次启动会创建项目 .venv 并安装 requirements-desktop.txt。环境准备完成后，日常双击 **start-app.vbs** 即可打开无地址栏的独立窗口。
 
-- **CCD camera:** manufacturer, model, SDK, and connection interface to be specified.
-- **Spectrometer:** wavelength calibration and any motorized controls to be specified.
-- **Delay stage:** controller, communication protocol, travel limits, and homing procedure to be specified.
+仅准备环境而不打开窗口：
 
-**Software:** Python 3.10+ is a suggested development target. Actual dependencies will depend on the selected camera SDK and delay-stage controller; installation instructions will be added once the interfaces are implemented.
+~~~powershell
+.\start-app.ps1 -SetupOnly
+~~~
 
-## Intended Measurement Workflow
+### 浏览器模式
 
-1. Connect to the CCD, spectrometer, and delay-stage controller.
-2. Validate hardware status, stage limits, and acquisition parameters.
-3. Configure CCD exposure, readout settings, and spectral acquisition parameters.
-4. Set or measure the time-zero position, then define the delay scan.
-5. At each delay point, move the stage, wait for stabilization, and acquire the requested spectra.
-6. Save the raw spectra together with wavelength, delay, stage position, acquisition settings, and timestamps.
-7. Optionally apply background subtraction and plot the wavelength–time TRPL map.
-8. Stop acquisition safely and close hardware connections.
+首次运行 **start-sim.cmd** 准备环境并打开网页；环境准备好后，可双击 **start-web.vbs**。本机地址为 http://127.0.0.1:8765 ，服务就绪后自动打开。不要直接双击 index.html，也不要在后端未运行时只输入网址。
 
-### Delay Calibration
+~~~powershell
+# 有控制台的入口；自己启动的服务可用 Ctrl+C 正常停止
+.\start-sim.ps1
 
-For a delay arm with a retroreflector in a **double-pass** configuration, a stage displacement \(\Delta x\) changes the optical delay by
+# 只启动服务
+.\start-sim.ps1 -NoBrowser
 
-\[
-\Delta t = \frac{2\Delta x}{c},
-\]
+# 指定端口
+.\start-sim.ps1 -Port 8766
+~~~
 
-where \(c\) is the speed of light in vacuum. Thus, **1 mm of stage travel corresponds to approximately 6.67 ps** of optical delay in air. For a single-pass geometry, the factor of 2 does not apply. The sign of the delay and the time-zero offset must be established experimentally.
+已有同项目服务时会复用；其他程序占用端口时会报错。隐藏网页入口自己启动的后端会保持运行，关闭标签页不会停止采集。App 若自行启动后端，退出时会确认活动操作和未保存数据，并关闭它拥有的后端；复用其他入口的服务时不会关闭该服务。
 
-## Proposed Data Organization
+也可手动安装、运行：
 
-Each scan should retain both raw data and sufficient metadata for reproducibility. For example:
+~~~powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m backend
+~~~
 
-```text
-data/
-└── YYYYMMDD_HHMMSS_scan/
-    ├── spectra.csv       # Rows: delay points; columns: wavelengths
-    ├── delays.csv        # Delay values and corresponding stage positions
-    ├── metadata.json     # Instrument settings and scan parameters
-    └── background.csv    # Optional dark/background spectrum
-```
+其他平台可运行 Python 后端和浏览器界面；此仓库的启动脚本及桌面宿主以 Windows 为目标。
 
-The output format and folder structure are **proposed conventions** and may change during development. Raw data should be preserved; processed results should be stored separately.
+## 采集与数据
 
-## Safety and Measurement Notes
+1. 预览信号，设置曝光、延迟扫描分段及 Scan / Single / Repeat。
+2. 点击 Start；Pause 在完整点提交后暂停，Stop 保留已提交的完整帧。
+3. Autosave 默认开启；路径为空时写入 data/ 内唯一 HDF5 文件。内存采集结束后可在 Analysis 中 Save HDF5。
+4. Analysis 可通过本机绝对文件路径重开本程序生成的实验。
+5. 默认每轮最多 5001 点、10 个分段，总计最多 25000 帧；内存模式另设 128 MiB 原始记录估算限额。
 
-- Confirm the stage is homed and its travel limits are valid before moving it.
-- Avoid stage collisions and check that the selected scan range is physically accessible.
-- Follow laser-safety procedures and protect the CCD against excessive optical power.
-- Keep the CCD acquisition conditions consistent across a delay scan.
-- Measure backgrounds and periodically verify the optical time zero.
-- Distinguish optical delay sign conventions from the recorded stage coordinate.
+HDF5 保留 /raw/spectra、/raw/record_index、/raw/record_meta、/raw/committed，以及设备、标定、背景、坐标、模拟来源和分析元数据。采集中使用 .partial.h5，正常结束或停止后完成终态命名；异常文件保留供恢复。CSV 导出每个已采单帧的窗口像素平均原始计数，不随显示背景扣除变化。
 
-## Roadmap
+已完成帧的 flush 不等于突然断电时必然可恢复。原始实验数据、日志、WebView 缓存、虚拟环境和本地标定安装文件均被 Git 忽略。
 
-- [ ] Implement camera communication and spectral acquisition.
-- [ ] Implement delay-stage control and position feedback.
-- [ ] Integrate synchronized stage scanning and CCD acquisition.
-- [ ] Add configuration, logging, and error handling.
-- [ ] Add live plotting and standardized data export.
-- [ ] Validate timing calibration, background subtraction, and measurement repeatability.
+## 波长标定与 Analysis
 
-## License
+校准页的图像、提谱、找峰和拟合均来自后端；前端负责显示与人工配对。参考 CSV 为 wavelength_nm,relative_intensity（强度列可省略），示例谱线不是灯谱数据库。支持递增/递减轴；拟合检查重复配对、秩、病态条件数和整个连续 CCD 区间的折返，并提示外推区域。air/vacuum 仅记录约定，不自动换算。
 
-A license has not yet been selected.
+Apply 按服务端 solution_id 安装已验证结果，只用于未来采集。**旧实验始终使用采集时保存的波长轴**，不会被当前标定追溯修改。安装标定与手动光谱仪记录保存在 data/installed-calibration.json；原始校准图像和未应用草稿仅在内存缓存中。模拟帧产生的标定始终标为 synthetic。
+
+Analysis 使用所有帧和轮次的原始计数/曝光；显示扣背景和 Acquisition 的显示轮次筛选不改变拟合输入。IRF 是用户指定高斯宽度，参数误差为局部 Jacobian 近似，不是严格置信区间。尚未支持实测 IRF、bootstrap 或自定义坏点剔除。
+
+## 无界面检查
+
+先安装开发与桌面依赖（桌面测试使用 mock，不打开窗口）：
+
+~~~powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt -r requirements-desktop.txt
+.\.venv\Scripts\python.exe -m pytest -q tests/test_workbench_flow.py tests/test_desktop.py --junitxml=test-output/workbench-python.xml
+
+# Python 生成真实后端响应样本后，用 Node.js 执行前端模块契约检查
+node --experimental-vm-modules tests/workbench-flow.cjs
+~~~
+
+截至 2026-10-31，相关 Python 检查 15 项通过，最新前端模块检查 24 项通过，校准互斥接口回归通过。接口测试使用隔离临时目录和真实 spawn 工作进程；Node 使用最小 DOM 和真实接口响应样本，不打开浏览器或 App。它们不代表视觉和真实硬件验收。
+
+可选浏览器检查脚本需要另外安装 playwright 和 Edge；常规数据流检查不需要这些浏览器依赖。早期原型截图和旧 UI-only 校准检查未作为当前实现的验收结果发布。
+
+## 项目结构
+
+- backend/：FastAPI、进程通信、采集/拟合、校准和 HDF5。
+- frontend/：工作台界面、状态、图表、分析与校准交互。
+- desktop.py / desktop_service.py：桌面宿主及本地服务生命周期。
+- browser.py / start-*：网页和桌面入口。
+- tests/：Python 接口/存储测试、Node 前端模块检查与可选浏览器检查。
+- [数据流检查](docs/数据流检查.md)：接口、元数据和验证边界。
+- [原项目说明](docs/PROJECT_OVERVIEW.md)：仓库原有的项目背景与初始规划。
+- docs/design/：历史设计记录，功能状态以当前 README 为准。
+
+后端默认仅监听本机；写入接口使用会话 token，拒绝跨源请求，并通过实例锁避免重复占用设备。API 文档位于运行后的 /docs。日志位于 data/desktop-service.log、data/desktop-error.log 和 data/browser-error.log。
+
+DeepSeek 参与过部分界面及校准计算初稿；主模型完成集成、数据流修正和验证。许可证尚未选择，未添加授权条款。
