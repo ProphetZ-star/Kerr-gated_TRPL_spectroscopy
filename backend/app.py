@@ -5,6 +5,8 @@ import json
 import os
 import secrets
 import math
+import uuid
+from urllib.parse import unquote
 from datetime import datetime, timezone
 from fastapi.exceptions import RequestValidationError
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -32,6 +34,16 @@ class ConnectBody(SmallBody):
 
 class PathBody(SmallBody):
     path: str=Field(min_length=1,max_length=4096)
+
+
+class SaveBody(PathBody):
+    overwrite_token: str|None=Field(default=None,min_length=64,max_length=64)
+
+
+class EmptyServiceStopBody(SmallBody):
+    checkout_id: str=Field(min_length=64,max_length=64)
+    process_id: int=Field(gt=0)
+    worker_session_id: str=Field(min_length=1,max_length=128)
 
 
 def acquire_instance_lock():
@@ -141,6 +153,17 @@ async def stop_service():
     return dict(stopping=True)
 
 
+@app.post('/api/v1/service/stop-if-empty')
+async def stop_empty_service(body:EmptyServiceStopBody):
+    if body.checkout_id!=identity()['checkout_id'] or body.process_id!=os.getpid():
+        raise HTTPException(409,'The local service identity changed; it will remain running')
+    shutdown=getattr(app.state,'request_shutdown',None)
+    if shutdown is None:raise HTTPException(409,'This server must be stopped from its owning console')
+    result=await call('prepare_empty_shutdown',dict(worker_session_id=body.worker_session_id))
+    asyncio.get_running_loop().call_later(.2,shutdown)
+    return result
+
+
 @app.get('/api/v1/devices/capabilities')
 async def capabilities():return await call('capabilities')
 
@@ -219,12 +242,38 @@ async def calibration_apply(body:ApplyRequest):return await call('calibration_ap
 async def plan(body:RunRequest):return await call('plan',body.model_dump())
 
 
+@app.post('/api/v1/output/check')
+async def check_output(body:PathBody):return await call('output_check',body.model_dump())
+
+
 @app.post('/api/v1/runs')
 async def run(body:RunRequest):return await call('run',body.model_dump())
 
 
 @app.post('/api/v1/runs/open')
 async def open_run(body:PathBody):return await call('open',body.model_dump())
+
+
+@app.post('/api/v1/runs/import')
+async def import_run(request:Request):
+    name=unquote(request.headers.get('x-file-name','experiment.h5')).replace('\\','/').split('/')[-1]
+    if not name.lower().endswith('.h5'):raise HTTPException(422,'Choose an HDF5 .h5 file')
+    directory=ROOT/'data'/'imports'/uuid.uuid4().hex
+    directory.mkdir(parents=True)
+    # Keep a local imported copy for later fit persistence, never rewrite the
+    # user's selected source file through a browser upload.
+    target=directory/'experiment.h5'
+    try:
+        size=0
+        with target.open('xb') as stream:
+            async for chunk in request.stream():
+                size+=len(chunk)
+                if size>256*1024**2:raise HTTPException(413,'This browser import supports files up to 256 MiB')
+                await asyncio.to_thread(stream.write,chunk)
+        if not size:raise HTTPException(422,'The selected HDF5 file is empty')
+        return await call('open',dict(path=str(target)))
+    except BaseException:
+        target.unlink(missing_ok=True);directory.rmdir();raise
 
 
 @app.get('/api/v1/runs/{run_id}')
@@ -238,7 +287,7 @@ async def records(run_id:str,offset:int=0,limit:int=100):
 
 
 @app.post('/api/v1/runs/{run_id}/save')
-async def save(run_id:str,body:PathBody):return await call('save',dict(run_id=run_id,path=body.path))
+async def save(run_id:str,body:SaveBody):return await call('save',dict(run_id=run_id,**body.model_dump()))
 
 
 @app.post('/api/v1/runs/{run_id}/fits')

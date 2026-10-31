@@ -1,0 +1,25 @@
+/* All plots use the extracted-spectrum palette, with or without data. */
+:root{--no-data:var(--plot);--summary-panel-height:clamp(190px,27vh,240px)}
+body.light{--plot:#e4edf7;--no-data:var(--plot)}
+.plot-axes-button{position:absolute;z-index:3;right:3px;top:3px;height:23px;min-height:23px;padding:0 6px;font-size:10px;opacity:.78;background:var(--surface);border-color:var(--line)}
+.plot-axes-button:hover,.plot-axes-button:focus-visible{opacity:1}
+.axis-form fieldset{margin-top:14px;border:1px solid var(--line);border-radius:6px;padding:12px}
+.axis-form legend{font-size:13px;padding:0 5px;color:var(--text)}
+.axis-form .row{margin-bottom:9px}.axis-form .grid{gap:12px}
+.axis-form input:disabled{opacity:.55}
+.acquisition-heading #preview{height:27px;min-height:27px;padding:0 8px;font-size:11px}
+.analysis-results{grid-template-rows:minmax(310px,1fr) var(--summary-panel-height)}
+.analysis-bottom{height:var(--summary-panel-height);min-height:0;overflow:hidden}
+.analysis-quality{overflow:auto}
+.cal-results{grid-template-rows:minmax(180px,1fr) minmax(180px,1fr) var(--summary-panel-height)}
+@media(max-width:999px),(max-height:719px){
+ .analysis-results{grid-template-rows:480px var(--summary-panel-height)}
+ .analysis-bottom{grid-template-columns:minmax(0,1fr) minmax(180px,.65fr)}
+ .cal-results{grid-template-rows:240px 240px auto}
+ .cal-lower{grid-template-rows:var(--summary-panel-height) 280px}
+}
+@media(max-width:750px){
+ .analysis-results{grid-template-rows:480px auto}
+ .analysis-bottom{height:auto;grid-template-columns:1fr;grid-auto-rows:var(--summary-panel-height)}
+ .cal-results{grid-template-rows:250px 250px auto}
+}

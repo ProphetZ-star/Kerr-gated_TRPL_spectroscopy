@@ -67,6 +67,7 @@ class RunRequest(_StrictModel):
     exposure_s: float = Field(default=1.0, ge=0.001, le=3600.0)
     frames_per_point: int = Field(default=1, ge=1, le=100)
     save_path: str | None = None
+    overwrite_token: str | None = Field(default=None,min_length=64,max_length=64)
     autosave: bool = True
     seed: int = Field(default=42, ge=0, le=2147483647)
     speedup: float = Field(default=50.0, ge=1.0, le=1000.0)

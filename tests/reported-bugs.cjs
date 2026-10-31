@@ -8,7 +8,7 @@ async function loaded(changes={}){const run=clone(fx.run);run.metadata.analysis=
 
 check('FE-01: expired token refreshes once and retries rejected write',async()=>{
  const h=createHarness();await bootApp(h);const n=h.requestsMatching('/api/v1/session').length;h.state.token='rotated';await h.click('run');
- assert.equal(h.requestsMatching('/api/v1/session').length,n+1);const requests=h.requestsMatching('/api/v1/runs').filter(r=>r.url==='/api/v1/runs');assert.equal(requests.filter(r=>r.rejected).length,1);assert.equal(requests.filter(r=>!r.rejected).length,1);
+ assert.equal(h.requestsMatching('/api/v1/session').length,n+1);const requests=h.requests.filter(r=>r.url==='/api/v1/runs'||r.url==='/api/v1/output/check');assert.equal(requests.filter(r=>r.rejected).length,1);assert.equal(requests.filter(r=>r.url==='/api/v1/runs'&&!r.rejected).length,1);
 });
 check('FE-01: worker session change refreshes token proactively',async()=>{
  const h=createHarness();await bootApp(h);h.state.token='new';h.setStatus({worker_session_id:'restarted'});await h.tick(600);await h.click('run');assert.ok(h.requestsMatching('/api/v1/session').length>=2);assert.ok(!h.requestsMatching('/api/v1/runs').some(r=>r.rejected));
@@ -32,7 +32,7 @@ check('FE-06: export without experiment calibration is blocked',async()=>{
  const h=await loaded();h.patchStatus(s=>{s.run.metadata.calibration.wavelengths_nm=null;return s;});await h.tick(600);assert.equal(h.get('export').disabled,true);const count=h.requests.length;await h.click('export');assert.equal(h.requests.length,count);
 });
 check('FE-07: mismatched background clears checkbox and subtraction state',async()=>{
- const h=await loaded();h.store().subtract=true;h.setChecked('subtractBackground',true);h.patchStatus(s=>{s.run.metadata.background={exposure_s:99,spectrum:Array(1024).fill(10)};return s;});await h.tick(600);assert.equal(h.get('subtractBackground').disabled,true);assert.equal(h.get('subtractBackground').checked,false);assert.equal(h.store().subtract,false);
+ const h=await loaded();h.store().subtract=true;h.patchStatus(s=>{s.run.metadata.background={exposure_s:99,spectrum:Array(1024).fill(10)};return s;});await h.tick(600);assert.equal(h.store().subtract,false);assert.ok(!fs.readFileSync(path.join(ROOT,'index.html'),'utf8').includes('id="subtractBackground"'));
 });
 check('FE-08: disabled empty calibration row does not block fit',async()=>{
  const h=createHarness();await bootApp(h);await h.navigate('calibration');await h.click('calCapture');await h.click('calAddLine');

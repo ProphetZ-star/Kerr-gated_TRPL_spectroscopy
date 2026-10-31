@@ -1,10 +1,12 @@
-import {api,initialize,requestId,subscribe,download} from './api.js';
+import {api,initialize,requestId,subscribe,download,uploadExperiment} from './api.js';
 import {store,axisForRun} from './store.js';
 import {drawAll,clickWave} from './charts.js';
 import {initAnalysis,renderAnalysis,fitOptions,analysisFitState} from './analysis.js';
 import {initCalibration,renderCalibration} from './calibration.js';
 import {setHeaderPage,acquisitionPage,headerLocked,syncHeaderLock,updateProgress} from './header.js';
 import {newestUnseenFit} from './analysis-state.js';
+import {DEFAULT_FILE_NAME,outputPath,splitOutputPath} from './output.js';
+import {initPlotRanges} from './plot-ranges.js';
 const $=id=>document.getElementById(id),n=id=>Number($(id).value);
 let segments=[{start:-2,end:0,step:.1},{start:0,end:2,step:.05},{start:2,end:20,step:.5}];
 function renderViews(){drawAll();renderAnalysis();renderCalibration();}
@@ -13,25 +15,58 @@ let fitSelection=null;
 const seenFits=new Set();
 const hiddenFits=new Set();
 let updating=false,pending=false,fetching=false,planTimer,toastTimer,fitTask=null;
+let startupReady=false;
+let acquisitionParameters={frames_per_point:1,seed:42,speedup:50,settle_s:.05,fault:{kind:'none',point_index:2}};
+function output(){return outputPath(store.outputDirectory,$('savePath').value);}
+function renderOutput(){
+ const name=$('savePath').value.trim()||DEFAULT_FILE_NAME;
+ $('sampleName').textContent=name;$('sampleName').title=name;
+ $('path').title='Save folder: '+store.outputDirectory;
+}
+function ready(){
+ startupReady=true;document.body.classList.remove('is-starting');$('appShell').inert=false;
+ $('appShell').setAttribute('aria-busy','false');$('startupOverlay').hidden=true;
+}
+function startupError(error){
+ if(startupReady)return;
+ $('startupOverlay').classList.add('is-error');$('startupMessage').textContent=error.message;
+ $('startupRetry').hidden=false;
+}
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,6000);}
 async function action(fn){if(pending)return;pending=true;try{await fn();await refresh();}catch(e){toast(e.message);}finally{pending=false;}}
 function modal(title,body){$('modalTitle').textContent=title;$('modalBody').replaceChildren(body);if(!$('modal').open)$('modal').showModal();}
+async function withOutputConfirmation(path,perform,cancelLabel='Cancel acquisition'){
+ const info=await api('/output/check',{path});
+ const execute=async token=>{
+  try{await perform(token);$('modal').close();}
+  catch(error){if(error.status===409&&/Output file.*(exists|changed)/.test(error.message))return withOutputConfirmation(path,perform,cancelLabel);throw error;}
+ };
+ if(!info.conflicts.length)return execute(null);
+ const box=document.createElement('div'),message=document.createElement('p'),files=document.createElement('p'),buttons=document.createElement('div'),cancel=document.createElement('button'),overwrite=document.createElement('button');
+ message.textContent='Existing experiment files will be replaced. A backup of the original files will be kept in the save folder.';
+ files.textContent=info.conflicts.join('\n');files.className='folder-path mono';buttons.className='modal-foot';cancel.textContent=cancelLabel;cancel.onclick=()=>$('modal').close();overwrite.textContent='Overwrite';overwrite.className='primary';
+ overwrite.onclick=()=>action(async()=>{
+  const current=await api('/output/check',{path});
+  if(current.overwrite_token!==info.overwrite_token)return withOutputConfirmation(path,perform,cancelLabel);
+  await execute(info.overwrite_token);
+ });
+ buttons.append(cancel,overwrite);box.append(message,files,buttons);modal('Overwrite existing experiment?',box);
+}
 function renderSegments(){
  $('segments').replaceChildren();segments.forEach((segment,index)=>{const row=document.createElement('div');row.className='segment-row';
  for(const key of ['start','end','step']){const input=document.createElement('input');input.type='number';input.step='any';input.value=segment[key];input.dataset.index=index;input.dataset.key=key;input.setAttribute('aria-label',`Segment ${index+1} ${key}`);input.oninput=()=>{segments[index][key]=input.value===''?NaN:Number(input.value);schedulePlan();};row.append(input);}
  const b=document.createElement('button');b.className='remove-segment';b.textContent='×';b.disabled=segments.length===1;b.dataset.remove=index;b.setAttribute('aria-label','Delete segment');b.onclick=()=>{segments.splice(index,1);renderSegments();schedulePlan();};row.append(b);$('segments').append(row);});
 }
 function request(){
- const numeric=['exposure','framesPerPoint','seed','speedup','settle','repeats'];
+ const numeric=['exposure','repeats'];
  if(numeric.some(id=>$(id).value===''||!Number.isFinite(n(id)))||segments.some(s=>Object.values(s).some(v=>!Number.isFinite(v))))throw Error('Enter valid finite acquisition parameters');
- return {mode:store.selectedMode,segments,repeats:n('repeats'),exposure_s:n('exposure'),frames_per_point:n('framesPerPoint'),
-  save_path:$('savePath').value.trim()||null,autosave:$('autosave').checked,seed:n('seed'),speedup:n('speedup'),settle_s:n('settle'),
-  fault:{kind:$('fault').value,point_index:n('faultPoint')},request_id:requestId()};
+ return {...acquisitionParameters,mode:store.selectedMode,segments,repeats:n('repeats'),exposure_s:n('exposure'),
+  save_path:output(),autosave:$('autosave').checked,request_id:requestId()};
 }
 function schedulePlan(){clearTimeout(planTimer);planTimer=setTimeout(plan,180);}
 async function plan(){
  if(store.snapshot?.busy)return;
- try{const p=await api('/scan/plan',request());$('validation').textContent='';updateProgress({percent:0,text:`${p.delays_ps.length} points / scan · ${p.rounds} scans`,remaining:`Estimated ${p.estimated_seconds.toFixed(1)} s / ×${n('speedup')} simulation`});$('run').disabled=headerLocked()||!store.online;}
+ try{const p=await api('/scan/plan',request());$('validation').textContent='';updateProgress({percent:0,text:`${p.delays_ps.length} points / scan · ${p.rounds} scans`,remaining:`Estimated ${p.estimated_seconds.toFixed(1)} s / ×${acquisitionParameters.speedup} simulation`});$('run').disabled=headerLocked()||!store.online;}
  catch(e){$('validation').textContent=e.message;$('run').disabled=true;}
 }
 async function syncRecords(){
@@ -44,16 +79,18 @@ async function syncRecords(){
  }finally{fetching=false;renderViews();}
 }
 function renderStatus(s){
+ store.subtract=false;
  const finalProgress=syncHeaderLock();
  const busy=Boolean(s.busy),run=store.run,active=s.busy==='scan';
- ['stageFields','detectorFields','scanFields','simulationFields'].forEach(id=>$(id).disabled=busy||!store.online);
+ ['stageFields','detectorFields','scanFields'].forEach(id=>$(id).disabled=busy||!store.online);
  $('captureBackground').disabled=busy||!store.online;$('preview').disabled=(busy&&s.busy!=='preview')||!store.online;
  $('preview').textContent=s.busy==='preview'?'Stop preview':'Live preview';
  if(document.activeElement!==$('delay'))$('delay').value=s.stage.delay_ps.toFixed(3);
  $('stageStatus').replaceChildren();const dot=document.createElement('span');dot.className='dot';$('stageStatus').append(dot,document.createTextNode(s.stage.moving?'Moving':s.connected?'In position · simulated':'Disconnected'));
  $('stageStatus').classList.toggle('moving',s.stage.moving);
  document.querySelectorAll('.connected').forEach(el=>el.textContent=s.connected?'● Simulated':'Disconnected');
- document.querySelector('.badge').textContent=store.online?'SIMULATION · Hardware offline':'SERVICE OFFLINE';
+ document.querySelector('.badge').textContent=store.online?(s.source_mode==='simulation'?'SIMULATION · Hardware offline ▾':'HARDWARE · '+(s.connected?'Connected':'Offline')+' ▾'):'SERVICE OFFLINE';
+ $('hardwareMode').disabled=busy||!store.online;
  const label=active?(run?.status??'running'):busy?s.busy:run?.status??'ready';
  $('runStatus').textContent=label.charAt(0).toUpperCase()+label.slice(1);$('runStatus').className='run-sub '+(run?.status==='error'?'status-danger':'status-neutral');
  $('run').textContent=active?(['paused','pausing'].includes(run.status)?'▶ Resume':'Ⅱ Pause'):'▶ Start';
@@ -68,12 +105,8 @@ function renderStatus(s){
  $('saveStatus').title=$('saveStatus').textContent;
  $('export').disabled=!store.records.length||!axisForRun();$('saveRun').disabled=busy||!run||run.saved;$('fit').disabled=busy||!store.records.length||!axisForRun();
  $('runFit').disabled=busy||!store.records.length||!axisForRun();$('discardRun').disabled=busy||!run;
- $('subtractBackground').disabled=!run?.metadata?.background||run.metadata.background.exposure_s!==run.request.exposure_s;
- if($('subtractBackground').disabled){$('subtractBackground').checked=false;store.subtract=false;}
  const cal=s.calibration;$('calibrationState').textContent=s.calibration_warning|| (cal.wavelengths_nm?`${cal.source} · ${cal.calibration_id}`:'No wavelength calibration · pixel axis');
  $('calibrationState').classList.toggle('error',!!s.calibration_warning);
- $('cameraFacts').textContent=`${s.camera.pixels} pixels · FVB · 16 bit · Andor Newton DU920P simulation`;
- $('frameContext').textContent=s.latest?`Last acquired frame · ${s.latest.delay_ps.toFixed(3)} ps · ${s.latest.exposure_s} s exposure${Math.abs(s.latest.delay_ps-s.stage.delay_ps)>.001?' · Stage moved since this frame':''}`:'No acquired frame';
 }
 async function refresh(){
  if(updating)return;updating=true;let reachable=false;
@@ -83,18 +116,20 @@ async function refresh(){
   store.online=true;store.snapshot=s;
   const changed=s.run?.run_id!==store.run?.run_id;
   if(changed){seenFits.clear();store.records=[];store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;
-   $('roundSelect').replaceChildren(new Option('All rounds','all'));for(let i=0;i<(s.run?.plan.rounds??0);i++)$('roundSelect').add(new Option(`Round ${i+1}`,String(i)));store.round='all';
+   store.round='all';
    if(s.run){const r=s.run.request;segments=structuredClone(r.segments);renderSegments();store.selectedMode=r.mode;
     document.querySelectorAll('#mode button').forEach(b=>b.classList.toggle('selected',b.dataset.mode===r.mode));$('scanParams').hidden=r.mode==='single';$('repeatWrap').hidden=r.mode!=='repeat';
-    for(const [id,key]of [['exposure','exposure_s'],['framesPerPoint','frames_per_point'],['seed','seed'],['speedup','speedup'],['settle','settle_s'],['repeats','repeats']])$(id).value=r[key];
-    $('fault').value=r.fault.kind;$('faultPoint').value=r.fault.point_index;$('autosave').checked=r.autosave;
+    for(const [id,key]of [['exposure','exposure_s'],['repeats','repeats']])$(id).value=r[key];
+    for(const key of Object.keys(acquisitionParameters))if(key!=='fault')acquisitionParameters[key]=structuredClone(r[key]??acquisitionParameters[key]);
+    $('autosave').checked=r.autosave;
+    if(r.save_path){const saved=splitOutputPath(r.save_path);store.outputDirectory=saved.directory;$('savePath').value=saved.fileName;renderOutput();}
    }
   }
   if(first){$('center').value=s.spectrograph.center_nm;$('grating').value=s.spectrograph.grating;$('slit').value=s.spectrograph.slit_um;$('exposure').value=s.camera.exposure_s;}
   store.run=s.run;
   if(!fitTask){const restored=newestUnseenFit(store.run,seenFits);if(restored)showFit(restored);}
-  renderStatus(s);await syncRecords();renderViews();
- }catch(e){if(reachable){toast(e.message);return;}store.online=false;$('runStatus').textContent=e.status===503?'Backend unavailable · restart local service':'Service offline';$('run').disabled=true;$('stop').disabled=true;document.querySelector('.badge').textContent=e.status===503?'BACKEND UNAVAILABLE · Restart local service':'SERVICE OFFLINE';}
+  renderStatus(s);await syncRecords();renderViews();ready();
+ }catch(e){startupError(e);if(reachable){toast(e.message);return;}store.online=false;$('hardwareMode').disabled=true;$('runStatus').textContent=e.status===503?'Backend unavailable · restart local service':'Service offline';$('run').disabled=true;$('stop').disabled=true;document.querySelector('.badge').textContent=e.status===503?'BACKEND UNAVAILABLE · Restart local service':'SERVICE OFFLINE';}
  finally{updating=false;}
 }
 async function startFit(){
@@ -113,33 +148,32 @@ async function checkFit(){
 function showFit(result){
  if(result.task_id)seenFits.add(result.task_id);
  store.fit=result;const options=result.request;
- if(options){store.wave=options.wavelength_nm;store.halfWindow=options.half_window_nm;$('waveSelect').value=store.wave;$('windowSelect').value=store.halfWindow;$('fitModel').value=options.model;$('irfWidth').value=options.irf_fwhm_ps;$('fitStart').value=options.min_delay_ps??'';$('fitEnd').value=options.max_delay_ps??'';}
+ if(options){store.wave=options.wavelength_nm;store.halfWindow=options.half_window_nm;$('fitModel').value=options.model;$('irfWidth').value=options.irf_fwhm_ps;$('fitStart').value=options.min_delay_ps??'';$('fitEnd').value=options.max_delay_ps??'';}
  $('fit').checked=true;$('tauValues').hidden=false;$('tauValues').replaceChildren();
  const p=result.parameters;for(const key of ['tau_ps','tau_1_ps','tau_2_ps'])if(key in p){const span=document.createElement('span');span.textContent=`${key.replace('_ps','')} ${p[key].toFixed(3)} ps`;$('tauValues').append(span);}renderAnalysis();
 }
 $('run').onclick=()=>action(async()=>{
  if(headerLocked())return;
  if(store.snapshot?.busy==='scan'){await api(`/runs/${store.run.run_id}/${['paused','pausing'].includes(store.run.status)?'resume':'pause'}`,{});return;}
- await api('/runs',request());
+ const body=request();
+ if(body.autosave)await withOutputConfirmation(body.save_path,token=>api('/runs',{...body,overwrite_token:token}));
+ else await api('/runs',body);
 });
 $('stop').onclick=()=>{if(!headerLocked())return action(()=>api(({move:'/stage/stop',preview:'/preview/stop',background:'/backgrounds/stop'})[store.snapshot?.busy]??`/runs/${store.run?.run_id}/stop`,{}));};
 $('moveAbsolute').onclick=()=>action(()=>api('/stage/move',{delay_ps:n('delay'),relative:false,request_id:requestId()}));
+$('returnZero').onclick=()=>action(()=>api('/stage/move',{delay_ps:0,relative:false,request_id:requestId()}));
 $('delay').onkeydown=e=>{if(e.key==='Enter')$('moveAbsolute').click();};
 document.querySelectorAll('[data-jog]').forEach(b=>b.onclick=()=>action(()=>api('/stage/move',{delay_ps:Number(b.dataset.jog),relative:true,request_id:requestId()})));
 $('zero').onclick=()=>{const box=document.createElement('div'),p=document.createElement('p'),b=document.createElement('button');p.textContent='Set the current position as optical delay zero? The stage will not move.';b.textContent='Confirm zero';b.className='primary';b.onclick=()=>action(async()=>{await api('/stage/zero',{});$('modal').close();});box.append(p,b);modal('Set delay zero',box);};
 $('closeModal').onclick=()=>$('modal').close();
 document.querySelectorAll('#mode button').forEach(b=>b.onclick=()=>{store.selectedMode=b.dataset.mode;document.querySelectorAll('#mode button').forEach(x=>x.classList.toggle('selected',x===b));$('scanParams').hidden=store.selectedMode==='single';$('repeatWrap').hidden=store.selectedMode!=='repeat';schedulePlan();});
 $('addSegment').onclick=()=>{if(segments.length>=10)return toast('Up to 10 segments');const start=segments.at(-1).end;segments.push({start,end:start+10,step:1});renderSegments();schedulePlan();};
-for(const id of ['repeats','exposure','framesPerPoint','seed','speedup','settle','fault','faultPoint'])$(id).addEventListener('input',schedulePlan);
+for(const id of ['repeats','exposure'])$(id).addEventListener('input',schedulePlan);
 $('exposure').onchange=()=>action(()=>api('/camera/configure',{exposure_s:n('exposure')}));
 $('center').onchange=()=>action(async()=>{await api('/spectrograph/config',{center_nm:n('center'),grating:n('grating'),slit_um:n('slit')});toast('Manual setting recorded. Wavelength calibration must be reloaded.');});
 for(const id of ['grating','slit'])$(id).onchange=$('center').onchange;
 $('preview').onclick=()=>action(()=>api('/preview/'+(store.snapshot?.busy==='preview'?'stop':'start'),{}));
-$('captureBackground').onclick=()=>action(async()=>{await api('/backgrounds',{kind:$('backgroundKind').value,condition:$('backgroundCondition').value});});
-$('waveSelect').onchange=()=>{store.wave=n('waveSelect');store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;renderViews();};
-$('windowSelect').onchange=()=>{store.halfWindow=n('windowSelect');store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;renderViews();};
-$('roundSelect').onchange=()=>{store.round=$('roundSelect').value;renderViews();};
-$('subtractBackground').onchange=()=>{store.subtract=$('subtractBackground').checked;store.fit=null;$('fit').checked=false;$('tauValues').hidden=true;renderViews();};
+$('captureBackground').onclick=()=>action(async()=>{await api('/backgrounds',{kind:'dark',condition:'Synthetic shutter closed'});});
 $('fit').onchange=()=>{if($('fit').checked)action(startFit);else{if(fitTask){hiddenFits.add(fitTask);seenFits.add(fitTask);void api('/tasks/'+fitTask+'/cancel',{}).catch(e=>toast(e.message));}store.fit=null;$('tauValues').hidden=true;renderViews();}};
 $('runFit').onclick=()=>action(startFit);
 for(const [id,key]of [['spectrumScale','specScale'],['mapScale','mapScale']])document.querySelectorAll('#'+id+' button').forEach(b=>b.onclick=()=>{store[key]=b.dataset.scale;document.querySelectorAll('#'+id+' button').forEach(x=>x.classList.toggle('selected',x===b));renderViews();});
@@ -147,12 +181,36 @@ for(const id of ['spectrum','map'])$(id).onclick=e=>{clickWave(id,e.clientX);$('
 $('theme').onclick=()=>{document.body.classList.toggle('light');renderViews();};
 function navigate(){const name=['analysis','calibration'].includes(location.hash.slice(1))?location.hash.slice(1):'acquisition';setHeaderPage(name);document.querySelector('.workspace').hidden=name!=='acquisition';document.querySelector('.foot').hidden=name!=='acquisition';$('analysisPage').hidden=name!=='analysis';$('calibrationPage').hidden=name!=='calibration';for(const id of ['acquisition','analysis','calibration'])$(id).classList.toggle('active',id===name);if(store.snapshot){renderStatus(store.snapshot);if(acquisitionPage()&&!store.run&&!store.snapshot.busy)plan();}requestAnimationFrame(renderViews);}
 for(const id of ['acquisition','analysis','calibration'])$(id).onclick=()=>location.hash=id;window.addEventListener('hashchange',navigate);
-$('path').onclick=()=>{const p=document.createElement('p');p.textContent='Enter an output filename in the Save path field. A blank path creates a unique .h5 file in the project data folder. Paths refer to this Windows computer.';modal('Local output path',p);};
+$('savePath').oninput=()=>{renderOutput();schedulePlan();};
+$('path').onclick=async()=>{
+ if(store.snapshot?.busy)return;
+ const choose=window.pywebview?.api?.select_output_folder;
+ if(choose){try{const folder=await choose(store.outputDirectory);if(folder){store.outputDirectory=folder;renderOutput();schedulePlan();}}catch(error){toast(error.message);}return;}
+ const box=document.createElement('div'),label=document.createElement('label'),input=document.createElement('input'),save=document.createElement('button');
+ label.textContent='Save folder';input.className='folder-input mono';input.value=store.outputDirectory;input.setAttribute('aria-label','Save folder');
+ save.textContent='Use folder';save.className='primary';save.onclick=()=>{if(!input.value.trim())return toast('Enter a save folder.');store.outputDirectory=input.value.trim();renderOutput();schedulePlan();$('modal').close();};
+ box.append(label,input,save);modal('Choose save folder',box);
+};
+$('hardwareMode').onclick=()=>{
+ if(!store.online||store.snapshot?.busy)return;
+ const box=document.createElement('div'),info=document.createElement('p'),options=document.createElement('div');options.className='source-options';
+ info.textContent='Andor Newton DU920P · PI M-414.32S (USB). Hardware mode requires commissioned drivers and the PI controller configuration.';
+ for(const [mode,label]of [['simulation','Simulation'],['hardware','Real hardware']]){const button=document.createElement('button');button.textContent=label;button.onclick=()=>action(async()=>{await api('/devices/connect',{mode});$('modal').close();});options.append(button);}
+ box.append(info,options);modal('Acquisition source',box);
+};
 $('export').onclick=async()=>{if(!store.run||!axisForRun())return;const url=`/runs/${store.run.run_id}/export?center_nm=${store.wave}&half_window_nm=${store.halfWindow}`;try{const r=await download(url);const a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download=`kerr_${store.run.run_id}_simulation.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}catch(e){toast(e.message);}};
-$('saveRun').onclick=()=>action(()=>api(`/runs/${store.run.run_id}/save`,{path:$('savePath').value.trim()||`data/${store.run.run_id}.h5`}));
+$('saveRun').onclick=()=>action(async()=>{const path=output(),id=store.run.run_id;await withOutputConfirmation(path,token=>api(`/runs/${id}/save`,{path,overwrite_token:token}),'Cancel save');});
 $('discardRun').onclick=()=>{const box=document.createElement('div'),p=document.createElement('p'),b=document.createElement('button');p.textContent='Discard the in-memory experiment? Existing files are retained.';b.textContent='Discard memory';b.onclick=()=>action(async()=>{await api(`/runs/${store.run.run_id}/discard`,{});$('modal').close();});box.append(p,b);modal('Discard experiment',box);};
-$('openRun').onclick=()=>action(async()=>{await api('/runs/open',{path:$('openPath').value});store.run=null;store.records=[];});
-initAnalysis(renderViews);initCalibration(refresh);renderSegments();navigate();new ResizeObserver(renderViews).observe(document.querySelector('.data'));
+$('openRun').onclick=async()=>{
+ if(!store.online||store.snapshot?.busy)return;
+ const choose=window.pywebview?.api?.select_hdf5_file;
+ if(!choose){$('openFile').click();return;}
+ try{const path=await choose($('openPath').value||store.outputDirectory);if(path)await action(async()=>{await api('/runs/open',{path});$('openPath').value=path;store.run=null;store.records=[];});}
+ catch(error){toast(error.message);}
+};
+$('openFile').onchange=e=>action(async()=>{const file=e.target.files?.[0];if(!file)return;try{await uploadExperiment(file);$('openPath').value=file.name;store.run=null;store.records=[];}finally{e.target.value='';}});
+initPlotRanges(modal,renderViews);initAnalysis(renderViews);initCalibration(refresh);renderSegments();renderOutput();navigate();new ResizeObserver(renderViews).observe(document.querySelector('.data'));
+$('startupRetry').onclick=async()=>{ $('startupOverlay').classList.remove('is-error');$('startupRetry').hidden=true;$('startupMessage').textContent='Connecting to the local service…';try{await initialize();await refresh();await plan();}catch(error){startupError(error);} };
 try{await initialize();store.online=true;await refresh();await plan();subscribe(message=>{if(message.type==='stream.gap')void refresh();if(message.type==='spectrum.preview'&&store.snapshot){store.snapshot.latest=message.payload;renderViews();}if(message.type==='run.error')toast(message.payload.message);},connected=>{if(connected)store.online=true;});}
-catch(e){toast('Start the local service using start-sim.ps1. '+e.message);}
+catch(e){startupError(e);toast('Start the local service using start-sim.ps1. '+e.message);}
 setInterval(async()=>{await refresh();try{await checkFit();}catch(e){fitTask=null;analysisFitState(false,e.message);toast(e.message);}},600);

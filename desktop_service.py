@@ -100,6 +100,22 @@ class LocalService:
                 if self.log:self.log.write(f'\nStartup cleanup also failed: {cleanup}\n');self.log.flush()
             raise
 
+    def stop_reused_if_empty(self):
+        """Best-effort graceful cleanup; never terminate an unowned process."""
+        if self.owned:return False
+        try:
+            if not self.existing():return False
+            status=self.request('/api/v1/status',timeout=2)
+            if status.get('busy') or status.get('run') is not None:return False
+            result=self.request('/api/v1/service/stop-if-empty',dict(
+                checkout_id=identity(ROOT)['checkout_id'],process_id=self.server_pid,
+                worker_session_id=status['worker_session_id']),timeout=3)
+            return result.get('stopping') is True
+        except (urllib.error.URLError,TimeoutError,OSError,RuntimeError,ValueError,KeyError):
+            # Changed identity, active work, an old backend or a failed probe all
+            # mean leave the shared service alone. Closing the GUI still succeeds.
+            return False
+
     def confirm_close(self,window):
         if not self.owned:return True
         try:

@@ -2,6 +2,7 @@
 from html import escape
 from pathlib import Path
 import os
+import re
 import traceback
 from log_utils import rotate_file,CappedStream
 from desktop_instance import DesktopInstance
@@ -21,15 +22,33 @@ _PAGE_STYLE=(
     'code{display:inline-block;max-width:100%;padding:8px 10px;background:#e8edf5;border-radius:6px;color:#172033;font-size:14px;overflow-wrap:anywhere}'
     '</style>'
 )
-_LOADING_PAGE=(
-    '<!doctype html><html lang=en><head><meta charset=utf-8>'
-    '<title>Kerr Studio</title>'
-    + _PAGE_STYLE +
-    '</head><body><main>'
-    '<h1>Starting local service…</h1>'
-    '<p>Kerr Studio is preparing the local acquisition service. This window will update automatically.</p>'
-    '</main></body></html>'
-)
+def _loading_page():
+    """The real workbench, disabled, with local CSS and no backend requests."""
+    html=(ROOT/'index.html').read_text(encoding='utf-8')
+    def inline_style(match):
+        return '<style>'+(ROOT/'frontend'/match.group(1)).read_text(encoding='utf-8')+'</style>'
+    html=re.sub(r'<link rel="stylesheet" href="/frontend/([\w.-]+\.css)">',inline_style,html)
+    return re.sub(r'<script\b[^>]*>.*?</script>','',html,flags=re.S)
+
+
+class DesktopBridge:
+    def __init__(self):self._window=None
+
+    def select_output_folder(self,directory=''):
+        import webview
+        initial=Path(directory).expanduser() if directory else ROOT/'data'
+        if not initial.is_absolute():initial=ROOT/initial
+        paths=self._window.create_file_dialog(webview.FileDialog.FOLDER,directory=str(initial),allow_multiple=False)
+        return str(paths[0]) if paths else None
+
+    def select_hdf5_file(self,directory=''):
+        import webview
+        initial=Path(directory).expanduser() if directory else ROOT/'data'
+        if initial.suffix.lower()=='.h5':initial=initial.parent
+        if not initial.is_absolute():initial=ROOT/initial
+        paths=self._window.create_file_dialog(webview.FileDialog.OPEN,directory=str(initial),
+            allow_multiple=False,file_types=('TRPL HDF5 (*.h5)',))
+        return str(paths[0]) if paths else None
 
 
 def _error_page(exc):
@@ -71,11 +90,13 @@ def create_desktop(url,on_closing=None,on_started=None):
     storage=ROOT/'data'/'webview'
     storage.mkdir(parents=True,exist_ok=True)
     loading=url is None
+    bridge=DesktopBridge()
     window=webview.create_window(
-        'Kerr Studio · TRPL',url=url,html=_LOADING_PAGE if loading else None,width=1440,height=940,min_size=(1000,700),
+        'Kerr Studio · TRPL',url=url,html=_loading_page() if loading else None,width=1440,height=940,min_size=(1000,700),js_api=bridge,
         resizable=True,frameless=False,easy_drag=False,
         background_color='#f5f7fb' if loading else '#0b1220',text_select=True,
     )
+    bridge._window=window
     if on_closing is not None:
         def closing():
             return bool(on_closing(window))
@@ -137,12 +158,17 @@ def run_desktop():
             return True
         if startup_failed.is_set():
             return True
-        if close_approved.is_set() or not service.owned:return True
+        if close_approved.is_set():return True
         if not close_check.is_set():
             close_check.set()
             def check():
                 try:
-                    if service.confirm_close(window):
+                    if service.owned:
+                        approved=service.confirm_close(window)
+                    else:
+                        service.stop_reused_if_empty()
+                        approved=True
+                    if approved:
                         close_approved.set();window.destroy()
                 finally:close_check.clear()
             threading.Thread(target=check,daemon=True).start()

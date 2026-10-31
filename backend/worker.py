@@ -12,6 +12,7 @@ from .core import make_plan, mm_to_delay, delay_to_mm
 from .models import RunRequest, FitRequest
 from .drivers.sim import SimCamera, SimStage
 from .storage.hdf5 import HDFWriter, choose_path, read_run, append_analysis
+from .storage.output import output_info,prepare_output
 from .storage.export import export_csv
 from .analysis import fit_records
 from .calibration_service import CalibrationWorkbench
@@ -56,6 +57,7 @@ class Engine:
         self.current=None;self.runs={};self.stop=Event();self.pause=Event();self.job=None
         self.commands={};self.tasks={};self.pool=ThreadPoolExecutor(max_workers=1);self.last_preview=0
         self.task_controls={}
+        self.shutdown_prepared=False
 
     def emit(self, kind, payload):
         with self.lock:
@@ -136,14 +138,14 @@ class Engine:
                                     tau_ps=[.42,3.8],irf_fwhm_ps=.25,gain_e_per_count=2.5))
 
     def run_scan(self,run):
-        request=run['request'];plan=run['plan'];writer=None
+        request=run['request'];plan=run['plan'];writer=run.get('writer')
         terminal='completed'
         def step(name):
             with self.lock:run['step']=name
             message=self.emit('run.state',{k:run[k] for k in ['run_id','status','step','completed_points','committed_frames','acquired_frames']})
             if writer:writer.call('event',message)
         try:
-            if request['autosave']:
+            if request['autosave'] and writer is None:
                 writer=HDFWriter(run['path'],run['metadata'])
                 with self.lock:run['writer']=writer
             with self.lock:run['status']='running'
@@ -235,6 +237,20 @@ class Engine:
 
     def handle(self,name,data):
         # command loop is the only place launching device jobs; SDK calls stay in owner job.
+        with self.lock:
+            if self.shutdown_prepared and name!='status':
+                raise CommandError('The local service is shutting down')
+            if name=='prepare_empty_shutdown':
+                if data.get('worker_session_id')!=self.session:
+                    raise CommandError('The local service session changed')
+                if (self.busy or self.runs or self.background is not None
+                        or self.calibration_workbench.frame is not None
+                        or any(task['status']=='running' for task in self.tasks.values())):
+                    raise CommandError('The service has active work or experiment data; it will remain running')
+                # Serialized with new commands: no acquisition can start between
+                # this check and the API process beginning graceful shutdown.
+                self.shutdown_prepared=True
+                return dict(stopping=True)
         request_id=data.get('request_id')
         key=(name,request_id)
         if request_id and key in self.commands:
@@ -304,20 +320,25 @@ class Engine:
         if name=='plan':
             request=RunRequest(**data)
             return make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
+        if name=='output_check':return output_info(data['path'])
         if name=='run':
             self.idle();request=RunRequest(**data)
             plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
-            # Keep at most one in-memory run; saved experiments can be reopened.
-            if self.current and not self.runs[self.current]['saved'] and self.runs[self.current]['records']:
-                raise ValueError('Save or explicitly discard the previous memory-only run before starting another')
+            if any(task['status']=='running' for task in self.tasks.values()):
+                raise CommandError('Wait for or cancel analysis before starting another acquisition')
             run_id=uuid.uuid4().hex[:16]
-            path=choose_path(request.save_path,run_id,plan['estimated_bytes']) if request.autosave else None
+            path=None;writer=None
             self.set_exposure(request.exposure_s)
             plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
             metadata=self.metadata(data,plan,run_id);metadata['config']['center_nm']=self.spectrograph['center_nm']
+            if request.autosave:
+                with prepare_output(request.save_path,run_id,plan['estimated_bytes'],request.overwrite_token) as path:
+                    writer=HDFWriter(path,metadata)
             run=dict(run_id=run_id,status='preparing',step='preparing',request=data,plan=plan,records=[],
                      metadata=metadata,path=str(path) if path else None,saved=False,created_utc=now(),ended_utc=None,
                      acquired_frames=0,committed_frames=0,completed_points=0,error=None)
+            if writer:run['writer']=writer
+            # Replace a memory-only experiment only after new output is ready.
             self.runs={run_id:run};self.current=run_id;self.camera.exposure_s=request.exposure_s
             self.launch('scan',self.run_scan,run);return self.public_run(run)
         if name in {'pause','resume','stop'}:
@@ -372,13 +393,13 @@ class Engine:
                 self.idle(devices=False)
                 with self.analysis_lock:
                     if run['saved']:return self.public_run(run)
-                    path=choose_path(data.get('path'),run['run_id'],run['plan']['estimated_bytes'])
-                    writer=HDFWriter(path,run['metadata'])
-                    try:
-                        for record in run['records']:writer.call('record',record)
-                    except Exception:
-                        writer.call('close','error');raise
-                    run['path']=writer.call('close',run['status']);run['saved']=True;return self.public_run(run)
+                    with prepare_output(data.get('path'),run['run_id'],run['plan']['estimated_bytes'],data.get('overwrite_token')) as path:
+                        writer=HDFWriter(path,run['metadata'])
+                        try:
+                            for record in run['records']:writer.call('record',record)
+                        except Exception:
+                            writer.call('close','error');raise
+                        run['path']=writer.call('close',run['status']);run['saved']=True;return self.public_run(run)
             if name=='discard':
                 self.idle(devices=False);self.runs={};self.current=None;self.latest=None;self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm']);return dict(discarded=True)
             if name=='fit':

@@ -1,5 +1,6 @@
 import {api} from './api.js';
 import {store} from './store.js';
+import {plotRange} from './plot-ranges.js';
 const $=id=>document.getElementById(id),css=k=>getComputedStyle(document.body).getPropertyValue(k).trim();
 const W=1024,H=255,demoPixels=[115.23,282.65,449.38,655.14,851.72];
 const demoWave=p=>490+.24*p+.00002*p*p;
@@ -16,7 +17,8 @@ async function extract(){
  const result=await api('/calibration/extract',extractionRequest());
  if(result.frame_id!==frameMeta?.frame_id)throw Error('Calibration frame changed; acquire again.');
  profile=result.profile_counts;detected=result.peaks_pixels;
- $('calRoiLabel').textContent='Rows '+result.row_start+'–'+result.row_end+' · Mean extraction · '+result.saturated_pixels+' saturated pixels';
+ $('calRoiLabel').textContent=result.saturated_pixels?'⚠ '+result.saturated_pixels+' saturated pixels':'';
+ $('calRoiLabel').hidden=!result.saturated_pixels;
 }
 function peaks(){return detected;}
 async function receiveFrame(result){
@@ -25,7 +27,7 @@ async function receiveFrame(result){
  frameMeta=result;frame=new Int32Array(result.image_counts);image=null;frameNo++;invalidate();await extract();
  $('calFrameState').textContent='Simulated frame '+frameNo;
 }
-function clearFrame(){frame=null;frameMeta=null;profile=null;detected=[];image=null;invalidate();$('calFrameState').textContent='No frame';}
+function clearFrame(){frame=null;frameMeta=null;profile=null;detected=[];image=null;invalidate();$('calFrameState').textContent='No frame';$('calRoiLabel').hidden=true;$('calRoiLabel').textContent='';}
 async function calAction(fn){
  if(controlsLocked())return;
  acquiring=true;renderControls();
@@ -76,16 +78,58 @@ export function initCalibration(onChanged=async()=>{}){
  $('calReferenceFile').onchange=e=>calAction(async()=>{const file=e.target.files[0];if(!file)return;try{const text=await file.text(),rows=text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));if(rows.length&&/^wavelength_nm\s*,/i.test(rows[0]))rows.shift();const ref=rows.map((line,i)=>{const fields=line.split(',');if(fields.length>2)throw Error('CSV needs wavelength_nm and optional relative_intensity.');const wave=Number(fields[0]),intensity=fields.length===2?Number(fields[1]):1;if(!fields[0]||!Number.isFinite(wave)||wave<=0||!Number.isFinite(intensity)||intensity<0)throw Error('Invalid reference CSV row '+(i+1));return{wave,intensity}});if(ref.length<2||ref.length>100)throw Error('Import 2–100 reference lines.');if(new Set(ref.map(r=>r.wave)).size!==ref.length)throw Error('Reference wavelengths must be unique.');references=ref.sort((a,b)=>a.wave-b.wave);referenceName=file.name;source='measured';const found=peaks();pairs=references.map((r,i)=>({id:nextId++,pixel:found.length===references.length?found[i]:NaN,wave:r.wave,enabled:true}));selected=0;invalidate();feedback('Reference imported · Confirm each pixel-to-line assignment.');}finally{e.target.value=''}});
  $('calApply').onclick=()=>calAction(async()=>{if(!solution)throw Error('Fit a mapping first.');await api('/calibration/apply',{solution_id:solution.wire.solution_id});feedback('Applied to future acquisitions. Existing experiments retain their recorded calibration.');});
  $('calExport').onclick=()=>calAction(async()=>{if(!solution)return;const draft=await api('/calibration/solutions/'+solution.wire.solution_id);const url=URL.createObjectURL(new Blob([JSON.stringify({format:'kerr-spectral-calibration-v1',...draft},null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='spectral_calibration_'+draft.calibration_id+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)});
- $('calSpectrum').onclick=e=>{if(controlsLocked()||!spectrumPlot||!pairs.length)return;const q=spectrumPlot,px=e.clientX-$('calSpectrum').getBoundingClientRect().left;if(px<q.p.l||px>q.p.r)return;let pixel=(px-q.p.l)/(q.p.r-q.p.l)*1023;if(scale==='wavelength'&&solution){const wave=q.xmin+(px-q.p.l)/(q.p.r-q.p.l)*(q.xmax-q.xmin);pixel=solution.axis.reduce((best,v,i)=>Math.abs(v-wave)<Math.abs(solution.axis[best]-wave)?i:best,0);}const found=peaks().filter(p=>Math.abs(p-pixel)<12);if(found.length)pixel=found.reduce((best,p)=>Math.abs(p-pixel)<Math.abs(best-pixel)?p:best,found[0]);pairs[selected].pixel=+pixel.toFixed(3);invalidate();renderPairs();feedback('Peak assigned · Enter or confirm its reference wavelength.');renderCalibration()};
- $('calImage').onclick=e=>{if(controlsLocked()||!ccdPlot)return;return calAction(async()=>{const q=ccdPlot,y=(e.clientY-$('calImage').getBoundingClientRect().top-q.p.t)/(q.p.b-q.p.t)*254;if(y<0||y>254)return;const[a,b]=roi(),half=(b-a)/2,start=Math.max(0,Math.min(254-(b-a),Math.round(y-half)));$('calRowStart').value=start;$('calRowEnd').value=start+(b-a);invalidate();await extract();});};
+ $('calSpectrum').onclick=e=>{if(controlsLocked()||!profile||!spectrumPlot||!pairs.length)return;const q=spectrumPlot,px=e.clientX-$('calSpectrum').getBoundingClientRect().left;if(px<q.p.l||px>q.p.r)return;let pixel=q.xmin+(px-q.p.l)/(q.p.r-q.p.l)*(q.xmax-q.xmin);if(scale==='wavelength'&&solution){const wave=q.xmin+(px-q.p.l)/(q.p.r-q.p.l)*(q.xmax-q.xmin);pixel=solution.axis.reduce((best,v,i)=>Math.abs(v-wave)<Math.abs(solution.axis[best]-wave)?i:best,0);}const found=peaks().filter(p=>Math.abs(p-pixel)<12);if(found.length)pixel=found.reduce((best,p)=>Math.abs(p-pixel)<Math.abs(best-pixel)?p:best,found[0]);pairs[selected].pixel=+pixel.toFixed(3);invalidate();renderPairs();feedback('Peak assigned · Enter or confirm its reference wavelength.');renderCalibration()};
+ $('calImage').onclick=e=>{if(controlsLocked()||!frameMeta||!ccdPlot)return;return calAction(async()=>{const q=ccdPlot,py=e.clientY-$('calImage').getBoundingClientRect().top;if(py<q.p.t||py>q.p.b)return;const y=q.ymin+(q.ymax-q.ymin)*(q.p.b-py)/(q.p.b-q.p.t);if(y<0||y>254)return;const[a,b]=roi(),half=(b-a)/2,start=Math.max(0,Math.min(254-(b-a),Math.round(y-half)));$('calRowStart').value=start;$('calRowEnd').value=start+(b-a);invalidate();await extract();});};
  renderPairs();new ResizeObserver(drawCalibration).observe(document.querySelector('.cal-results'));renderCalibration();
 }
-function canvas(id,xmin,xmax,ymin,ymax,left=66){const c=$(id),r=c.getBoundingClientRect();if(r.width<1||r.height<1)return;const d=devicePixelRatio||1;c.width=Math.round(r.width*d);c.height=Math.round(r.height*d);const ctx=c.getContext('2d');ctx.scale(d,d);ctx.font='12px Segoe UI';const p={l:left,r:r.width-22,t:13,b:r.height-32};ctx.fillStyle=css('--plot');ctx.fillRect(p.l,p.t,p.r-p.l,p.b-p.t);return{ctx,p,w:r.width,h:r.height,xmin,xmax,ymin,ymax,x:v=>p.l+(v-xmin)/(xmax-xmin||1)*(p.r-p.l),y:v=>p.b-(v-ymin)/(ymax-ymin||1)*(p.b-p.t)};}
-function axes(q,label,small=false){const{ctx,p}=q;ctx.fillStyle=css('--muted');ctx.strokeStyle=css('--chart-grid');ctx.lineWidth=1;for(let i=0;i<=4;i++){const v=q.xmin+(q.xmax-q.xmin)*i/4;ctx.beginPath();ctx.moveTo(q.x(v),p.t);ctx.lineTo(q.x(v),p.b);ctx.stroke();ctx.textAlign='center';if(q.w>400||i%2===0)ctx.fillText(fmt(v,1),q.x(v),p.b+18)}for(let i=0;i<=(small?2:3);i++){const v=q.ymin+(q.ymax-q.ymin)*i/(small?2:3);ctx.beginPath();ctx.moveTo(p.l,q.y(v));ctx.lineTo(p.r,q.y(v));ctx.stroke();ctx.textAlign='right';ctx.fillText(Math.abs(v)>=1000?(v/1000).toFixed(1)+'k':v!==0&&Math.abs(v)<.01?Number(v.toPrecision(2)).toString():fmt(v,2),p.l-7,q.y(v)+4)}ctx.save();ctx.translate(17,(p.t+p.b)/2);ctx.rotate(-Math.PI/2);ctx.textAlign='center';ctx.fillText(label,0,0);ctx.restore();ctx.strokeStyle=css('--plot-border');ctx.strokeRect(p.l,p.t,p.r-p.l,p.b-p.t)}
+function canvas(id,xmin,xmax,ymin,ymax,left=66,bottom=32,empty=false,metadata={}){
+ ({xmin,xmax,ymin,ymax}=plotRange(id,{xmin,xmax,ymin,ymax},metadata));
+ const c=$(id),r=c.getBoundingClientRect();if(r.width<1||r.height<1)return;
+ const d=devicePixelRatio||1;c.width=Math.round(r.width*d);c.height=Math.round(r.height*d);
+ const ctx=c.getContext('2d');ctx.scale(d,d);ctx.font='12px Segoe UI';
+ const p={l:left,r:r.width-22,t:13,b:r.height-bottom};ctx.fillStyle=css('--plot');ctx.fillRect(p.l,p.t,p.r-p.l,p.b-p.t);
+ return{ctx,p,w:r.width,h:r.height,xmin,xmax,ymin,ymax,x:v=>p.l+(v-xmin)/(xmax-xmin||1)*(p.r-p.l),y:v=>p.b-(v-ymin)/(ymax-ymin||1)*(p.b-p.t)};
+}
+function axes(q,label,small=false,showX=true,grid=true){
+ const{ctx,p}=q;ctx.fillStyle=css('--muted');ctx.strokeStyle=css('--chart-grid');ctx.lineWidth=1;
+ for(let i=0;i<=4;i++){const v=q.xmin+(q.xmax-q.xmin)*i/4;if(grid){ctx.beginPath();ctx.moveTo(q.x(v),p.t);ctx.lineTo(q.x(v),p.b);ctx.stroke();}ctx.textAlign='center';if(showX&&(q.w>400||i%2===0))ctx.fillText(fmt(v,1),q.x(v),p.b+18)}
+ for(let i=0;i<=(small?2:3);i++){const v=q.ymin+(q.ymax-q.ymin)*i/(small?2:3);if(grid){ctx.beginPath();ctx.moveTo(p.l,q.y(v));ctx.lineTo(p.r,q.y(v));ctx.stroke();}ctx.textAlign='right';ctx.fillText(Math.abs(v)>=1000?(v/1000).toFixed(1)+'k':v!==0&&Math.abs(v)<.01?Number(v.toPrecision(2)).toString():fmt(v,2),p.l-7,q.y(v)+4)}
+ ctx.save();ctx.translate(17,(p.t+p.b)/2);ctx.rotate(-Math.PI/2);ctx.textAlign='center';ctx.fillText(label,0,0);ctx.restore();ctx.strokeStyle=css('--plot-border');ctx.strokeRect(p.l,p.t,p.r-p.l,p.b-p.t);
+
+}
+function noData(q,label){q.ctx.fillStyle=css('--muted');q.ctx.textAlign='center';q.ctx.fillText(label,(q.p.l+q.p.r)/2,(q.p.t+q.p.b)/2);}
 function line(q,points,color,dash=[]){const{ctx,p}=q;ctx.save();ctx.beginPath();ctx.rect(p.l,p.t,p.r-p.l,p.b-p.t);ctx.clip();ctx.strokeStyle=color;ctx.setLineDash(dash);ctx.lineWidth=1.7;ctx.beginPath();points.forEach(([x,y],i)=>i?ctx.lineTo(q.x(x),q.y(y)):ctx.moveTo(q.x(x),q.y(y)));ctx.stroke();ctx.restore()}
-function dot(q,x,y,color){if(!Number.isFinite(x+y))return;q.ctx.fillStyle=color;q.ctx.beginPath();q.ctx.arc(q.x(x),q.y(y),3,0,Math.PI*2);q.ctx.fill()}
-function ccd(){const q=ccdPlot=canvas('calImage',0,1023,254,0);if(!q||!frame)return;const{ctx,p}=q;const theme=document.body.classList.contains('light')?'light':'dark';if(!image||imageTheme!==theme){imageTheme=theme;const off=document.createElement('canvas');off.width=W;off.height=H;const c=off.getContext('2d'),data=c.createImageData(W,H);for(let i=0;i<frame.length;i++){const v=Math.pow(Math.max(0,frame[i]-55)/3300,.55);const f=Math.min(1,v);data.data[i*4]=Math.round(16+f*174);data.data[i*4+1]=Math.round(27+f*208);data.data[i*4+2]=Math.round(47+f*202);data.data[i*4+3]=255;}c.putImageData(data,0,0);image=off;}ctx.drawImage(image,p.l,p.t,p.r-p.l,p.b-p.t);const[a,b]=roi(),y0=q.y(a),y1=q.y(b);ctx.fillStyle=css('--blue')+'16';ctx.fillRect(p.l,y0,p.r-p.l,y1-y0);for(const y of [y0,y1])line(q,[[0,q.ymin+(p.b-y)/(p.b-p.t)*(q.ymax-q.ymin)],[1023,q.ymin+(p.b-y)/(p.b-p.t)*(q.ymax-q.ymin)]],css('--cursor'),[5,4]);ctx.fillStyle=css('--muted');ctx.textAlign='right';for(const y of [0,128,254])ctx.fillText(y,p.l-8,q.y(y)+4);ctx.textAlign='center';for(const x of [0,256,512,768,1023])if(q.w>400||x===0||x===512||x===1023)ctx.fillText(x,q.x(x),p.b+18);ctx.save();ctx.translate(17,(p.t+p.b)/2);ctx.rotate(-Math.PI/2);ctx.fillText('CCD row',0,0);ctx.restore();ctx.strokeStyle=css('--plot-border');ctx.strokeRect(p.l,p.t,p.r-p.l,p.b-p.t)}
-function spectrum(){const wave=scale==='wavelength'&&solution,low=wave?Math.min(...solution.axis):0,high=wave?Math.max(...solution.axis):1023;const q=spectrumPlot=canvas('calSpectrum',low,high,0,Math.max(...profile)*1.18);if(!q)return;axes(q,'CCD / counts');line(q,profile.map((y,x)=>[wave?solution.at(x):x,y]),css('--data'));for(const [i,p]of pairs.entries())if(Number.isFinite(p.pixel)&&p.pixel>=0&&p.pixel<=1023){const x=wave?solution.at(p.pixel):p.pixel;line(q,[[x,0],[x,q.ymax*.92]],i===selected?css('--cursor'):css('--amber'),[3,4]);dot(q,x,profile[Math.round(p.pixel)],css('--data'));q.ctx.fillStyle=i===selected?css('--text'):css('--muted');q.ctx.textAlign='center';q.ctx.fillText('L'+(i+1),q.x(x),q.p.t+12);}if(wave){const max=Math.max(...references.map(r=>r.intensity),1);for(const r of references)if(r.wave>=low&&r.wave<=high)line(q,[[r.wave,0],[r.wave,q.ymax*.8*r.intensity/max]],css('--amber'),[5,4]);}$('calSpectrumAxis').textContent=wave?'Wavelength / nm':'Pixel';}
-function mapping(){const active=pairs.filter(p=>p.enabled&&Number.isFinite(p.pixel+p.wave)),ys=active.map(p=>p.wave),lo=ys.length?Math.min(...ys)-15:490,hi=ys.length?Math.max(...ys)+15:770,q=canvas('calMapping',0,1023,lo,hi,62);if(!q)return;axes(q,'λ / nm',true);if(solution)line(q,Array.from({length:128},(_,i)=>[i*1023/127,solution.at(i*1023/127)]),css('--amber'));for(const p of active)dot(q,p.pixel,p.wave,css('--data'));const bound=solution?Math.max(.002,solution.max*1.4):.1,r=canvas('calResidual',0,1023,-bound,bound,62);if(!r)return;axes(r,'Δ nm',true);line(r,[[0,0],[1023,0]],css('--cursor'),[4,4]);if(solution)for(const p of active)dot(r,p.pixel,p.wave-solution.at(p.pixel),css('--data'));}
+function dot(q,x,y,color){if(!Number.isFinite(x+y))return;const{ctx,p}=q;ctx.save();ctx.beginPath();ctx.rect(p.l,p.t,p.r-p.l,p.b-p.t);ctx.clip();ctx.fillStyle=color;ctx.beginPath();ctx.arc(q.x(x),q.y(y),3,0,Math.PI*2);ctx.fill();ctx.restore()}
+function ccd(){
+ const q=ccdPlot=canvas('calImage',0,1023,254,0,66,32,!frame);if(!q)return;
+ if(!frame){axes(q,'CCD row',false,true,false);noData(q,'No frame');return;}
+ const{ctx,p}=q,theme=document.body.classList.contains('light')?'light':'dark';
+ if(!image||imageTheme!==theme){imageTheme=theme;const off=document.createElement('canvas');off.width=W;off.height=H;const c=off.getContext('2d'),data=c.createImageData(W,H);for(let i=0;i<frame.length;i++){const f=Math.min(1,Math.pow(Math.max(0,frame[i]-55)/3300,.55));data.data[i*4]=Math.round(16+f*174);data.data[i*4+1]=Math.round(27+f*208);data.data[i*4+2]=Math.round(47+f*202);data.data[i*4+3]=255;}c.putImageData(data,0,0);image=off;}
+ ctx.save();ctx.beginPath();ctx.rect(p.l,p.t,p.r-p.l,p.b-p.t);ctx.clip();
+ ctx.drawImage(image,q.x(0),q.y(0),q.x(1023)-q.x(0),q.y(254)-q.y(0));
+ const[a,b]=roi(),y0=q.y(a),y1=q.y(b);ctx.fillStyle=css('--blue')+'16';ctx.fillRect(p.l,y0,p.r-p.l,y1-y0);
+ for(const row of [a,b])line(q,[[0,row],[1023,row]],css('--cursor'),[5,4]);ctx.restore();
+ axes(q,'CCD row',false,true,false);
+}
+function spectrum(){
+ const wave=scale==='wavelength'&&solution,low=wave?Math.min(...solution.axis):0,high=wave?Math.max(...solution.axis):1023;
+ $('calSpectrumAxis').textContent=wave?'nm':'pixel';
+ const q=spectrumPlot=canvas('calSpectrum',low,high,0,profile?Math.max(1,...profile)*1.18:65535,66,32,!profile,{xKey:wave?'calSpectrum:nm':'calSpectrum:pixel',xLabel:wave?'Wavelength / nm':'CCD pixel'});
+ if(!q)return;axes(q,'CCD / counts');if(!profile){noData(q,'No spectrum');return;}
+ line(q,profile.map((y,x)=>[wave?solution.at(x):x,y]),css('--data'));
+ for(const [i,p]of pairs.entries())if(Number.isFinite(p.pixel)&&p.pixel>=0&&p.pixel<=1023){const x=wave?solution.at(p.pixel):p.pixel;if(x<q.xmin||x>q.xmax)continue;line(q,[[x,0],[x,q.ymax*.92]],i===selected?css('--cursor'):css('--amber'),[3,4]);dot(q,x,profile[Math.round(p.pixel)],css('--data'));q.ctx.fillStyle=i===selected?css('--text'):css('--muted');q.ctx.textAlign='center';q.ctx.fillText('L'+(i+1),q.x(x),q.p.t+12);}
+ if(wave){const max=Math.max(...references.map(r=>r.intensity),1);for(const r of references)if(r.wave>=low&&r.wave<=high)line(q,[[r.wave,0],[r.wave,q.ymax*.8*r.intensity/max]],css('--amber'),[5,4]);}
+}
+function mapping(){
+ const active=frameMeta?pairs.filter(p=>p.enabled&&Number.isFinite(p.pixel+p.wave)):[],ys=active.map(p=>p.wave);
+ const lo=ys.length?Math.min(...ys)-15:490,hi=ys.length?Math.max(...ys)+15:770,q=canvas('calMapping',0,1023,lo,hi,62,32,!frameMeta);
+ if(!q)return;axes(q,'λ / nm',true);
+ if(solution)line(q,Array.from({length:128},(_,i)=>[i*1023/127,solution.at(i*1023/127)]),css('--amber'));
+ for(const p of active)dot(q,p.pixel,p.wave,css('--data'));
+ if(!frameMeta)noData(q,'No mapping');
+ const bound=solution?Math.max(.002,solution.max*1.4):.1,r=canvas('calResidual',0,1023,-bound,bound,62,8,!solution);
+ if(!r)return;axes(r,'Δ nm',true,false);line(r,[[0,0],[1023,0]],css('--cursor'),[4,4]);
+ if(solution)for(const p of active)dot(r,p.pixel,p.wave-solution.at(p.pixel),css('--data'));
+}
 export function renderCalibration(){if(!$('calibrationPage'))return;syncSession();renderControls();$('calReferenceName').textContent=referenceName;$('calReferenceName').title=referenceName;drawCalibration()}
-export function drawCalibration(){if(!$('calibrationPage')||$('calibrationPage').hidden||!profile)return;try{ccd();spectrum();mapping()}catch(error){feedback(error.message,true)}}
+export function drawCalibration(){if(!$('calibrationPage')||$('calibrationPage').hidden)return;try{ccd();spectrum();mapping()}catch(error){feedback(error.message,true)}}

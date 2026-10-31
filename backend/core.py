@@ -64,6 +64,6 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0):
                 estimated_seconds=seconds, estimated_bytes=frames * (4096 + 2048),
                 revision=revision, zero_mm=zero, delay_sign=sign, path_multiplier=2)
     identity={k:v for k,v in data.items() if k!='estimated_seconds'}
-    identity['request']=request.model_dump(exclude={'request_id','save_path'})
+    identity['request']=request.model_dump(exclude={'request_id','save_path','overwrite_token'})
     data['plan_id'] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
     return data

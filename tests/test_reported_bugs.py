@@ -415,6 +415,7 @@ def test_E17_legacy_webview_shows_install_message(monkeypatch,tmp_path):
     fake=SimpleNamespace(settings={},guilib=SimpleNamespace(renderer='mshtml'),create_window=Mock(return_value=window))
     fake.start=lambda **kwargs:kwargs['func']()
     monkeypatch.setitem(sys.modules,'webview',fake);monkeypatch.setattr(desktop,'ROOT',tmp_path);monkeypatch.setattr(desktop,'ERROR_LOG',tmp_path/'error.log')
+    monkeypatch.setattr(desktop,'_loading_page',lambda:'<html>Loading</html>')
     callback=Mock();desktop.create_desktop(None,on_started=callback)
     assert not callback.called and 'WebView2' in window.load_html.call_args.args[0]
 

@@ -29,7 +29,7 @@ def test_close_stops_scan_before_exit(monkeypatch):
     calls=[]
     def request(path,body=None,**kwargs):
         calls.append((path,body))
-        if len(calls)==1:return dict(busy='scan',run=dict(run_id='test',committed_frames=3,saved=False))
+        if len(calls)==1:return dict(busy='scan',run=dict(run_id='test',committed_frames=3,saved=False,status='running'))
         return dict(busy=None)
     monkeypatch.setattr(service,'request',request)
     window=Mock();window.create_confirmation_dialog.return_value=True

@@ -1,4 +1,4 @@
-export const store={snapshot:null,run:null,records:[],wave:600,halfWindow:5,round:'all',subtract:false,fit:null,specScale:'linear',mapScale:'log',selectedMode:'scan',online:false};
+export const store={snapshot:null,run:null,records:[],wave:600,halfWindow:5,round:'all',subtract:false,fit:null,specScale:'linear',mapScale:'log',selectedMode:'scan',online:false,outputDirectory:'data'};
 export function axisForRun(){return store.run?.metadata?.calibration?.wavelengths_nm??null;}
 export function grouped(){
  const groups=new Map();

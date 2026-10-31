@@ -25,7 +25,7 @@ function makeCanvasContext() {
   const ctx = {
     ops: [], strokes: [], path: [], dash: [], arcs: [],
     fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', textAlign: 'left',
-    scale() {}, save() {}, restore() {}, translate() {}, rotate() {}, drawImage() {}, putImageData() {},
+    scale() {}, save() {}, restore() {}, translate() {}, rotate() {}, drawImage(...args) { this.ops.push({op:'drawImage',args}); }, putImageData() {},
     beginPath() { this.path = []; },
     moveTo(x, y) { this.path.push([x, y]); },
     lineTo(x, y) { this.path.push([x, y]); },
@@ -151,7 +151,7 @@ const FORM_DEFAULTS = {
   exposure: '1.000', center: '600.0', grating: '300', slit: '200', repeats: '3',
   speedup: '50', seed: '42', framesPerPoint: '1', settle: '0.05', fault: 'none',
   faultPoint: '2', backgroundKind: 'dark', backgroundCondition: 'Synthetic shutter closed',
-  savePath: '', delay: '0.350', waveSelect: '600', windowSelect: '5',
+  savePath: 'Sample 01 TRPL', delay: '0.350', waveSelect: '600', windowSelect: '5',
   analysisWave: '600', analysisWindow: '5', fitModel: 'double', irfWidth: '.25',
   fitStart: '', fitEnd: '', calExposure: '1.0', calRowStart: '85', calRowEnd: '165',
   calOrder: '2', calConvention: 'air', openPath: '',
@@ -297,7 +297,7 @@ function createHarness(options = {}) {
   const fetchFn = async (url, optionSet = {}) => {
     const method = (optionSet.method || 'GET').toUpperCase();
     const headers = optionSet.headers || {};
-    const body = optionSet.body ? JSON.parse(optionSet.body) : undefined;
+    const body = optionSet.body ? (typeof optionSet.body==='string'?JSON.parse(optionSet.body):optionSet.body) : undefined;
     const entry = { url: String(url), method, body, headers: { ...headers } };
     requestLog.push(entry);
     if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
@@ -316,6 +316,7 @@ function createHarness(options = {}) {
     if (state.openError && entry.url === '/api/v1/runs/open') return jsonResponse({ detail: state.openError }, 409);
     if (entry.url === '/api/v1/session') return jsonResponse({ token: state.token });
     if (entry.url === '/api/v1/status') return jsonResponse(clone(state.status));
+    if (entry.url === '/api/v1/output/check') return jsonResponse(clone(state.outputCheck || {path:body.path,conflicts:[],overwrite_token:null}));
     if (entry.url === '/api/v1/scan/plan' || entry.url === '/api/v1/plan') return jsonResponse(clone(state.plan));
     if (entry.url === '/api/v1/runs' && method === 'POST') {
       const run = clone(state.newRun || { ...fx.run, run_id: 'started-run-1', status: 'preparing', completed_points: 0, committed_frames: 0, acquired_frames: 0, saved: false, path: null, error: null });
@@ -327,6 +328,9 @@ function createHarness(options = {}) {
       state.status = { ...clone(state.status), run, busy: null };
       state.records = clone(options.openRecords || fx.records);
       return jsonResponse(run);
+    }
+    if (entry.url === '/api/v1/runs/import') {
+      const run=clone(fx.run);state.status={...clone(state.status),run,busy:null};state.records=clone(fx.records);return jsonResponse(run);
     }
     let match = entry.url.match(/^\/api\/v1\/runs\/([^/?]+)\/(records)\?offset=(\d+)&limit=(\d+)$/);
     if (match) {
@@ -369,7 +373,7 @@ function createHarness(options = {}) {
     if (entry.url.startsWith('/api/v1/calibration/solutions/')) return jsonResponse(clone(fx.exported));
     if (entry.url === '/api/v1/calibration/frame') return jsonResponse(state.calFrame ? clone(state.calFrame) : null);
     if (entry.url === '/api/v1/calibration/frames') { state.calFrame = clone(fx.frame); state.records.length; return jsonResponse(clone(fx.frame)); }
-    if (entry.url === '/api/v1/calibration/extract') return jsonResponse(clone(fx.extracted));
+    if (entry.url === '/api/v1/calibration/extract') return jsonResponse(clone(state.extracted || fx.extracted));
     if (entry.url === '/api/v1/calibration/fit') return jsonResponse(clone(fx.solution));
     if (entry.url === '/api/v1/calibration/apply') {
       state.applied = true;
@@ -448,7 +452,7 @@ function createHarness(options = {}) {
     requestAnimationFrame,
     devicePixelRatio: 1,
     ResizeObserver: class { constructor(cb) { this.cb = cb; } observe() {} disconnect() {} },
-    getComputedStyle: () => ({ getPropertyValue: name => CSS_COLORS[name] || '' }),
+    getComputedStyle: () => ({ getPropertyValue: name => name==='--no-data'?CSS_COLORS['--plot']:CSS_COLORS[name] || '' }),
     crypto: { randomUUID: () => 'uuid-' + (++clock.seq).toString(16).padStart(8, '0') },
     structuredClone,
     Float32Array, Float64Array, Int32Array, Uint8ClampedArray, Object, Array, JSON, Math, Number,

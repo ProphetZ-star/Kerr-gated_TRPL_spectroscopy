@@ -29,6 +29,16 @@ async function request(path,body,retry=true){
 }
 export async function api(path,body){return (await request(path,body)).json();}
 export async function download(path){return request(path);}
+export async function uploadExperiment(file,retry=true){
+ const used=token;
+ const response=await fetchLocal('/api/v1/runs/import',{method:'POST',headers:{'Content-Type':'application/x-hdf5','X-Session-Token':used,'X-File-Name':encodeURIComponent(file.name)},body:file});
+ if(response.ok)return response.json();
+ const error=await responseError(response);
+ if(retry&&response.status===403&&error.message==='Missing local session token'){
+  if(token===used)await initialize();return uploadExperiment(file,false);
+ }
+ throw error;
+}
 export const requestId=()=>crypto.randomUUID();
 export function subscribe(onMessage,onConnection){
  let stopped=false,socket;
