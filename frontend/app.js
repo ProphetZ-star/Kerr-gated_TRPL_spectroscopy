@@ -1,3 +1,4 @@
+import {initDeviceConnections,renderDeviceConnections,deviceAvailability} from './devices.js';
 import {api,initialize,requestId,subscribe,download,uploadExperiment} from './api.js';
 import {store,axisForRun,analysisContext} from './store.js';
 import {drawAll,clickWave,initChartDrags} from './charts.js';
@@ -70,7 +71,7 @@ function request(){
 function schedulePlan(){clearTimeout(planTimer);planTimer=setTimeout(plan,180);}
 async function plan(){
  if(store.snapshot?.busy)return;
- try{const p=await api('/scan/plan',request());$('validation').textContent='';updateProgress({percent:0,text:`${p.delays_ps.length} points / scan · ${p.rounds} scans`,remaining:`Estimated ${p.estimated_seconds.toFixed(1)} s / ×${acquisitionParameters.speedup} simulation`});$('run').disabled=headerLocked()||!store.online;}
+ try{const p=await api('/scan/plan',request());$('validation').textContent='';updateProgress({percent:0,text:`${p.delays_ps.length} points / scan · ${p.rounds} scans`,remaining:store.snapshot?.source_mode==='simulation'?`Estimated ${p.estimated_seconds.toFixed(1)} s / ×${acquisitionParameters.speedup} simulation`:`Estimated ${p.estimated_seconds.toFixed(1)} s`});$('run').disabled=headerLocked()||!deviceAvailability(store.snapshot,store.online).scan;}
  catch(e){$('validation').textContent=e.message;$('run').disabled=true;}
 }
 async function syncRecords(force=false){
@@ -90,21 +91,25 @@ async function syncRecords(force=false){
 function renderStatus(s){
  store.subtract=false;
  const finalProgress=syncHeaderLock();
- const busy=Boolean(s.busy),run=store.run,active=s.busy==='scan';
- ['stageFields','detectorFields'].forEach(id=>$(id).disabled=(busy&&s.busy!=='preview')||s.stage.moving||!store.online);$('scanFields').disabled=busy||!store.online;
- $('captureBackground').disabled=busy||!store.online;$('preview').disabled=(busy&&s.busy!=='preview')||!store.online;
+ const busy=Boolean(s.busy),run=store.run,active=s.busy==='scan',available=deviceAvailability(s,store.online);
+ const editingLocked=(busy&&s.busy!=='preview')||s.stage.moving||!store.online;
+ $('stageFields').disabled=editingLocked||!available.stage;
+ $('detectorFields').disabled=editingLocked||(!available.camera&&!available.spectrograph);
+ $('exposure').disabled=!available.camera;
+ $('center').title=s.devices?.spectrometer?.capabilities?.manual?'Record the manually adjusted center wavelength':'Set spectrometer center wavelength';
+ for(const [id,key]of [['center','center_nm'],['grating','grating'],['slit','slit_um']])$(id).disabled=!available.spectralControls.includes(key);
+ $('scanFields').disabled=busy||!available.scan;
+ $('captureBackground').disabled=busy||!available.background;$('preview').disabled=(busy&&s.busy!=='preview')||!available.preview;
  $('preview').textContent=s.busy==='preview'?'Stop preview':'Live preview';
- if(document.activeElement!==$('delay'))$('delay').value=s.stage.delay_ps.toFixed(3);
- $('stageStatus').replaceChildren();const dot=document.createElement('span');dot.className='dot';$('stageStatus').append(dot,document.createTextNode(s.stage.moving?'Moving':s.connected?'In position':'Disconnected'));
+ if(document.activeElement!==$('delay')){if(Number.isFinite(s.stage.delay_ps))$('delay').value=s.stage.delay_ps.toFixed(3);else $('delay').value='';}
+ $('stageStatus').replaceChildren();const dot=document.createElement('span');dot.className='dot';$('stageStatus').append(dot,document.createTextNode(s.stage.moving?'Moving':available.stage?(s.stage.position_source==='controller_step_counter'?'In position · Step count':'In position'):'Not connected'));
  $('stageStatus').classList.toggle('moving',s.stage.moving);
- document.querySelectorAll('.connected').forEach(el=>el.textContent=s.connected?'● Simulated':'Disconnected');
- document.querySelector('.badge').textContent=store.online?(s.source_mode==='simulation'?'SIMULATION · Hardware offline ▾':'HARDWARE · '+(s.connected?'Connected':'Offline')+' ▾'):'SERVICE OFFLINE';
- $('hardwareMode').disabled=busy||!store.online;
+ renderDeviceConnections();
  const label=active?(run?.status??'running'):busy?s.busy:run?.status??'ready';
  $('runStatus').textContent=label.charAt(0).toUpperCase()+label.slice(1);$('runStatus').className='run-sub '+(run?.status==='error'?'status-danger':'status-neutral');
  $('run').textContent=active?(['paused','pausing'].includes(run.status)?'▶ Resume':'\u275A\u275A Pause'):'▶ Start';
- $('run').disabled=headerLocked()||!store.online||(busy&&!active)||(['preparing','stopping','finalizing'].includes(run?.status)&&active)||(!s.connected);
- $('stop').disabled=headerLocked()||!['scan','move','background','preview'].includes(s.busy)||run?.status==='stopping';
+ $('run').disabled=headerLocked()||!store.online||(busy&&!active)||(['preparing','stopping','finalizing'].includes(run?.status)&&active)||(!active&&!available.scan);
+ $('stop').disabled=headerLocked()||!['scan','move','background','preview','calibration'].includes(s.busy)||run?.status==='stopping';
  $('autosave').disabled=busy;$('savePath').disabled=busy;$('path').disabled=busy;
  if(run){
   const pct=100*run.completed_points/run.plan.total_points;
@@ -120,7 +125,7 @@ function renderStatus(s){
 async function refresh(force=false){
  if(updating){if(force===true)fullSyncPending=true;return;}updating=true;let reachable=false;
  try{
-  const s=await readStatus(force===true);reachable=true;const first=!store.snapshot;
+  const s=await readStatus(force===true);reachable=true;const first=!store.snapshot,deviceChanged=store.snapshot?.device_generation!==s.device_generation;
   if(store.snapshot&&store.snapshot.worker_session_id!==s.worker_session_id){await initialize();store.records=[];store.run=null;store.fit=null;fitJobs.acquisition=null;fitJobs.analysis=null;analysisFitState(false);store.analysis={imported:false,run:null,records:[],fit:null,wave:600,halfWindow:5};analysisSeenFits.clear();}
   store.online=true;store.snapshot=s;
   const changed=s.run?.run_id!==store.run?.run_id;
@@ -134,11 +139,11 @@ async function refresh(force=false){
     if(r.save_path){const saved=splitOutputPath(r.save_path);store.outputDirectory=saved.directory;$('savePath').value=saved.fileName;renderOutput();}
    }
   }
-  if(first){$('center').value=s.spectrograph.center_nm;$('grating').value=s.spectrograph.grating;$('slit').value=s.spectrograph.slit_um;$('exposure').value=s.camera.exposure_s;}
+  if(first||deviceChanged){$('center').value=s.spectrograph.center_nm;$('grating').value=s.spectrograph.grating;$('slit').value=s.spectrograph.slit_um;$('exposure').value=s.camera.exposure_s;}
   store.run=s.run;
   if(!fitJobs.acquisition){const restored=newestUnseenFit(store.run,seenFits);if(restored)showFit(restored);}
   renderStatus(s);await syncRecords();rendering.request();ready();
- }catch(e){startupError(e);if(reachable){toast(e.message);return;}store.online=false;$('hardwareMode').disabled=true;$('runStatus').textContent=e.status===503?'Backend unavailable · restart local service':'Service offline';$('run').disabled=true;$('stop').disabled=true;document.querySelector('.badge').textContent=e.status===503?'BACKEND UNAVAILABLE · Restart local service':'SERVICE OFFLINE';}
+ }catch(e){startupError(e);if(reachable){toast(e.message);return;}store.online=false;for(const id of ['stageFields','detectorFields','scanFields','preview','captureBackground'])$(id).disabled=true;renderDeviceConnections();if(!$('calibrationPage').hidden)renderCalibration();$('hardwareMode').disabled=true;$('runStatus').textContent=e.status===503?'Backend unavailable · restart local service':'Service offline';$('run').disabled=true;$('stop').disabled=true;document.querySelector('.badge').textContent=e.status===503?'BACKEND UNAVAILABLE · Restart local service':'SERVICE OFFLINE';}
  finally{updating=false;if(fullSyncPending){fullSyncPending=false;void refresh(true);}}
 }
 function currentFitOptions(scope){
@@ -186,7 +191,7 @@ $('run').onclick=()=>action(async()=>{
  if(body.autosave)await withOutputConfirmation(body.save_path,token=>api('/runs',{...body,overwrite_token:token}));
  else await api('/runs',body);
 });
-$('stop').onclick=()=>{if(!headerLocked())return action(()=>api(({move:'/stage/stop',preview:'/preview/stop',background:'/backgrounds/stop'})[store.snapshot?.busy]??`/runs/${store.run?.run_id}/stop`,{}));};
+$('stop').onclick=()=>{if(!headerLocked())return action(()=>api(({move:'/stage/stop',preview:'/preview/stop',background:'/backgrounds/stop',calibration:'/calibration/stop'})[store.snapshot?.busy]??`/runs/${store.run?.run_id}/stop`,{}));};
 $('moveAbsolute').onclick=()=>action(()=>api('/stage/move',{delay_ps:n('delay'),relative:false,request_id:requestId()}));
 $('returnZero').onclick=()=>action(()=>api('/stage/move',{delay_ps:0,relative:false,request_id:requestId()}));
 $('delay').onkeydown=e=>{if(e.key==='Enter')$('moveAbsolute').click();};
@@ -197,10 +202,13 @@ document.querySelectorAll('#mode button').forEach(b=>b.onclick=()=>{store.select
 $('addSegment').onclick=()=>{if(segments.length>=10)return toast('Up to 10 segments');const start=segments.at(-1).end;segments.push({start,end:start+10,step:1});renderSegments();schedulePlan();};
 for(const id of ['repeats','exposure'])$(id).addEventListener('input',schedulePlan);
 $('exposure').onchange=()=>action(()=>api('/camera/configure',{exposure_s:n('exposure')}));
-$('center').onchange=()=>action(async()=>{await api('/spectrograph/config',{center_nm:n('center'),grating:n('grating'),slit_um:n('slit')});toast('Manual setting recorded. Wavelength calibration must be reloaded.');});
+$('center').onchange=()=>action(async()=>{await api('/spectrograph/config',{center_nm:n('center'),grating:n('grating'),slit_um:n('slit')});toast(store.snapshot?.devices?.spectrometer?.capabilities?.manual?'Manual setting recorded. Wavelength calibration must be reloaded.':'Spectrometer setting applied. Wavelength calibration must be reloaded.');});
 for(const id of ['grating','slit'])$(id).onchange=$('center').onchange;
-$('preview').onclick=()=>action(()=>api('/preview/'+(store.snapshot?.busy==='preview'?'stop':'start'),{}));
-$('captureBackground').onclick=()=>action(async()=>{await api('/backgrounds',{kind:'dark',condition:'Synthetic shutter closed'});});
+$('preview').onclick=()=>action(async()=>{if(store.snapshot?.busy==='preview')return api('/preview/stop',{});await api('/camera/configure',{exposure_s:n('exposure')});return api('/preview/start',{});});
+$('captureBackground').onclick=()=>{
+ if(store.snapshot?.source_mode==='simulation')return action(()=>api('/backgrounds',{kind:'dark',condition:'Synthetic shutter closed'}));
+ const box=document.createElement('div'),p=document.createElement('p'),b=document.createElement('button');p.textContent='Block light to the CCD before acquiring a dark background. This software does not operate a shutter.';b.textContent='Light blocked · Acquire';b.className='primary';b.onclick=()=>action(async()=>{await api('/backgrounds',{kind:'dark',condition:'User confirmed light blocked'});$('modal').close();});box.append(p,b);modal('Acquire dark background',box);
+};
 $('runFit').onclick=()=>action(()=>startFit('analysis'));
 for(const [id,key]of [['spectrumScale','specScale'],['mapScale','mapScale']])document.querySelectorAll('#'+id+' button').forEach(b=>b.onclick=()=>{store[key]=b.dataset.scale;document.querySelectorAll('#'+id+' button').forEach(x=>x.classList.toggle('selected',x===b));renderViews();});
 for(const id of ['spectrum','map'])$(id).onclick=e=>{clickWave(id,e.clientX);};
@@ -217,14 +225,8 @@ $('path').onclick=async()=>{
  save.textContent='Use folder';save.className='primary';save.onclick=()=>{if(!input.value.trim())return toast('Enter a save folder.');store.outputDirectory=input.value.trim();renderOutput();schedulePlan();$('modal').close();};
  box.append(label,input,save);modal('Choose save folder',box);
 };
-$('hardwareMode').onclick=()=>{
- if(!store.online||store.snapshot?.busy)return;
- const box=document.createElement('div'),info=document.createElement('p'),options=document.createElement('div');options.className='source-options';
- info.textContent='Andor Newton DU920P · PI M-414.32S (USB). Hardware mode requires commissioned drivers and the PI controller configuration.';
- for(const [mode,label]of [['simulation','Simulation'],['hardware','Real hardware']]){const button=document.createElement('button');button.textContent=label;button.onclick=()=>action(async()=>{await api('/devices/connect',{mode});$('modal').close();});options.append(button);}
- box.append(info,options);modal('Acquisition source',box);
-};
-$('export').onclick=async()=>{if(!store.run||!axisForRun())return;const url=`/runs/${store.run.run_id}/export?center_nm=${store.wave}&half_window_nm=${store.halfWindow}`;try{const r=await download(url);const a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download=`kerr_${store.run.run_id}_simulation.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}catch(e){toast(e.message);}};
+initDeviceConnections({modal,action,onSourceChanged:schedulePlan});
+$('export').onclick=async()=>{if(!store.run||!axisForRun())return;const url=`/runs/${store.run.run_id}/export?center_nm=${store.wave}&half_window_nm=${store.halfWindow}`;try{const r=await download(url);const a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download=`kerr_${store.run.run_id}_${store.run.metadata.meta.source_mode}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}catch(e){toast(e.message);}};
 $('saveRun').onclick=()=>action(async()=>{if(store.analysis.imported)return;const path=output(),id=store.run.run_id;await withOutputConfirmation(path,token=>api(`/runs/${id}/save`,{path,overwrite_token:token}),'Cancel save');});
 $('discardRun').onclick=()=>{if(store.analysis.imported)return action(async()=>{await api('/analysis/runs/'+store.analysis.run.run_id+'/close',{});store.analysis={imported:false,run:null,records:[],fit:null,wave:600,halfWindow:5};fitJobs.analysis=null;if(acquisitionFitOptions){$('fitModel').value=acquisitionFitOptions.model;$('irfWidth').value=acquisitionFitOptions.irf_fwhm_ps;$('fitStart').value=acquisitionFitOptions.min_delay_ps??'';$('fitEnd').value=acquisitionFitOptions.max_delay_ps??'';}analysisFitState(!!fitJobs.acquisition);renderViews();});const box=document.createElement('div'),p=document.createElement('p'),b=document.createElement('button');p.textContent='Discard the in-memory experiment? Existing files are retained.';b.textContent='Discard memory';b.onclick=()=>action(async()=>{await api(`/runs/${store.run.run_id}/discard`,{});$('modal').close();});box.append(p,b);modal('Discard experiment',box);};
 $('openRun').onclick=async()=>{

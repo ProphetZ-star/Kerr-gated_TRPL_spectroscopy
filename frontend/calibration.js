@@ -1,3 +1,4 @@
+import {deviceAvailability} from './devices.js';
 import {api} from './api.js';
 import {store} from './store.js';
 import {plotRange,registerAxisEndpoints} from './plot-ranges.js';
@@ -33,7 +34,7 @@ async function receiveFrame(result){
  if(!result)return;
  if(![1,255].includes(result.shape?.[0])||result.shape?.[1]!==W||result.image_counts?.length!==W*result.shape[0])throw Error('Unexpected CCD frame shape.');
  setFrameHeight(result.shape[0]);$('calDimensions').textContent=W+' × '+H+' px';$('calReadout').value=result.readout==='fvb'?'fvb':'full_image';frameMeta=result;frame=new Int32Array(result.image_counts);image=null;frameNo++;invalidate();await extract();
- $('calFrameState').textContent='Simulated frame '+frameNo;
+ $('calFrameState').textContent=(result.source_mode==='hardware'?'CCD frame ':'Simulated frame ')+frameNo;
 }
 function clearFrame(){frame=null;frameMeta=null;profile=null;detected=[];image=null;invalidate();$('calFrameState').textContent='No frame';$('calRoiLabel').hidden=true;$('calRoiLabel').textContent='';}
 async function calAction(fn){
@@ -44,18 +45,21 @@ async function calAction(fn){
  finally{acquiring=false;renderPairs();renderCalibration();await changed();}
 }
 function syncSession(){
- const current=store.snapshot?.worker_session_id;
+ const current=store.snapshot?.worker_session_id?store.snapshot.worker_session_id+':'+store.snapshot.device_generation:null;
  if(!store.online||store.snapshot?.busy||!current||current===session)return;
  session=current;clearFrame();
  void calAction(async()=>{await receiveFrame(await api('/calibration/frame'));});
 }
 function renderControls(){
- const busy=!!store.snapshot?.busy,blocked=controlsLocked();
+ const busy=!!store.snapshot?.busy,blocked=controlsLocked(),available=deviceAvailability(store.snapshot,store.online),sim=store.snapshot?.source_mode==='simulation';
+ $('calSource').textContent=sim?'SIMULATION':'HARDWARE';$('calConnectionNote').textContent=sim?'Backend simulated frame':available.camera?'CCD connected · SDK2 acquisition':'Connect a CCD in Detection to acquire a frame.';
  if(frameMeta&&JSON.stringify(frameMeta.spectrograph)!==JSON.stringify(store.snapshot?.spectrograph)){clearFrame();feedback('Manual spectrograph settings changed. Acquire a new frame.');}
- $('calCapture').disabled=blocked||busy;$('calCapture').textContent=acquiring?'Working…':'Acquire frame';
+ $('calCapture').disabled=blocked||busy||!available.calibration;$('calCapture').textContent=acquiring?'Working…':'Acquire frame';
  $('calFindPeaks').disabled=blocked||!profile;$('calFitMapping').disabled=blocked||!frameMeta;
  $('calApply').disabled=blocked||busy||!solution;$('calExport').disabled=blocked||!solution;
  for(const id of ['calReadout','calExposure','calRowStart','calRowEnd','calOrder','calConvention','calReferenceFile','calDemoReference','calAddLine','calOpenFile','calInstalledFile'])$(id).disabled=blocked;
+ for(const id of ['calExposure','calReadout'])$(id).disabled=blocked||!available.calibration;
+ $('calDemoReference').disabled=blocked||!sim;
  $('calRowStart').disabled=blocked||$('calReadout').value==='fvb';$('calRowEnd').disabled=blocked||$('calReadout').value==='fvb';$('calExtractionNote').textContent=$('calReadout').value==='fvb'?'Full vertical binning · All CCD rows are combined.':'Mean of selected rows · Click the CCD image to move the band.';
  for(const input of $('calPairs').querySelectorAll('input,button'))input.disabled=blocked;
  for(const button of document.querySelectorAll('#calAxis button'))button.disabled=blocked||(button.dataset.axis==='wavelength'&&!solution);
@@ -85,7 +89,9 @@ export function initCalibration(onChanged=async()=>{}){
    await api('/calibration/load',{calibration_id:value.calibration_id,source:value.source,wavelengths_nm:value.wavelengths_nm});clearFrame();feedback('Loaded '+file.name+' for future acquisitions. Existing experiments retain their recorded calibration.');
   }finally{e.target.value='';}
  });
- $('calCapture').onclick=()=>calAction(async()=>{const exposure=Number($('calExposure').value);if($('calExposure').value===''||!Number.isFinite(exposure)||exposure<.001||exposure>3600)throw Error('Exposure must be from 0.001 to 3600 s.');clearFrame();await receiveFrame(await api('/calibration/frames',{exposure_s:exposure,seed:42,readout:$('calReadout').value}));feedback('Simulated CCD frame received from backend.');});
+ $('calCapture').onclick=()=>calAction(async()=>{const exposure=Number($('calExposure').value);if($('calExposure').value===''||!Number.isFinite(exposure)||exposure<.001||exposure>3600)throw Error('Exposure must be from 0.001 to 3600 s.');clearFrame();let result=await api('/calibration/frames',{exposure_s:exposure,seed:42,readout:$('calReadout').value});
+ if(result.pending){const captureId=result.capture_id,deadline=Date.now()+(exposure+40)*1000;while(true){const task=await api('/calibration/captures/'+captureId);if(task.status==='completed'){result=task.frame;break;}if(task.status!=='running')throw Error(task.error??'CCD capture did not complete');if(Date.now()>deadline)throw Error('CCD capture timed out. Stop it with the top Stop button.');await new Promise(resolve=>setTimeout(resolve,150));}}
+ await receiveFrame(result);feedback(result.source_mode==='hardware'?'CCD frame received from SDK2.':'Simulated CCD frame received from backend.');});
  for(const id of ['calRowStart','calRowEnd'])$(id).onchange=()=>calAction(async()=>{invalidate();profile=null;detected=[];await extract();feedback('');});
  $('calFindPeaks').onclick=()=>calAction(async()=>{await extract();const found=peaks();if(!found.length)throw Error('No peaks found. Acquire a frame first.');pairs=pairs.map(p=>({...p,pixel:+found.reduce((best,x)=>Math.abs(x-p.pixel)<Math.abs(best-p.pixel)?x:best,found[0]).toFixed(3)}));invalidate();feedback(found.length+' peaks detected · Review line assignments.');});
  $('calAddLine').onclick=()=>{if(controlsLocked())return;pairs.push({id:nextId++,pixel:512,wave:600,enabled:true});selected=pairs.length-1;invalidate();renderPairs();$('calPairs').lastElementChild?.scrollIntoView({block:'nearest'});renderCalibration()};

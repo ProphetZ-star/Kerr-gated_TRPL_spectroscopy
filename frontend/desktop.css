@@ -183,3 +183,18 @@ body.light .seg button.selected{background:#dbe6f6;color:#244b7f}
  .sidebar>.section:nth-child(2) .heading{margin-bottom:8px}
  .sidebar>.section:nth-child(2) details{margin-top:8px}
 }
+
+/* Independent hardware connections */
+.connection-button{height:26px;min-height:26px;padding:0 7px;background:transparent;border-color:transparent;cursor:pointer}
+.connection-button[data-state="connected"]{color:var(--data)}
+.connection-button[data-state="partial"]{color:var(--warning)}
+.connection-button[data-state="disconnected"]{color:var(--muted)}
+.device-connections{display:grid;gap:16px;max-height:72vh;overflow:auto;padding:2px}
+.device-card+.device-card{border-top:1px solid var(--line);padding-top:16px}
+.device-card h3{color:var(--text);font-weight:600}
+.device-card .grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.device-card label{min-width:0}.device-card input,.device-card select{width:100%;min-width:0}
+.device-actions{display:flex;gap:8px;justify-content:flex-end}
+.device-card .device-message{margin:8px 0;overflow-wrap:anywhere}
+.device-card .device-hint{font-size:12px;line-height:1.5}
+fieldset:disabled{opacity:.55}fieldset:disabled fieldset{opacity:1}

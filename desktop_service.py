@@ -131,6 +131,7 @@ class LocalService:
             elif status.get('busy')=='preview':self.request('/api/v1/preview/stop',{})
             elif status.get('busy')=='move':self.request('/api/v1/stage/stop',{})
             elif status.get('busy')=='background':self.request('/api/v1/backgrounds/stop',{})
+            elif status.get('busy')=='calibration':self.request('/api/v1/calibration/stop',{})
             deadline=time.monotonic()+15
             while status.get('busy') and time.monotonic()<deadline:
                 time.sleep(.1);status=self.retry_status(max(.1,deadline-time.monotonic()))

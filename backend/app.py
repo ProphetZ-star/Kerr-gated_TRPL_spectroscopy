@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 import asyncio
 import json
 import os
@@ -29,7 +30,34 @@ class SmallBody(BaseModel):
 
 
 class ConnectBody(SmallBody):
-    mode: str='simulation'
+    mode: Literal['simulation','hardware']='hardware'
+
+
+class DeviceBody(SmallBody):
+    device: Literal['stage','camera','spectrometer']
+    driver: str=Field(default='',max_length=80,pattern=r'^[a-z0-9_]*$')
+    transport: Literal['usb','serial','manual','tcpip','visa']|None=None
+    model: str=Field(default='',max_length=160)
+    resource: str=Field(default='',max_length=512)
+    usb_device: str=Field(default='',max_length=512)
+    pi_dll: str=Field(default='',max_length=4096)
+    port: str=Field(default='',max_length=64)
+    baudrate: Literal[9600,19200,38400,57600,115200]=38400
+    axis: str=Field(default='',max_length=16,pattern=r'^[A-Za-z0-9_]*$')
+    camera_index: int=Field(default=0,ge=0,le=63,strict=True)
+    dll_directory: str=Field(default='',max_length=4096)
+
+
+class SDKBody(SmallBody):
+    dll_directory: str=Field(default='',max_length=4096)
+
+
+class PIUSBBody(SmallBody):
+    pi_dll: str=Field(default='',max_length=4096)
+
+
+class DeviceNameBody(SmallBody):
+    device: Literal['stage','camera','spectrometer']
 
 
 class PathBody(SmallBody):
@@ -175,6 +203,38 @@ async def connect(body:ConnectBody):return await call('connect',body.model_dump(
 
 @app.post('/api/v1/devices/disconnect')
 async def disconnect():return await call('disconnect')
+
+
+@app.get('/api/v1/devices/ports')
+async def ports():return await call('device_ports')
+
+
+@app.get('/api/v1/devices/drivers')
+async def drivers():return await call('device_drivers')
+
+
+@app.post('/api/v1/devices/pi-usb')
+async def pi_usb(body:PIUSBBody):return await call('device_pi_usb',body.model_dump())
+
+
+@app.post('/api/v1/devices/cameras')
+async def cameras(body:SDKBody):return await call('device_cameras',body.model_dump())
+
+
+@app.post('/api/v1/devices/connect-one')
+async def connect_one(body:DeviceBody):return await call('device_connect',body.model_dump())
+
+
+@app.post('/api/v1/devices/disconnect-one')
+async def disconnect_one(body:DeviceNameBody):return await call('device_disconnect',body.model_dump())
+
+
+@app.get('/api/v1/calibration/captures/{capture_id}')
+async def capture_status(capture_id:str):return await call('calibration_capture_status',dict(capture_id=capture_id))
+
+
+@app.post('/api/v1/calibration/stop')
+async def capture_stop():return await call('calibration_stop')
 
 
 @app.post('/api/v1/camera/configure')

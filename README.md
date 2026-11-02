@@ -1,6 +1,6 @@
 # TRPL · Kerr Studio Desktop
 
-Windows 桌面精简版 Kerr 门时间分辨荧光采集与分析工作台。独立窗口运行，无浏览器地址栏；当前使用模拟信号，真实硬件模式尚未启用。
+Windows 桌面精简版 Kerr 门时间分辨荧光采集与分析工作台。独立窗口运行，无浏览器地址栏；默认进入硬件模式；未连接仪器也可打开主界面，并可手动切换为模拟模式。
 
 ## 启动
 
@@ -10,6 +10,10 @@ Windows 桌面精简版 Kerr 门时间分辨荧光采集与分析工作台。独
 
 `TRPL.exe` 是带图标的轻量启动器，不是捆绑 Python 的独立安装包。首次安装需要联网；Python 依赖保存在软件目录的 `.venv` 中，之后复用该环境。整个软件文件夹移动后，可继续从新位置启动；如现有虚拟环境因移动失效，删除该目录下的 `.venv`，下次启动会重建。
 
+桌面加载兼容处理由 `desktop_runtime.py` 和 `desktop-runtime.config` 提供，复制软件时必须一起保留。安装时会在 `.venv/DesktopRuntime` 中准备软件专用的 Python 启动进程及相邻配置，继续复用 `.venv` 中的依赖。该配置只允许本软件进程加载 Windows 判定为远程来源的桌面组件，不改系统 Python、注册表或全局 .NET 安全设置。
+
+安装验证、双击快速检查和正常桌面启动使用同一套加载方式。已有依赖完整时重试可直接验证，不需要全部重新下载；日志会逐项显示检查的模块。缺少这两个新增文件时会明确提示重新复制完整软件包。
+
 也可双击 `start-app.vbs` 启动。仅准备环境时，在软件目录运行：
 
 ```powershell
@@ -18,11 +22,33 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start-app.ps1 -SetupOn
 
 可为 `TRPL.exe` 创建桌面快捷方式；快捷方式会沿用 TRPL 图标。启动器自身的只读文件检查命令为 `TRPL.exe --check`，不会打开软件或安装依赖。
 
+## 硬件连接
+
+默认进入硬件模式，允许仪器全部断开。点击 Delay Stage 标题右侧的状态按钮，选择 **PI C-663.12 · M-414.32S**：
+
+- USB（默认）：安装 PI Software Suite 的 USB 驱动和 64 位 GCS2 DLL，点 **Find PI USB**，选择发现的控制器。通常可自动定位 DLL，也可在框中填写 PI GCS2 DLL 的完整路径。
+- RS-232 / COM：选择串口及与控制器拨码一致的波特率。当前适配器支持 9600、19200、38400、115200；不能仅根据软件下拉框假定控制器的设置。
+- 连接时核对 C-663.12 型号、`M-414.32S` 台体配置、轴、运动范围、电机启动状态和参考状态。请先在 PIMikroMove 中配置并完成参考；本软件不自动启用电机、找参考或改变运动参数。
+- M-414.32S 没有编码器，`POS?` 在此配置下报告步进轮廓发生器的位置。界面标为 **Step count**，数据标记为 `controller_step_counter`，不作为独立传感器实测位置。扫描按控制器读回的软限位检查，包括参考后的负坐标。
+
+点击 Detection 标题右侧的状态按钮，分别设置 CCD 与光谱仪：
+
+- **CCD**：Andor Newton DU920P，通过 USB / 官方 SDK2 选择相机，不使用 COM 口。需安装 Andor 的 64 位 SDK2 和相机驱动，再选择 `atmcd64d.dll` 所在文件夹。
+- **Oriel 77400 / MS125**：默认手动模式，不需要串口或控制器。先手动调好仪器，再在软件中记录中心波长、光栅及狭缝；记录值不会发送到仪器，状态显示 **Manual**，不显示虚假的“已连接”。
+- **其他手动光谱仪**：可选 Other spectrometer · Manual 并记录型号。
+- **未来自动控制光谱仪**：保留 Serial、USB、TCP/IP、VISA 连接信息。未安装具体型号驱动时禁用 Connect，不猜测协议或发送通用命令。添加驱动的方法见 [INSTRUMENT_DRIVERS.md](INSTRUMENT_DRIVERS.md)。
+
+各设备独立启用：仅 CCD 即可预览、采背景及标定帧；仅位移台即可移动及设置 t₀；TRPL 扫描需要 CCD 和位移台。手动光谱仪记录、Analysis 文件处理、标定文件导入不要求电子连接。
+
+硬件与模拟数据、t₀ 和标定分开。更换光谱仪型号或修改光学设置会清除当前波长标定；自动控制驱动必须回读实际设置。没有实测标定时显示 pixel，不用合成波长冒充实测标定。真实硬件尚未经过实机验证。
+
+接口依据：[C-663.12 官方规格](https://www.physikinstrumente.com/en/products/controllers-and-drivers/motion-controllers-drivers-for-linear-torque-stepper-dc-servo-motors/c-66312-mercury-step-stepper-motor-controller-900553/)、[M-414 官方规格](https://www.physikinstrumente.de/de/produkte/lineartische/tische-mit-dc-buerstenlosen-dc-bldc-schrittmotoren/m-414-praeziser-hochlast-lineartisch-701755/)、[PI 官方 PIPython](https://github.com/PI-PhysikInstrumente/PIPython)。
+
 ## 使用
 
 - **Acquisition**：实时预览、位移台调节、分段扫描、背景采集、暂停/恢复与 HDF5 保存。确认覆盖时直接替换同名实验文件，不生成备份。
 - **Analysis**：`Decay & fit` 查看指定波长的衰减并拟合；`Spectrum` 选择多个 delay 叠加波长光谱，颜色按时间先后映射。导入文件只影响 Analysis。
-- **Spectral Calibration**：模拟 CCD Full image / FVB 采集、选行提取、谱线指认、波长标定拟合及 JSON 导入/导出。
+- **Spectral Calibration**：CCD Full image / FVB 采集（按当前硬件或模拟模式）、选行提取、谱线指认、波长标定拟合及 JSON 导入/导出。
 - 显示轴的最小值/最大值可点击原位编辑，Enter 应用，Esc 取消。
 
 实验与运行日志默认位于 `data`，可另选实验保存目录。程序采用有界异步批量写入和前端增量更新；状态日常增量同步，每 60 秒完整同步。退出时仍会确认未保存或正在采集的数据。

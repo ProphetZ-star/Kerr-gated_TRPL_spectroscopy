@@ -133,8 +133,15 @@ function Initialize-KerrEnvironment([string]$Root,[string[]]$Modules,[string]$Re
             if($exitCode -ne 0){throw ('Dependency installation failed (exit '+$exitCode+'). See data\setup-pip.log.')}
         }elseif($LASTEXITCODE -ne 0){throw 'Could not inspect the Python environment.'}
         Write-KerrSetupStatus 4 'Verifying installed dependencies'
-        $verification=Invoke-KerrInstaller $projectPython @('-u','-c','import importlib,sys; [importlib.import_module(n) for n in sys.argv[1].split(chr(44))]',$names) 180 4
-        if($verification -ne 0){throw 'Dependency verification failed. Check data\setup.log.'}
+        if($Modules -contains 'clr'){
+            $runtimeHelper=Join-Path $Root 'desktop_runtime.py'
+            if(-not(Test-Path -LiteralPath $runtimeHelper) -or -not(Test-Path -LiteralPath (Join-Path $Root 'desktop-runtime.config'))){throw 'Incomplete desktop package: copy desktop_runtime.py and desktop-runtime.config, then retry.'}
+            $verification=Invoke-KerrInstaller $projectPython @('-u',$runtimeHelper,'--verify',$names) 180 4
+        }else{
+            $verification=Invoke-KerrInstaller $projectPython @('-u','-c','import importlib,sys; [importlib.import_module(n) for n in sys.argv[1].split(chr(44))]',$names) 180 4
+        }
+        if($verification -ne 0){throw 'Dependency or desktop-component verification failed. The failed module and full error are in data\setup.log; retry after correcting that error.'}
+        if($Modules -contains 'clr'){$projectPython=Join-Path $Root '.venv\DesktopRuntime\python.exe'}
         Write-KerrSetupStatus 4 'Dependencies ready' 'ready'
         return $projectPython
     }catch{

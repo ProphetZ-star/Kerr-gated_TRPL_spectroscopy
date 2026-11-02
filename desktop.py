@@ -6,6 +6,7 @@ import re
 import traceback
 from log_utils import rotate_file,CappedStream
 from desktop_instance import DesktopInstance
+from desktop_runtime import ensure_desktop_runtime,launch_desktop_if_needed
 
 ROOT=Path(__file__).resolve().parent
 ERROR_LOG=ROOT/'data'/'desktop-error.log'
@@ -84,6 +85,7 @@ def _write_log(message,exc):
 
 def create_desktop(url,on_closing=None,on_started=None):
     '''Block in the native GUI. Closing callback returns False to cancel.'''
+    ensure_desktop_runtime()
     import webview
     # Blob/anchor CSV exports need an explicit native Save As dialog in WebView2.
     webview.settings['ALLOW_DOWNLOADS']=True
@@ -187,7 +189,8 @@ def run_desktop():
 
 if __name__=='__main__':
     try:
-        raise SystemExit(main())
+        relaunched=launch_desktop_if_needed(Path(__file__).resolve())
+        raise SystemExit(main() if relaunched is None else relaunched)
     except Exception as exc:
         _write_log('Desktop launch failed',exc)
         if os.name=='nt':
