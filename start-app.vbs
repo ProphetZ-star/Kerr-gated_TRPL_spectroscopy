@@ -13,7 +13,7 @@ setup=fso.BuildPath(root,"start-app.cmd")
 shell.CurrentDirectory=root
 result=1
 If fso.FileExists(python) Then
-    probe="import sys,struct,importlib.util; sys.exit(0 if sys.version_info >= (3,12) and struct.calcsize('P')==8 and all(importlib.util.find_spec(n) is not None for n in ('webview','clr','clr_loader','bottle','proxy_tools','fastapi','uvicorn','numpy','scipy','h5py','pydantic','websockets')) else 1)"
+    probe="import sys,struct,importlib.util; sys.exit(0 if sys.version_info >= (3,12) and struct.calcsize('P')==8 and all(importlib.util.find_spec(n) is not None for n in ('webview','clr','clr_loader','bottle','proxy_tools','fastapi','uvicorn','numpy','scipy','h5py','pydantic','websockets')) and __import__('clr') is not None else 1)"
     result=shell.Run(Chr(34) & python & Chr(34) & " -c " & Chr(34) & probe & Chr(34),0,True)
 End If
 If result<>0 Then
