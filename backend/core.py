@@ -15,7 +15,7 @@ def mm_to_delay(position, zero=150.0, sign=1):
     return sign * 2 * (position - zero) / C_MM_PS
 
 
-def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0):
+def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0, limits=(0.,300.)):
     if request.mode == 'single':
         points = [current_delay]
     else:
@@ -41,8 +41,8 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0):
     targets = [delay_to_mm(p, zero, sign) for p in points]
     # Positive-direction approach on every round. The extra travel is part of the plan.
     approach = targets[0] - sign * 0.01 if request.mode != 'single' else targets[0]
-    if any(not 0 <= x <= 300 for x in targets + [approach]):
-        raise ValueError('Scan or approach position exceeds simulated soft limits 0–300 mm')
+    if any(not limits[0] <= x <= limits[1] for x in targets + [approach]):
+        raise ValueError(f'Scan or approach position exceeds stage soft limits {limits[0]}–{limits[1]} mm')
     if len(set(targets)) != len(targets):
         raise ValueError('Different delays map to indistinguishable stage positions')
     rounds = request.repeats if request.mode == 'repeat' else 1

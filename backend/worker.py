@@ -11,8 +11,10 @@ import traceback
 import uuid
 import numpy as np
 from .core import make_plan, mm_to_delay, delay_to_mm
-from .models import RunRequest, FitRequest
+from .models import RunRequest, FitRequest, SpectrographConfig
 from .drivers.sim import SimCamera, SimStage
+from .devices import DeviceConnections, serial_ports
+from .drivers.hardware import HardwareError, AcquisitionCancelled, camera_choices
 from .storage.hdf5 import HDFWriter, choose_path, read_run, append_analysis
 from .storage.output import output_info,prepare_output
 from .storage.export import export_csv
@@ -47,25 +49,91 @@ class Cancelled(Exception):
 
 
 class Engine:
-    def __init__(self, events):
+    def __init__(self, events, device_factories=None):
         self.events=events;self.lock=RLock();self.seq=0;self.session=uuid.uuid4().hex
-        self.camera=SimCamera();self.stage=SimStage();self.zero=150.0;self.zero_version=1
-        self.revision=0;self.connected=True;self.busy=None;self.latest=None;self.background=None
-        self.calibration=dict(calibration_id='synthetic-500-800-v1',source='synthetic',wavelengths_nm=self.camera.axis.tolist())
+        self.devices=DeviceConnections(device_factories);self.zero=150.0;self.zero_version=1
+        self.revision=0;self.busy=None;self.latest=None;self.background=None
+        self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
         self.latest_axis=self.calibration['wavelengths_nm']
         self.spectrograph=dict(center_nm=600.0,grating=300,slit_um=200.0)
         self.calibration_workbench=CalibrationWorkbench()
         recorded=self.calibration_workbench.recorded_spectrograph()
         if recorded is not None:self.spectrograph=recorded
         restored=self.calibration_workbench.restore(self.spectrograph)
-        if restored is not None:self.calibration=restored
+        if restored is not None and restored.get('source')=='measured':self.calibration=restored
         self.latest_axis=self.calibration['wavelengths_nm']
         self.analysis_lock=RLock()
         self.current=None;self.runs={};self.stop=Event();self.pause=Event();self.job=None
         self.commands={};self.tasks={};self.pool=ThreadPoolExecutor(max_workers=1);self.last_preview=0
         self.task_controls={};self.analysis_runs={}
         self.shutdown_prepared=False;self.preview_moving=False
-        self.event_times={};self.latest_version=0
+        self.event_times={};self.latest_version=0;self.capture_tasks={};self.device_generation=0
+        self.mode_calibrations={'hardware':copy.deepcopy(self.calibration)}
+        self.mode_zeros={'hardware':self.zero};self.mode_spectrographs={'hardware':self.spectrograph.copy()}
+
+    @property
+    def camera(self):return self.devices.camera
+
+    @property
+    def stage(self):return self.devices.stage
+
+    @property
+    def connected(self):return all(link['connected'] for link in self.devices.links.values())
+
+    def stage_state(self,run=None):
+        connected=self.devices.connected('stage');simulated=self.devices.mode=='simulation'
+        return dict(controller_reported_mm=self.stage.position_mm if connected else None,
+                    position_source='simulated_controller' if simulated else getattr(self.stage,'position_source','controller') if connected else 'unavailable',
+                    position_sensor=bool(getattr(self.stage,'position_sensor',False)),
+                    delay_ps=mm_to_delay(self.stage.position_mm,self.zero) if connected else None,
+                    zero_mm=self.zero,zero_version=self.zero_version,
+                    moving=self.preview_moving or self.busy=='move' or bool(self.busy=='scan' and run and run['step']=='moving'))
+
+    def hardware_failure(self,exc):
+        self.devices.failed(exc.device,exc);self.revision+=1
+        self.emit('device.error',dict(device=exc.device,message=str(exc)))
+
+    def require_operation(self,name):
+        needed={'configure':('camera',),'move':('stage',),'zero':('stage',),
+                'preview_start':('camera',),'background':('camera',),
+                'calibration_capture':('camera',),'run':('stage','camera')}.get(name,())
+        self.devices.require(*needed)
+
+    def acquire_counts(self,delay,seed,index,exposure,center,fault='none',**options):
+        if self.devices.mode=='simulation':return self.camera.acquire(delay,seed,index,exposure,center,fault,**options)
+        try:image=self.camera.capture(exposure,'fvb',self.stop)
+        except AcquisitionCancelled:raise Cancelled()
+        return image[0],int(np.count_nonzero(image>=self.camera.full_scale))
+
+    def make_scan_plan(self,request):
+        limits=(self.stage.lower,self.stage.upper) if self.devices.mode=='hardware' and self.devices.connected('stage') else (0.,300.)
+        plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision,limits=limits)
+        if self.devices.mode=='hardware' and self.devices.connected('stage'):
+            for target in plan['targets_mm']+[plan['approach_mm']]:self.stage.duration(target)
+        return plan
+
+    def source_changed(self):
+        self.latest=None;self.latest_version+=1;self.background=None
+        self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm'])
+        self.calibration_workbench.invalidate();self.capture_tasks={};self.commands.clear();self.revision+=1;self.device_generation+=1
+        self.emit('device.status',dict(source_mode=self.devices.mode,devices=self.devices.status()))
+
+    def clear_wavelength_calibration(self):
+        empty=dict(calibration_id=None,source=None,wavelengths_nm=None)
+        self.calibration_workbench.persist(empty,self.spectrograph)
+        self.calibration=empty;self.latest_axis=None;self.background=None
+        self.calibration_workbench.invalidate();self.revision+=1
+
+    def capture_hardware_frame(self,capture_id,data):
+        try:
+            image=self.camera.capture(data['exposure_s'],data['readout'],self.stop)
+            frame=self.calibration_workbench.record_hardware_frame(image,self.camera.exposure_s,data['readout'],self.spectrograph,capture_id)
+            self.capture_tasks[capture_id]=dict(status='completed',frame=frame)
+        except AcquisitionCancelled:self.capture_tasks[capture_id]=dict(status='cancelled',error='CCD capture cancelled')
+        except Exception as exc:
+            self.capture_tasks[capture_id]=dict(status='error',error=str(exc))
+            if isinstance(exc,HardwareError):self.hardware_failure(exc)
+        self.emit('calibration.ready',dict(capture_id=capture_id,status=self.capture_tasks[capture_id]['status']))
 
     def emit(self, kind, payload):
         with self.lock:
@@ -93,9 +161,8 @@ class Engine:
                    id(self.latest_axis),id(self.background),self.calibration_workbench.warning)
             token=hashlib.sha256(repr(stamp).encode()).hexdigest()
             full=since!=token
-            state=dict(source_mode='simulation',connected=self.connected,busy=self.busy,worker_session_id=self.session,seq=self.seq,revision=self.revision,
-                       stage=dict(controller_reported_mm=self.stage.position_mm,position_source='simulated_controller',delay_ps=mm_to_delay(self.stage.position_mm,self.zero),zero_mm=self.zero,zero_version=self.zero_version,
-                                  moving=self.preview_moving or self.busy=='move' or bool(self.busy=='scan' and run and run['step']=='moving')),
+            state=dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,worker_session_id=self.session,seq=self.seq,revision=self.revision,
+                       stage=self.stage_state(run),
                        camera=self.camera.capabilities()|dict(exposure_s=self.camera.exposure_s),
                        run={k:serial(v) for k,v in run.items() if k not in {'records','writer','metadata','request','plan'}} if run else None,
                        _sync=dict(full=full,token=token,latest_version=self.latest_version))
@@ -114,11 +181,9 @@ class Engine:
 
     def status(self):
         with self.lock:
-            return dict(source_mode='simulation',connected=self.connected,busy=self.busy,
+            return dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,
                         worker_session_id=self.session,seq=self.seq,revision=self.revision,
-                        stage=dict(controller_reported_mm=self.stage.position_mm,position_source='simulated_controller',
-                                   delay_ps=mm_to_delay(self.stage.position_mm,self.zero),zero_mm=self.zero,zero_version=self.zero_version,
-                                   moving=self.preview_moving or self.busy=='move' or bool(self.busy=='scan' and self.current and self.runs[self.current]['step']=='moving')),
+                        stage=self.stage_state(self.runs.get(self.current)),
                         camera=self.camera.capabilities()|dict(exposure_s=self.camera.exposure_s),
                         calibration=copy.deepcopy(self.calibration),spectrograph=self.spectrograph.copy(),
                         calibration_warning=self.calibration_workbench.warning,
@@ -126,12 +191,13 @@ class Engine:
                         run=self.public_run(self.runs[self.current]) if self.current else None)
 
     def idle(self,devices=True):
-        if devices and not self.connected:raise CommandError('Devices are disconnected')
         if self.busy:raise CommandError('Devices are busy: '+self.busy)
 
     def set_exposure(self,exposure):
         if self.camera.exposure_s!=exposure:
-            self.camera.exposure_s=exposure;self.background=None;self.revision+=1
+            if self.devices.mode=='hardware':self.camera.set_exposure(exposure)
+            else:self.camera.exposure_s=exposure
+            self.background=None;self.revision+=1
 
     def prune_tasks(self):
         finished=[key for key,value in self.tasks.items() if value['status']!='running']
@@ -146,7 +212,8 @@ class Engine:
         self.idle();self.stop.clear();self.pause.clear();self.busy=kind
         def wrapped():
             try:target(*args)
-            except Cancelled:pass
+            except (Cancelled,AcquisitionCancelled):pass
+            except HardwareError as exc:self.hardware_failure(exc)
             except Exception as exc:
                 self.emit('device.error',dict(message=str(exc)))
             finally:
@@ -156,6 +223,10 @@ class Engine:
         self.job.start()
 
     def move(self,target,speedup=50):
+        if self.devices.mode=='hardware':
+            try:self.stage.move_to(target,self.stop)
+            except AcquisitionCancelled:raise Cancelled()
+            self.emit('stage.position',self.stage_state());return
         duration=self.stage.duration(target)
         self.emit('stage.position',dict(moving=True,target_mm=target))
         started=time.monotonic()
@@ -168,13 +239,14 @@ class Engine:
         self.emit('stage.position',dict(moving=False,controller_reported_mm=target,delay_ps=mm_to_delay(target,self.zero)))
 
     def metadata(self,request,plan,run_id):
-        return dict(meta=dict(schema_version=1,software_version='0.1.1',source_mode='simulation',run_id=run_id,created_utc=now()),
-                    config=dict(request=request,plan=plan,applied=dict(read_mode='fvb',exposure_s=request['exposure_s'],hbin=1)),
-                    devices=dict(camera=self.camera.capabilities(),stage=dict(model='PI M-414.32S (simulated)',position_source='simulated_controller')),
+        return dict(meta=dict(schema_version=1,software_version='0.1.1',source_mode=self.devices.mode,run_id=run_id,created_utc=now()),
+                    config=dict(request=request,plan=plan,applied=dict(read_mode='fvb',exposure_s=self.camera.exposure_s,hbin=1)),
+                    devices=dict(camera=self.camera.capabilities(),stage=dict(model='PI M-414.32S',controller_model=getattr(self.stage,'controller_model',None),
+                        controller_identity=self.devices.links['stage']['identity'],**self.stage_state()),spectrometer=self.devices.status()['spectrometer']),
                     coordinates=dict(zero_mm=self.zero,zero_version=self.zero_version,path_multiplier=2,delay_sign=1),
                     calibration=copy.deepcopy(self.calibration),background=serial(self.background),
                     simulation=dict(seed=request['seed'],speedup=request['speedup'],fault=request['fault'],
-                                    tau_ps=[.42,3.8],irf_fwhm_ps=.25,gain_e_per_count=2.5))
+                                    tau_ps=[.42,3.8],irf_fwhm_ps=.25,gain_e_per_count=2.5) if self.devices.mode=='simulation' else {} )
 
     def run_scan(self,run):
         request=run['request'];plan=run['plan'];writer=run.get('writer')
@@ -208,21 +280,23 @@ class Engine:
                     step('moving')
                     if fault=='move_timeout':raise TimeoutError('Injected stage move timeout')
                     self.move(target,request['speedup'])
-                    step('settling');self.wait(request['settle_s'],request['speedup'])
+                    step('settling');self.wait(request['settle_s'],request['speedup'] if self.devices.mode=='simulation' else 1)
                     for frame_index in range(request['frames_per_point']):
-                        started=now();step('exposing');self.wait(request['exposure_s'],request['speedup'])
+                        started=now();step('exposing')
+                        if self.devices.mode=='simulation':self.wait(request['exposure_s'],request['speedup'])
                         if fault=='camera_disconnect':raise ConnectionError('Injected camera disconnect')
-                        step('reading');self.wait(.03,request['speedup'])
+                        step('reading')
+                        if self.devices.mode=='simulation':self.wait(.03,request['speedup'])
                         if self.stop.is_set():raise Cancelled()
                         drain();record_id=run['acquired_frames']
-                        spectrum,saturated=self.camera.acquire(delay,request['seed'],record_id,request['exposure_s'],
+                        spectrum,saturated=self.acquire_counts(delay,request['seed'],record_id,request['exposure_s'],
                                                                run['metadata']['config'].get('center_nm',self.spectrograph['center_nm']),fault)
                         record=dict(record_id=record_id,round_index=round_index,point_index=point_index,frame_index=frame_index,
                                     delay_ps=delay,requested_mm=target,controller_reported_mm=self.stage.position_mm,
-                                    position_source='simulated_controller',zero_version=run['metadata']['coordinates']['zero_version'],
-                                    exposure_s=request['exposure_s'],requested_exposure_s=request['exposure_s'],temperature_c=-70.0,
+                                    position_source=self.stage_state()['position_source'],zero_version=run['metadata']['coordinates']['zero_version'],
+                                    exposure_s=self.camera.exposure_s,requested_exposure_s=request['exposure_s'],temperature_c=self.camera.capabilities().get('temperature_c'),
                                     host_exposure_start_utc=started,host_readout_end_utc=now(),hardware_timestamp=None,
-                                    saturated_pixels=saturated,spectrum=spectrum,source_mode='simulation')
+                                    saturated_pixels=saturated,spectrum=spectrum,source_mode=self.devices.mode)
                         with self.lock:run['acquired_frames']+=1
                         step('committing')
                         if fault=='write_failure' and not writer:raise OSError('Injected storage failure (memory-only run)')
@@ -243,6 +317,7 @@ class Engine:
         except Cancelled:
             terminal='stopped'
         except Exception as exc:
+            if isinstance(exc,HardwareError):self.hardware_failure(exc)
             terminal='error';run['error']=str(exc)
             self.emit('run.error',dict(message=str(exc),committed_frames=len(run['records'])))
         finally:
@@ -272,10 +347,10 @@ class Engine:
     def preview(self):
         index=0
         while not self.stop.is_set():
-            self.wait(self.camera.exposure_s,50)
-            counts,saturated=self.camera.acquire(mm_to_delay(self.stage.position_mm,self.zero),101,index,self.camera.exposure_s,self.spectrograph['center_nm'])
+            if self.devices.mode=='simulation':self.wait(self.camera.exposure_s,50)
+            counts,saturated=self.acquire_counts(mm_to_delay(self.stage.position_mm,self.zero),101,index,self.camera.exposure_s,self.spectrograph['center_nm'])
             with self.lock:
-                self.latest=dict(spectrum=counts,saturated_pixels=saturated,delay_ps=mm_to_delay(self.stage.position_mm,self.zero),exposure_s=self.camera.exposure_s)
+                self.latest=dict(spectrum=counts,saturated_pixels=saturated,delay_ps=self.stage_state()['delay_ps'],exposure_s=self.camera.exposure_s,source_mode=self.devices.mode)
                 self.latest_axis=self.calibration['wavelengths_nm'];self.latest_version+=1
             self.emit('spectrum.preview',self.latest);index+=1
             self.wait(.2,1)
@@ -303,11 +378,11 @@ class Engine:
 
     def acquire_background(self,data):
         exposure=self.camera.exposure_s
-        self.wait(exposure,50)
-        counts,_=self.camera.acquire(0,849,0,exposure,self.spectrograph['center_nm'],dark=data['kind']=='dark',optical_background=data['kind']=='optical_background')
+        if self.devices.mode=='simulation':self.wait(exposure,50)
+        counts,_=self.acquire_counts(0,849,0,exposure,self.spectrograph['center_nm'],dark=data['kind']=='dark',optical_background=data['kind']=='optical_background')
         with self.lock:
-            self.background=dict(spectrum=counts,exposure_s=exposure,kind=data['kind'],condition=data['condition'],source_mode='simulation',
-                                 revision=self.revision,temperature_c=-70.0,read_mode='fvb',timestamp_utc=now())
+            self.background=dict(spectrum=counts,exposure_s=exposure,kind=data['kind'],condition=data['condition'],source_mode=self.devices.mode,
+                                 revision=self.revision,temperature_c=self.camera.capabilities().get('temperature_c'),read_mode='fvb',timestamp_utc=now())
         self.emit('background.ready',self.background)
 
     def handle(self,name,data):
@@ -332,7 +407,9 @@ class Engine:
             old,result=self.commands[key]
             if old!=data:raise ValueError('request_id was already used with different parameters')
             return result
-        result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph'} else self._handle(name,data)
+        self.require_operation(name)
+        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph'} else self._handle(name,data)
+        except HardwareError as exc:self.hardware_failure(exc);raise
         if request_id:
             self.commands[key]=(copy.deepcopy(data),result)
             if len(self.commands)>1000:self.commands.pop(next(iter(self.commands)))
@@ -342,12 +419,49 @@ class Engine:
         if name=='status':return self.compact_status(data.get('since'),data.get('latest_version',-1)) if data.get('compact') else self.status()
         if name=='capabilities':return self.camera.capabilities()
         if name=='connect':
-            if data.get('mode','simulation')!='simulation':
-                raise ValueError('Hardware mode is not commissioned. Supply the PI controller model and validate adapters first; no simulation fallback.')
-            if self.busy:raise ValueError('Devices are busy')
-            self.connected=True;return self.status()
+            self.idle(devices=False)
+            mode=data.get('mode','hardware')
+            if mode not in {'hardware','simulation'}:raise ValueError('Unknown acquisition source')
+            if mode!=self.devices.mode or mode=='simulation' and not self.connected:
+                self.mode_calibrations[self.devices.mode]=copy.deepcopy(self.calibration)
+                self.mode_zeros[self.devices.mode]=self.zero;self.mode_spectrographs[self.devices.mode]=self.spectrograph.copy()
+                self.devices.switch(mode)
+                self.zero=self.mode_zeros.get(mode,150.0);self.zero_version+=1
+                self.spectrograph=self.mode_spectrographs.get(mode,dict(center_nm=600.0,grating=300,slit_um=200.0)).copy()
+                self.calibration_workbench.set_mode(mode)
+                self.calibration=copy.deepcopy(self.mode_calibrations.get(mode) or (dict(calibration_id='synthetic-500-800-v1',source='synthetic',wavelengths_nm=self.camera.axis.tolist()) if mode=='simulation' else dict(calibration_id=None,source=None,wavelengths_nm=None)))
+                self.source_changed()
+            return self.status()
         if name=='disconnect':
-            self.idle();self.connected=False;return self.status()
+            self.idle(devices=False);self.devices.close();self.source_changed();return self.status()
+        if name=='device_ports':return serial_ports()
+        if name=='device_drivers':return self.devices.catalog()
+        if name=='device_pi_usb':
+            self.idle(devices=False)
+            if self.devices.connected('stage'):raise CommandError('Disconnect the stage before finding USB controllers')
+            from .drivers.pi_usb import usb_choices
+            return usb_choices(data.get('pi_dll',''))
+        if name=='device_cameras':
+            self.idle(devices=False)
+            if self.devices.connected('camera'):raise CommandError('Disconnect the CCD before scanning SDK2 cameras')
+            return camera_choices(data.get('dll_directory',''))
+        if name in {'device_connect','device_disconnect'}:
+            self.idle(devices=False)
+            before=self.devices.status()
+            old_spec=copy.deepcopy(self.devices.links['spectrometer']['config'])
+            try:
+                if name=='device_connect':self.devices.connect(data['device'],{k:v for k,v in data.items() if k!='device'})
+                else:self.devices.disconnect(data['device'])
+            finally:
+                spec=self.devices.links['spectrometer'];optics_changed=spec.get('reported_settings') is not None and spec['reported_settings']!=self.spectrograph
+                if data['device']=='spectrometer' and (old_spec!=spec['config'] or optics_changed):
+                    if spec.get('reported_settings') is not None:self.spectrograph=spec['reported_settings'].copy()
+                    self.calibration_workbench.set_instrument(self.devices.links['spectrometer']['config'])
+                    self.clear_wavelength_calibration()
+                    # Never restore an axis cached for another spectrometer after a source switch.
+                    self.mode_calibrations.clear()
+                if before!=self.devices.status():self.source_changed()
+            return self.status()
         if name=='configure':
             self.idle();self.set_exposure(data['exposure_s'])
             return dict(exposure_s=self.camera.exposure_s)
@@ -356,25 +470,42 @@ class Engine:
             target=delay_to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'],self.zero)
             self.stage.duration(target);self.launch('move',self.move,target);return dict(accepted=True)
         if name=='zero':
-            self.idle();self.zero=self.stage.position_mm;self.zero_version+=1;self.revision+=1;return self.status()
+            self.idle()
+            if self.devices.mode=='hardware':self.stage.position_mm=self.stage.value('POS?')
+            self.zero=self.stage.position_mm;self.zero_version+=1;self.revision+=1;return self.status()
         if name=='spectrograph':
             self.idle()
             if data!=self.spectrograph:
-                empty=dict(calibration_id=None,source=None,wavelengths_nm=None)
-                self.calibration_workbench.persist(empty,data)
-                self.spectrograph=data;self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
-                self.latest_axis=None
-                self.calibration_workbench.invalidate()
-                self.background=None;self.revision+=1
+                if self.devices.mode=='hardware':self.devices.check_spectrometer_update(self.spectrograph,data)
+                self.clear_wavelength_calibration()  # Invalidate before any physical setting can change.
+                if self.devices.mode=='hardware':
+                    try:applied=self.devices.configure_spectrometer(self.spectrograph,data)
+                    except Exception as exc:raise HardwareError('spectrometer',str(exc)) from exc
+                else:applied=data
+                self.spectrograph=SpectrographConfig(**applied).model_dump()
+                self.calibration_workbench.persist(self.calibration,self.spectrograph)
             return self.status()
         if name=='calibration':
-            self.idle();self.calibration_workbench.persist(data,self.spectrograph)
+            self.idle(devices=False)
+            if self.devices.mode=='hardware' and data.get('source')!='measured':raise ValueError('Hardware mode requires a measured wavelength calibration')
+            self.calibration_workbench.persist(data,self.spectrograph)
             self.calibration=data;self.latest_axis=copy.deepcopy(data['wavelengths_nm']);self.revision+=1;return self.status()
         if name=='calibration_frame':
             return self.calibration_workbench.current_frame()
         if name=='calibration_capture':
             self.idle()
-            return self.calibration_workbench.capture(data,self.spectrograph)
+            if self.devices.mode=='simulation':return self.calibration_workbench.capture(data,self.spectrograph)
+            capture_id=uuid.uuid4().hex
+            self.capture_tasks={capture_id:dict(status='running')}
+            self.calibration_workbench.invalidate()
+            self.launch('calibration',self.capture_hardware_frame,capture_id,data)
+            return dict(pending=True,capture_id=capture_id)
+        if name=='calibration_capture_status':
+            if data['capture_id'] not in self.capture_tasks:raise CommandError('Calibration capture expired',404)
+            return self.capture_tasks[data['capture_id']]
+        if name=='calibration_stop':
+            if self.busy=='calibration':self.stop.set()
+            return dict(accepted=True)
         if name=='calibration_extract':
             self.idle()
             return self.calibration_workbench.extract(data,self.spectrograph)
@@ -394,17 +525,18 @@ class Engine:
             return self.status()
         if name=='plan':
             request=RunRequest(**data)
-            return make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
+            return self.make_scan_plan(request)
         if name=='output_check':return output_info(data['path'])
         if name=='run':
             self.idle();request=RunRequest(**data)
-            plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
+            if self.devices.mode=='hardware' and request.fault.kind!='none':raise ValueError('Fault injection is only available in Simulation mode')
+            plan=self.make_scan_plan(request)
             if any(task['status']=='running' and task.get('run_id') in self.runs for task in self.tasks.values()):
                 raise CommandError('Wait for or cancel analysis before starting another acquisition')
             run_id=uuid.uuid4().hex[:16]
             path=None;writer=None
             self.set_exposure(request.exposure_s)
-            plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision)
+            plan=self.make_scan_plan(request)
             metadata=self.metadata(data,plan,run_id);metadata['config']['center_nm']=self.spectrograph['center_nm']
             if request.autosave:
                 with prepare_output(request.save_path,run_id,plan['estimated_bytes'],request.overwrite_token) as path:
@@ -414,7 +546,7 @@ class Engine:
                      acquired_frames=0,committed_frames=0,completed_points=0,error=None)
             if writer:run['writer']=writer
             # Replace a memory-only experiment only after new output is ready.
-            self.runs={run_id:run};self.current=run_id;self.camera.exposure_s=request.exposure_s
+            self.runs={run_id:run};self.current=run_id
             self.launch('scan',self.run_scan,run);return self.public_run(run)
         if name in {'pause','resume','stop'}:
             with self.lock:
@@ -550,6 +682,9 @@ def worker_main(commands,responses,events):
             for control in engine.task_controls.values():control['cancel'].set()
             if engine.job:engine.job.join(10)
             engine.pool.shutdown(wait=True,cancel_futures=True)
+            if not engine.job or not engine.job.is_alive():
+                try:engine.devices.close()
+                except Exception:traceback.print_exc()
             return
         try:
             result=engine.handle(message['name'],message['data'])

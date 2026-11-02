@@ -1,24 +1,50 @@
 Option Explicit
-Dim shell, fso, root, python, pythonw, entry, setup, probe, result
-Set shell=CreateObject("WScript.Shell")
-Set fso=CreateObject("Scripting.FileSystemObject")
-root=fso.GetParentFolderName(WScript.ScriptFullName)
-pythonw=fso.BuildPath(root,".venv\Scripts\pythonw.exe")
-python=fso.BuildPath(root,".venv\Scripts\python.exe")
-If Not fso.FileExists(pythonw) Then
-    pythonw=python
+
+Dim shell, fso, root, python, pythonw, probe, marker, requirements, entry, setup, args, result, setupCmd, launchCmd
+
+Set shell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+root = fso.GetParentFolderName(WScript.ScriptFullName)
+python = fso.BuildPath(root, ".venv\Scripts\python.exe")
+pythonw = fso.BuildPath(root, ".venv\Scripts\pythonw.exe")
+probe = fso.BuildPath(root, "runtime_probe.py")
+marker = fso.BuildPath(root, ".venv\.trpl-requirements.sha256")
+requirements = fso.BuildPath(root, "requirements.txt")
+entry = fso.BuildPath(root, "desktop.py")
+setup = fso.BuildPath(root, "start-app.cmd")
+shell.CurrentDirectory = root
+
+If Not fso.FileExists(probe) Then
+    MsgBox "runtime_probe.py is missing. Re-extract the complete TRPL folder.", 16, "TRPL"
+    WScript.Quit 2
 End If
-entry=fso.BuildPath(root,"desktop.py")
-setup=fso.BuildPath(root,"start-app.cmd")
-shell.CurrentDirectory=root
-result=1
+If Not fso.FileExists(entry) Then
+    MsgBox "desktop.py is missing. Re-extract the complete TRPL folder.", 16, "TRPL"
+    WScript.Quit 2
+End If
+If Not fso.FileExists(setup) Then
+    MsgBox "start-app.cmd is missing. Re-extract the complete TRPL folder.", 16, "TRPL"
+    WScript.Quit 2
+End If
+
+result = 1
 If fso.FileExists(python) Then
-    probe="import sys,struct,importlib.util; sys.exit(0 if sys.version_info >= (3,12) and struct.calcsize('P')==8 and all(importlib.util.find_spec(n) is not None for n in ('webview','clr','clr_loader','bottle','proxy_tools','fastapi','uvicorn','numpy','scipy','h5py','pydantic','websockets')) and __import__('clr') is not None else 1)"
-    result=shell.Run(Chr(34) & python & Chr(34) & " -c " & Chr(34) & probe & Chr(34),0,True)
+    args = Quote(probe) & " --probe --requirements " & Quote(requirements) & " --marker " & Quote(marker)
+    result = shell.Run(Quote(python) & " " & args, 0, True)
 End If
-If result<>0 Then
-    ' Show installation progress and leave any setup error visible through CMD.
-    shell.Run Chr(34) & setup & Chr(34),1,False
+
+If result <> 0 Then
+    setupCmd = Quote(setup)
+    shell.Run setupCmd, 1, False
 Else
-    result=shell.Run(Chr(34) & pythonw & Chr(34) & " " & Chr(34) & entry & Chr(34),0,False)
+    If Not fso.FileExists(pythonw) Then
+        MsgBox "The local environment is incomplete. Run start-app.cmd to repair it.", 16, "TRPL"
+        WScript.Quit 2
+    End If
+    launchCmd = Quote(pythonw) & " " & Quote(entry)
+    shell.Run launchCmd, 0, False
 End If
+
+Function Quote(value)
+    Quote = Chr(34) & value & Chr(34)
+End Function

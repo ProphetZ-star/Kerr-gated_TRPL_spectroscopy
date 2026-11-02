@@ -1,12 +1,43 @@
-param([switch]$SetupOnly)
-$ErrorActionPreference='Stop'
-Set-Location -LiteralPath $PSScriptRoot
-. (Join-Path $PSScriptRoot 'bootstrap.ps1')
-$appPython=Initialize-KerrEnvironment $PSScriptRoot @('webview','clr','clr_loader','bottle','proxy_tools','fastapi','uvicorn','numpy','scipy','h5py','pydantic','websockets') 'requirements.txt'
-if(-not $SetupOnly){
-    $windowPython=Join-Path $PSScriptRoot '.venv\Scripts\pythonw.exe'
-    if(-not(Test-Path -LiteralPath $windowPython)){$windowPython=$appPython}
-    $desktopScript=Join-Path $PSScriptRoot 'desktop.py'
-    Write-KerrSetupStatus 4 'Opening the TRPL desktop window...' 'launching'
-    Start-Process -FilePath $windowPython -ArgumentList ('"{0}"' -f $desktopScript) -WorkingDirectory $PSScriptRoot -WindowStyle Hidden
+param(
+    [switch]$SetupOnly,
+    [switch]$Probe,
+    [switch]$NoLaunch
+)
+$ErrorActionPreference = 'Stop'
+$root = $PSScriptRoot
+Set-Location -LiteralPath $root
+. (Join-Path $root 'bootstrap.ps1')
+
+try {
+    $requirements = Join-Path $root 'requirements.txt'
+    $marker = Join-Path $root '.venv/.trpl-requirements.sha256'
+    if ($Probe) {
+        $python = Join-Path $root '.venv/Scripts/python.exe'
+        if (-not (Test-Path -LiteralPath $python)) { throw 'The local environment is not installed. Run setup first.' }
+        $probe = Join-Path $root 'runtime_probe.py'
+        & $python -u $probe --probe --requirements $requirements --marker $marker
+        exit $LASTEXITCODE
+    }
+    $appPython = Initialize-KerrEnvironment -Root $root -Requirements 'requirements.txt'
+    if ($SetupOnly -or $NoLaunch) { exit 0 }
+    $windowPython = Join-Path $root '.venv/Scripts/pythonw.exe'
+    if (-not (Test-Path -LiteralPath $windowPython)) { throw 'pythonw.exe is missing from the local environment.' }
+    $desktop = Join-Path $root 'desktop.py'
+    if (-not (Test-Path -LiteralPath $desktop)) { throw 'desktop.py is missing.' }
+    Write-KerrSetupStatus 4 'Opening the native Qt application' 'launching'
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $windowPython
+    $start.Arguments = ConvertTo-KerrProcessArgument $desktop
+    $start.WorkingDirectory = $root
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    [Diagnostics.Process]::Start($start) | Out-Null
+    exit 0
+} catch {
+    Write-Host ('TRPL startup failed: ' + $_.Exception.Message) -ForegroundColor Red
+    if ($script:KerrSetupLog) {
+        $step = if ($script:KerrSetupStep) { [int]$script:KerrSetupStep } else { 1 }
+        try { Write-KerrSetupStatus $step $_.Exception.Message 'error' } catch { }
+    }
+    exit 1
 }

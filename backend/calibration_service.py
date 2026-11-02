@@ -22,6 +22,7 @@ def timestamp():
 
 class CalibrationWorkbench:
     def __init__(self):
+        self.instrument=dict(driver='oriel_77400_manual',model='Oriel 77400 / MS125')
         self.directory = Path(os.environ.get('KERR_STATE_DIR', Path(__file__).resolve().parents[1] / 'data'))
         self.path = self.directory / 'installed-calibration.json'
         with _LOCKS_GUARD:self.persistence_lock=_LOCKS.setdefault(str(self.path.resolve()),RLock())
@@ -29,11 +30,24 @@ class CalibrationWorkbench:
         self.solutions = {}
         self.warning = None
 
+    def set_mode(self,mode):
+        self.path=self.directory/('installed-calibration.json' if mode=='hardware' else 'installed-simulation-calibration.json')
+        with _LOCKS_GUARD:self.persistence_lock=_LOCKS.setdefault(str(self.path.resolve()),RLock())
+        self.warning=None
+
+    def set_instrument(self,config):
+        self.instrument=dict(driver=config['driver'],model=config.get('model','Oriel 77400 / MS125'))
+
+    def instrument_matches(self,payload):
+        # Legacy files predate instrument selection and belonged to the original Oriel.
+        saved=payload.get('instrument',dict(driver='oriel_77400_manual',model='Oriel 77400 / MS125'))
+        return saved==self.instrument
+
     def recorded_spectrograph(self):
         """Restore software records of the manual settings; never issue hardware commands."""
         try:
             payload = json.loads(self.path.read_text(encoding='utf-8'))
-            if payload['version'] != 1:
+            if payload['version'] != 1 or not self.instrument_matches(payload):
                 return None
             return SpectrographConfig(**payload['spectrograph']).model_dump()
         except (OSError, ValueError, KeyError, TypeError):
@@ -45,8 +59,8 @@ class CalibrationWorkbench:
             return None
         try:
             with self.persistence_lock:payload = json.loads(self.path.read_text(encoding='utf-8'))
-            if payload['version'] != 1 or payload['spectrograph'] != spectrograph:
-                raise ValueError('Saved calibration does not match the manual spectrograph settings')
+            if payload['version'] != 1 or payload['spectrograph'] != spectrograph or not self.instrument_matches(payload):
+                raise ValueError('Saved calibration does not match the selected spectrometer or optical settings')
             calibration = payload['calibration']
             if not isinstance(calibration,dict) or not {'calibration_id','source','wavelengths_nm'}<=calibration.keys():raise ValueError('Calibration is missing required fields')
             if calibration['wavelengths_nm'] is not None:
@@ -66,7 +80,7 @@ class CalibrationWorkbench:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.directory,
                                              prefix='.calibration-', suffix='.tmp', delete=False) as stream:
                 temporary = Path(stream.name)
-                json.dump(dict(version=1, calibration=calibration, spectrograph=spectrograph), stream,
+                json.dump(dict(version=1, calibration=calibration, spectrograph=spectrograph,instrument=self.instrument), stream,
                           ensure_ascii=False, allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -106,6 +120,16 @@ class CalibrationWorkbench:
             return None
         return deepcopy(self.frame['header']) | dict(image_counts=self.frame['image'].ravel().tolist())
 
+    def record_hardware_frame(self,image,exposure,readout,spectrograph,frame_id):
+        import numpy as np
+        image=np.asarray(image,dtype=np.int32)
+        if image.shape!=((1,1024) if readout=='fvb' else (255,1024)):
+            raise ValueError('Unexpected hardware CCD frame dimensions')
+        header=dict(frame_id=frame_id,shape=list(image.shape),exposure_s=exposure,source_mode='hardware',source='measured',
+                    readout=readout,captured_utc=timestamp(),spectrograph=deepcopy(spectrograph),full_scale=65535)
+        self.frame=dict(header=header,image=image.copy());self.solutions.clear()
+        return self.current_frame()
+
     def require_frame(self, frame_id, spectrograph):
         if self.frame is None or self.frame['header']['frame_id'] != frame_id:
             raise CommandError('Calibration frame expired; acquire or reload the current frame')
@@ -117,23 +141,25 @@ class CalibrationWorkbench:
         from .calibration import ExtractRequest, extract_profile
         request = ExtractRequest(**data)
         frame = self.require_frame(request.frame_id, spectrograph)
-        return dict(frame_id=request.frame_id, source='synthetic') | extract_profile(
+        return dict(frame_id=request.frame_id, source=frame['header']['source']) | extract_profile(
             frame['image'], request.row_start, request.row_end)
 
     def fit(self, data, spectrograph):
         from .calibration import MappingRequest, fit_mapping, extract_profile
         request = MappingRequest(**data)
         frame = self.require_frame(request.frame_id, spectrograph)
+        if frame['header']['source_mode']=='hardware' and request.reference_source!='measured':
+            raise ValueError('Import measured reference wavelengths before fitting a real CCD frame; demo lines cannot calibrate hardware')
         extraction = extract_profile(frame['image'], request.row_start, request.row_end)
         if extraction['saturated_pixels']:
             raise CommandError('Calibration ROI contains saturated pixels; reduce exposure and acquire again')
         solution = fit_mapping(request)
         identifier = uuid.uuid4().hex
-        solution.update(solution_id=identifier, calibration_id=f'spectral-{identifier}', source='synthetic',
-                        source_mode='simulation', frame_id=request.frame_id, frame=deepcopy(frame['header']),
+        solution.update(solution_id=identifier, calibration_id=f'spectral-{identifier}', source=frame['header']['source'],
+                        source_mode=frame['header']['source_mode'], frame_id=request.frame_id, frame=deepcopy(frame['header']),
                         extraction_rows=[request.row_start, request.row_end], created_utc=timestamp(),
                         spectrograph=deepcopy(spectrograph), applied=False)
-        solution['warnings'].append('Simulated CCD frame; this is not an experimental wavelength calibration')
+        if frame['header']['source_mode']=='simulation':solution['warnings'].append('Simulated CCD frame; this is not an experimental wavelength calibration')
         self.solutions[identifier] = solution
         if len(self.solutions) > 8:
             del self.solutions[next(iter(self.solutions))]
