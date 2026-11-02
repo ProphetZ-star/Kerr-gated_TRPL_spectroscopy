@@ -1,10 +1,9 @@
-"""Confirmed replacement of one experiment's files, with recoverable backups."""
+"""Explicitly confirmed replacement of one experiment's output files."""
 from contextlib import contextmanager
 from pathlib import Path
 import hashlib
 import json
 import shutil
-import tempfile
 from ..errors import CommandError
 
 
@@ -35,22 +34,8 @@ def prepare_output(path,run_id,estimate=0,overwrite_token=None):
         raise CommandError('Output file exists or changed; confirm overwrite before continuing')
     target.parent.mkdir(parents=True,exist_ok=True)
     if shutil.disk_usage(target.parent).free<estimate+20*1024**2:raise ValueError('Insufficient free disk space')
-    moved=[];backup=None
-    try:
-        if info['conflicts']:
-            backup=Path(tempfile.mkdtemp(prefix='.'+target.stem+'.overwrite-backup-',dir=target.parent))
-            # Recheck the entire family immediately before moving any file.
-            if output_info(path,run_id)['overwrite_token']!=overwrite_token:
-                raise CommandError('Output files changed; confirm overwrite again')
-            for name in info['conflicts']:
-                original=Path(name);saved=backup/original.name
-                original.rename(saved);moved.append((original,saved))
-        yield target
-    except BaseException:
-        # Never overwrite a newly created file while rolling back. Any original
-        # that cannot be restored remains intact in the backup folder.
-        for original,saved in reversed(moved):
-            if not original.exists():saved.rename(original)
-        if backup and not any(backup.iterdir()):backup.rmdir()
-        raise
-    # A confirmed replacement keeps the old files in this sibling backup folder.
+    if info['conflicts']:
+        if output_info(path,run_id)['overwrite_token']!=overwrite_token:
+            raise CommandError('Output files changed; confirm overwrite again')
+        for name in info['conflicts']:Path(name).unlink()
+    yield target

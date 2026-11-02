@@ -107,11 +107,14 @@ def create_desktop(url,on_closing=None,on_started=None):
             _write_log('WebView2 unavailable',error);window.load_html(_error_page(error));return
         on_started(window)
     webview.start(func=run_started if on_started is not None else None,gui='edgechromium',
-                  debug=False,private_mode=True,storage_path=str(storage))
+                  debug=False,private_mode=True,storage_path=str(storage),icon=str(ROOT/'assets'/'TRPL.ico'))
     return 0
 
 
 def main():
+    if os.name=='nt':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('KerrStudio.TRPL.Desktop')
     instance=DesktopInstance(ROOT)
     if not instance.acquire():return 0
     try:return run_desktop()

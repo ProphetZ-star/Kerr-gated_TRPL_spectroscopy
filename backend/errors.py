@@ -10,6 +10,6 @@ def error_status(exc, command=''):
     if isinstance(exc, (FileNotFoundError, KeyError)): return 404
     if isinstance(exc, (FileExistsError,)): return 409
     if isinstance(exc, (ValueError, TypeError, OverflowError)) and command in {
-        'plan', 'export', 'save', 'open', 'calibration', 'calibration_capture', 'calibration_extract', 'calibration_fit'}:
+        'plan', 'export', 'save', 'open', 'analysis_open', 'calibration', 'calibration_capture', 'calibration_extract', 'calibration_fit'}:
         return 422
     return 409

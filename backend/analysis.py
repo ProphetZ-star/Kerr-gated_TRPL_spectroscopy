@@ -17,14 +17,12 @@ def fit_records(records, axis, options, cancel=None):
         raise ValueError('No pixels in the selected wavelength window')
     groups = {}
     for r in records:
-        if not isinstance(r,dict) or not {'delay_ps','exposure_s','spectrum','saturated_pixels'}<=r.keys():raise ValueError('Fit record is missing required fields')
+        if not isinstance(r,dict) or not {'delay_ps','exposure_s','spectrum'}<=r.keys():raise ValueError('Fit record is missing required fields')
         t=finite_number(r['delay_ps'],'delay_ps')
         if options.min_delay_ps is not None and t < options.min_delay_ps:
             continue
         if options.max_delay_ps is not None and t > options.max_delay_ps:
             continue
-        if r['saturated_pixels']:
-            raise ValueError('Selected fit window includes saturated frames. Narrow the time window to exclude them or reacquire at lower exposure.')
         exposure=finite_number(r['exposure_s'],'exposure_s',True)
         spectrum=np.asarray(r['spectrum'],dtype=float)
         if spectrum.shape!=wavelengths.shape or not np.isfinite(spectrum).all():raise ValueError('Fit spectrum must match the axis and contain only finite counts')

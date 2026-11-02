@@ -10,6 +10,7 @@ HEIGHT = 255
 class CaptureRequest(_StrictModel):
     exposure_s: float = Field(default=1.0, ge=0.001, le=3600.0)
     seed: int = Field(default=42, ge=0, le=2147483647)
+    readout: Literal['full_image', 'fvb'] = 'full_image'
 
 
 class ExtractRequest(_StrictModel):

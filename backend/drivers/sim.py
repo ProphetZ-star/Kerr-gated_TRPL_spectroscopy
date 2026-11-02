@@ -1,10 +1,10 @@
 """Synthetic optical Kerr gate and detector; all performance values are illustrative."""
 import math
 import numpy as np
-from scipy.special import log_ndtr
 
 
 def convolved_decay(t, tau, sigma):
+    from scipy.special import log_ndtr
     try:
         if isinstance(tau,(bool,np.bool_)) or isinstance(sigma,(bool,np.bool_)):raise ValueError()
         t=np.asarray(t,dtype=float);tau=float(tau);sigma=float(sigma)

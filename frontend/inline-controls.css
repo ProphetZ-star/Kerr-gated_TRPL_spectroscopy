@@ -1,0 +1,11 @@
+.axis-inline-editor{position:fixed;z-index:1200;display:grid;width:178px;max-width:calc(100vw - 8px);grid-template-columns:minmax(0,1fr) auto;gap:3px;align-items:start;background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:2px;box-shadow:0 3px 12px #0002}
+.axis-inline-editor input{height:28px;margin:0;font:12px var(--mono);padding:0 4px}
+.axis-inline-editor button{height:28px;min-height:28px;padding:0 6px;font-size:11px}
+.axis-inline-editor span{grid-column:1/-1;max-width:260px;font-size:11px;color:var(--danger);white-space:normal}
+.axis-inline-editor span:empty{display:none}
+.marker-readout{position:fixed;z-index:1100;pointer-events:none;padding:4px 8px;background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:4px;box-shadow:0 2px 8px #0002;font:12px var(--mono);white-space:nowrap}
+.point-readout{font:12px var(--mono);color:var(--text);white-space:nowrap;padding:3px 6px;background:var(--field);border-radius:3px}
+body{--zero-bg:#1e304d;--zero-border:#425d86;--zero-text:var(--text)}
+body.light{--zero-bg:#dbe6f6;--zero-border:#a9b9cc;--zero-text:#244b7f}
+body .zero-actions .zero-button,body .acquisition-heading #preview{background:var(--zero-bg);border-color:var(--zero-border);color:var(--zero-text)}
+body .zero-actions .zero-button:hover,body .acquisition-heading #preview:hover{background:var(--zero-bg);border-color:var(--zero-border);color:var(--zero-text)}

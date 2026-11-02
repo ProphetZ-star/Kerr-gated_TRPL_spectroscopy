@@ -74,7 +74,7 @@ async def lifespan(app):
         instance.close()
 
 
-app=FastAPI(title='Kerr Studio local acquisition',version='0.1.1',lifespan=lifespan)
+app=FastAPI(title='Kerr Studio local acquisition',version='0.1.1',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
 app.add_middleware(TrustedHostMiddleware,allowed_hosts=['127.0.0.1','localhost','testserver'])
 
 
@@ -129,7 +129,8 @@ async def session():
 
 
 @app.get('/api/v1/status')
-async def status():return await call('status')
+async def status(compact:bool=False,since:str|None=None,latest_version:int=-1):
+    return await call('status',dict(compact=True,since=since,latest_version=latest_version)) if compact else await call('status')
 
 
 @app.get('/api/v1/identity')
@@ -254,7 +255,26 @@ async def run(body:RunRequest):return await call('run',body.model_dump())
 async def open_run(body:PathBody):return await call('open',body.model_dump())
 
 
+@app.post('/api/v1/analysis/open')
+async def open_analysis(body:PathBody):return await call('analysis_open',body.model_dump())
+
+
+@app.get('/api/v1/analysis/runs/{run_id}/records')
+async def analysis_records(run_id:str,offset:int=0,limit:int=100):
+    if offset<0 or not 1<=limit<=100:raise HTTPException(422,'Invalid pagination')
+    return await call('records',dict(run_id=run_id,offset=offset,limit=limit,analysis=True))
+
+
+@app.post('/api/v1/analysis/runs/{run_id}/fits')
+async def analysis_fit(run_id:str,body:FitRequest):return await call('fit',dict(run_id=run_id,options=body.model_dump(),analysis=True))
+
+
+@app.post('/api/v1/analysis/runs/{run_id}/close')
+async def close_analysis(run_id:str):return await call('analysis_close',dict(run_id=run_id,analysis=True))
+
+
 @app.post('/api/v1/runs/import')
+@app.post('/api/v1/analysis/import')
 async def import_run(request:Request):
     name=unquote(request.headers.get('x-file-name','experiment.h5')).replace('\\','/').split('/')[-1]
     if not name.lower().endswith('.h5'):raise HTTPException(422,'Choose an HDF5 .h5 file')
@@ -271,7 +291,7 @@ async def import_run(request:Request):
                 if size>256*1024**2:raise HTTPException(413,'This browser import supports files up to 256 MiB')
                 await asyncio.to_thread(stream.write,chunk)
         if not size:raise HTTPException(422,'The selected HDF5 file is empty')
-        return await call('open',dict(path=str(target)))
+        return await call('analysis_open' if request.url.path.endswith('/analysis/import') else 'open',dict(path=str(target)))
     except BaseException:
         target.unlink(missing_ok=True);directory.rmdir();raise
 
@@ -324,7 +344,7 @@ async def events(websocket:WebSocket):
         await websocket.close(code=1008);return
     await websocket.accept()
     try:
-        snapshot=await call('status');seq=snapshot['seq']
+        snapshot=await call('status',dict(compact=True));seq=snapshot['seq']
         def envelope(kind,payload=None):
             return dict(type=kind,seq=seq,schema_version=1,worker_session_id=snapshot['worker_session_id'],
                         timestamp_utc=datetime.now(timezone.utc).isoformat(),payload=payload or {})

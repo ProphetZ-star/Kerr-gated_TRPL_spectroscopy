@@ -8,6 +8,11 @@
 .analysis-controls input:invalid{border-color:var(--danger)}
 #analysisModelLabel:empty{display:none}
 #analysisModelLabel:not(:empty){display:block;margin-top:2px}
+.analysis-time-key{display:flex;align-items:center;gap:6px;font:11px var(--mono);color:var(--muted);white-space:nowrap}
+.analysis-time-gradient{display:inline-block;width:100px;height:7px;border-radius:2px;border:1px solid var(--plot-border)}
+.analysis-spectrum-legend{display:flex;gap:8px;flex-wrap:wrap;max-height:112px;overflow:auto;padding:9px 17px;border-top:1px solid var(--line)}
+.spectrum-delay-key{display:flex;align-items:center;gap:7px;font:12px var(--mono);height:29px;min-height:29px;padding:0 8px}
+.spectrum-delay-key i{display:inline-block;width:18px;height:3px;border-radius:1px}
 @media(min-width:1500px){#analysisPage.analysis-workspace{padding-left:26px;padding-right:26px;gap:24px}.analysis-bottom{grid-template-columns:minmax(0,1fr) 280px}}
 @media(max-width:1200px){.analysis-bottom{grid-template-columns:minmax(0,1fr) 220px}.analysis-results .panel-head{flex-wrap:wrap;gap:8px}.analysis-results .tools{flex-wrap:wrap;gap:10px}.analysis-table td,.analysis-table th{padding:7px 10px}}
 @media(max-width:999px),(max-height:719px){#analysisPage.analysis-workspace{grid-row:3;overflow:visible;min-height:0;grid-template-columns:272px minmax(0,1fr)}.analysis-controls{overflow:visible}.analysis-results{grid-template-rows:420px auto}.analysis-bottom{grid-template-columns:1fr}.analysis-quality{overflow:visible}.analysis-table-wrap{max-height:270px}.analysis-controls .section{padding:14px}.analysis-results .panel-head{align-content:center}}

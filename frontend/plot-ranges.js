@@ -34,26 +34,36 @@ export function setPlotLimits(id,{x=null,y=null}){
  validate(x);validate(y);
  for(const [axis,value]of [['x',x],['y',y]]){const key=state.meta[axis+'Key'];if(value===null)limits.delete(key);else limits.set(key,{...value});}
 }
-export function initPlotRanges(openModal,redraw){
- for(const id of Object.keys(definitions))$('axes-'+id).onclick=()=>{
-  const state=plotState(id);if(!state)return;
-  const box=document.createElement('div'),fields={};box.className='axis-form';
-  for(const axis of ['x','y']){
-   const section=document.createElement('fieldset'),legend=document.createElement('legend'),autoLabel=document.createElement('label'),auto=document.createElement('input'),grid=document.createElement('div');
-   legend.textContent=axis.toUpperCase()+' · '+state.meta[axis+'Label'];auto.type='checkbox';auto.checked=!state.manual[axis];auto.id='axis'+axis.toUpperCase()+'Auto';autoLabel.className='row';autoLabel.append(auto,document.createTextNode('Auto'));grid.className='grid';
-   const inputs=[];
-   for(const [bound,label]of [['min','Minimum'],['max','Maximum']]){
-    const holder=document.createElement('label'),input=document.createElement('input');holder.textContent=label;input.type='number';input.step='any';input.id='axis'+axis.toUpperCase()+(bound==='min'?'Min':'Max');input.setAttribute('aria-label',axis.toUpperCase()+' '+label.toLowerCase());
-    const a=state.range[axis+'min'],b=state.range[axis+'max'];input.value=String(bound==='min'?Math.min(a,b):Math.max(a,b));input.disabled=auto.checked;holder.append(input);grid.append(holder);inputs.push(input);
-   }
-   auto.onchange=()=>inputs.forEach(input=>input.disabled=auto.checked);fields[axis]={auto,inputs};section.append(legend,autoLabel,grid);box.append(section);
-  }
-  const error=document.createElement('p'),buttons=document.createElement('div'),reset=document.createElement('button'),apply=document.createElement('button');error.id='axisError';error.className='error';error.setAttribute('role','alert');buttons.className='modal-foot';reset.textContent='Reset to auto';apply.textContent='Apply';apply.className='primary';
-  reset.onclick=()=>{setPlotLimits(id,{x:null,y:null});$('modal').close();redraw();};
-  apply.onclick=()=>{
-   try{const current=plotState(id);if(current.meta.xKey!==state.meta.xKey||current.meta.yKey!==state.meta.yKey)throw Error('Plot units changed. Close and reopen axis limits.');const next={};for(const axis of ['x','y']){const {auto,inputs}=fields[axis];if(!auto.checked&&inputs.some(input=>input.value.trim()===''))throw Error('Enter both minimum and maximum, or use Auto.');next[axis]=auto.checked?null:{min:Number(inputs[0].value),max:Number(inputs[1].value)};}setPlotLimits(id,next);$('modal').close();redraw();}
-   catch(problem){error.textContent=problem.message;}
-  };
-  buttons.append(reset,apply);box.append(error,buttons);openModal(state.meta.title+' · Axis limits',box);
- };
+const endpoints=new Map();let editor=null;
+export function registerAxisEndpoints(q,{x=true,y=true,xY=q.p.b+18,yX=q.p.l-7,format=v=>Number(v.toPrecision(5)).toString()}={}){
+ const hit=[];
+ const add=(axis,value,cx,cy,right=false)=>{const label=format(value),width=Math.max(24,q.ctx.measureText?.(label).width??label.length*7);hit.push({axis,bound:value===Math.min(q[axis+'min'],q[axis+'max'])?'min':'max',cx:right?cx-width/2:cx,cy,w:width+10,h:22});};
+ if(x)for(const value of [q.xmin,q.xmax])add('x',value,q.x(value),xY-4);
+ if(y)for(const value of [q.ymin,q.ymax])add('y',value,yX,q.y(value),true);
+ endpoints.set(q.id,hit);
+}
+function closeEditor(){if(editor){editor.wrapper.remove?.();editor.wrapper.hidden=true;editor=null;}}
+export function setAxisEndpoint(id,axis,bound,value){
+ const state=plotState(id);if(!state)throw Error('Plot is not ready.');
+ const next={x:limits.get(state.meta.xKey)??null,y:limits.get(state.meta.yKey)??null};
+ if(value===null)next[axis]=null;
+ else{const range=state.range;next[axis]={min:Math.min(range[axis+'min'],range[axis+'max']),max:Math.max(range[axis+'min'],range[axis+'max'])};next[axis][bound]=value;}
+ setPlotLimits(id,next);
+}
+export function initPlotRanges(redraw){
+ for(const id of Object.keys(definitions)){
+  const canvas=$(id);canvas.title='Click an axis minimum or maximum to edit. Enter applies; Esc cancels.';
+  canvas.addEventListener('click',event=>{
+   const rect=canvas.getBoundingClientRect(),px=event.clientX-rect.left,py=event.clientY-rect.top;
+   const target=(endpoints.get(id)??[]).filter(e=>Math.abs(px-e.cx)<=e.w/2&&Math.abs(py-e.cy)<=e.h/2).sort((a,b)=>Math.hypot(px-a.cx,py-a.cy)-Math.hypot(px-b.cx,py-b.cy))[0];
+   if(!target)return;event.preventDefault?.();event.stopImmediatePropagation?.();closeEditor();
+   const state=plotState(id),wrapper=document.createElement('div'),input=document.createElement('input'),auto=document.createElement('button'),error=document.createElement('span');
+   wrapper.id='axisInlineEditor';wrapper.className='axis-inline-editor';input.id='axisInlineValue';input.type='number';input.step='any';input.value=String(target.bound==='min'?Math.min(state.range[target.axis+'min'],state.range[target.axis+'max']):Math.max(state.range[target.axis+'min'],state.range[target.axis+'max']));input.setAttribute('aria-label',target.axis.toUpperCase()+' '+target.bound+' '+state.meta[target.axis+'Label']);auto.textContent='Auto';auto.title='Restore this axis to automatic limits';error.id='axisInlineError';error.setAttribute('role','alert');
+   wrapper.style.left=Math.max(3,Math.min((window.innerWidth||1280)-184,rect.left+target.cx-66))+'px';wrapper.style.top=Math.max(3,rect.top+target.cy-14)+'px';wrapper.append(input,auto,error);document.body.append(wrapper);editor={wrapper,input,auto};input.focus();input.select?.();
+   const apply=value=>{try{const current=plotState(id);if(current.meta[target.axis+'Key']!==state.meta[target.axis+'Key'])throw Error('Axis units changed. Click the current endpoint again.');setAxisEndpoint(id,target.axis,target.bound,value);closeEditor();redraw();}catch(problem){error.textContent=problem.message;input.setAttribute('aria-invalid','true');}};
+   input.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault?.();apply(input.value.trim()===''?null:Number(input.value));}else if(e.key==='Escape'){e.preventDefault?.();closeEditor();}};
+   input.onblur=e=>{if(e.relatedTarget!==auto)setTimeout(()=>{if(editor?.input===input)closeEditor();},0);};auto.onclick=()=>apply(null);
+  },true);
+ }
+ window.addEventListener('pointerdown',event=>{if(editor&&event.target!==editor.input&&event.target!==editor.auto)closeEditor();},true);
 }

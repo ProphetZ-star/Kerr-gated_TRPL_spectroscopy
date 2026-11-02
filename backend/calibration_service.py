@@ -89,9 +89,13 @@ class CalibrationWorkbench:
         from .calibration import CaptureRequest, make_frame
         request = CaptureRequest(**data)
         image = make_frame(request.exposure_s, request.seed)
-        header = dict(frame_id=uuid.uuid4().hex, shape=[255, 1024], exposure_s=request.exposure_s,
+        if request.readout=='fvb':
+            import numpy as np
+            # Sum photocharge; the synthetic electronic offset is read once.
+            image=np.clip((image.astype(np.int64)-75).sum(axis=0,keepdims=True)+75,0,65535).astype(np.int32)
+        header = dict(frame_id=uuid.uuid4().hex, shape=list(image.shape), exposure_s=request.exposure_s,
                       seed=request.seed, source_mode='simulation', source='synthetic',
-                      readout='simulated-calibration-image', captured_utc=timestamp(),
+                      readout=request.readout, captured_utc=timestamp(),
                       spectrograph=deepcopy(spectrograph), full_scale=65535)
         self.frame = dict(header=header, image=image)
         self.solutions.clear()

@@ -53,8 +53,8 @@ def _strict_int_in_range(value: object, name: str, lower: int, upper: int) -> in
 def _validated_frame(frame: object) -> np.ndarray:
     if not isinstance(frame, np.ndarray):
         raise ValueError('frame must be a NumPy array')
-    if frame.ndim != 2 or frame.shape != (HEIGHT, WIDTH):
-        raise ValueError(f'frame must have shape ({HEIGHT}, {WIDTH})')
+    if frame.ndim != 2 or frame.shape not in {(HEIGHT, WIDTH), (1, WIDTH)}:
+        raise ValueError(f'frame must have shape ({HEIGHT}, {WIDTH}) or (1, {WIDTH})')
     if not (
         np.issubdtype(frame.dtype, np.integer)
         or np.issubdtype(frame.dtype, np.floating)
@@ -148,8 +148,8 @@ def _find_peaks(profile: np.ndarray) -> list[float]:
 
 def extract_profile(frame: np.ndarray, row_start: int, row_end: int) -> dict:
     values = _validated_frame(frame)
-    start = _strict_int_in_range(row_start, 'row_start', 0, HEIGHT - 1)
-    end = _strict_int_in_range(row_end, 'row_end', 0, HEIGHT - 1)
+    start = _strict_int_in_range(row_start, 'row_start', 0, values.shape[0] - 1)
+    end = _strict_int_in_range(row_end, 'row_end', 0, values.shape[0] - 1)
     if end < start:
         raise ValueError('row_end must be greater than or equal to row_start')
 
