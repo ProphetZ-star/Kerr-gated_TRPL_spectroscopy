@@ -1,8 +1,8 @@
 '''Reusable native widgets, layout helpers and plot-adjacent presentation pieces.'''
 import math
-from PySide6.QtCore import Qt,Signal,QPoint,QTimer,QRectF
-from PySide6.QtGui import QColor,QPainter,QPen,QLinearGradient,QFont
-from PySide6.QtWidgets import QWidget,QLabel,QPushButton,QFrame,QVBoxLayout,QHBoxLayout,QGridLayout,QScrollArea,QLineEdit,QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QSizePolicy,QProgressBar,QToolButton
+from PySide6.QtCore import Qt,Signal,QPoint,QTimer,QRectF,QObject,QEvent,QPointF,QSize
+from PySide6.QtGui import QColor,QPainter,QPen,QLinearGradient,QFont,QPainterPath,QIcon,QPixmap,QPolygonF,QPalette
+from PySide6.QtWidgets import QWidget,QLabel,QPushButton,QFrame,QVBoxLayout,QHBoxLayout,QGridLayout,QScrollArea,QLineEdit,QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QSizePolicy,QProgressBar,QToolButton,QAbstractSpinBox,QStylePainter,QStyleOptionComboBox,QStyle
 
 def repolish(widget):
     try:
@@ -32,18 +32,72 @@ def vbox(*widgets,spacing=8,margins=(0,0,0,0)):
     return box
 class UnitField(QWidget):
     def __init__(self,control,unit,parent=None):
-        super().__init__(parent); self.control=control; layout=QHBoxLayout(self); layout.setContentsMargins(0,0,0,0); layout.setSpacing(5); layout.addWidget(control,1)
-        self.unit=QLabel(unit); self.unit.setProperty('muted',True); self.unit.setMinimumWidth(18); layout.addWidget(self.unit)
+        super().__init__(parent); self.control=control; layout=QHBoxLayout(self); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0); layout.addWidget(control,1)
+        self.unit=QLabel(unit,self);self.unit.setObjectName('unitSuffix');self.unit.setProperty('muted',True);self.unit.setAttribute(Qt.WA_TransparentForMouseEvents,True)
+        if isinstance(control,QLineEdit):control.setTextMargins(0,0,max(18,self.unit.sizeHint().width())+10,0)
+    def resizeEvent(self,event):
+        super().resizeEvent(event);width=self.unit.sizeHint().width();self.unit.setGeometry(self.width()-width-8,0,width,self.height());self.unit.raise_()
 class Field(QWidget):
     def __init__(self,title,control,unit=None,parent=None):
         super().__init__(parent); self.control=control; layout=QVBoxLayout(self); layout.setContentsMargins(0,0,0,0); layout.setSpacing(4)
         self.label=QLabel(title); self.label.setProperty('muted',True); self.label.setProperty('mono',False); layout.addWidget(self.label)
+        if not title:self.label.hide()
         layout.addWidget(UnitField(control,unit) if unit else control)
         self.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Preferred)
+
+class _SpinEditorGeometry:
+    # Qt 6.12's stylesheet spin-box edit field can collapse to one pixel.
+    # Keep the native editor, validator, keyboard and value signals intact.
+    def _place_editor(self):
+        edit=self.lineEdit()
+        if edit is not None:edit.setGeometry(8,1,max(1,self.width()-16),max(1,self.height()-2))
+    def resizeEvent(self,event):
+        super().resizeEvent(event);self._place_editor()
+    def showEvent(self,event):
+        super().showEvent(event);self._place_editor()
+class NativeSpinBox(_SpinEditorGeometry,QSpinBox):pass
+class NativeDoubleSpinBox(_SpinEditorGeometry,QDoubleSpinBox):
+    def textFromValue(self,value):
+        text=super().textFromValue(value);decimal=self.locale().decimalPoint()
+        return text.rstrip('0').rstrip(decimal) if decimal in text else text
+
+class ArrowComboBox(QComboBox):
+    def paintEvent(self,event):
+        if self.property('centerText'):
+            # Frame/background from the style, then the current text centred between equal side paddings.
+            p=QStylePainter(self);option=QStyleOptionComboBox();self.initStyleOption(option);option.currentText=''
+            p.drawComplexControl(QStyle.CC_ComboBox,option);p.setPen(self.palette().color(QPalette.Text));p.setFont(self.font())
+            p.drawText(self.rect().adjusted(22,0,-22,0),Qt.AlignCenter,self.currentText());p.end()
+        else:
+            super().paintEvent(event)
+        from .theme import palette
+        # A combo with its own QSS text colour (e.g. the amber source selector) draws the arrow in that colour.
+        color=self.palette().color(QPalette.Text) if self.property('ownTextColor') else QColor(palette()['text'] if self.isEnabled() else palette()['muted'])
+        p=QPainter(self);p.setRenderHint(QPainter.Antialiasing);p.setPen(QPen(color,1.4));x=self.width()-12;y=self.height()/2;p.drawLine(int(x-3),int(y-1),int(x),int(y+2));p.drawLine(int(x),int(y+2),int(x+3),int(y-1))
+
+class CheckBox(QCheckBox):
+    def paintEvent(self,event):
+        from .theme import palette
+        colors=palette();p=QPainter(self);p.setRenderHint(QPainter.Antialiasing);size=12 if self.objectName()=='autosave' else 13;y=(self.height()-size)/2
+        left,top,right,bottom=pixel_edges(self,QRectF(0,round(y),size,size))
+        p.setPen(crisp_pen(colors['blue'] if self.isChecked() else colors['border_hover']));p.setBrush(QColor(colors['blue'] if self.isChecked() else colors['surface']));p.drawRoundedRect(QRectF(left,top,right-left,bottom-top),2,2)
+        if self.isChecked():
+            pen=QPen(QColor('#ffffff'),1.5);pen.setCapStyle(Qt.RoundCap);pen.setJoinStyle(Qt.RoundJoin);p.setPen(pen);path=QPainterPath();path.moveTo(3,y+size*.5);path.lineTo(5,y+size*.7);path.lineTo(9,y+size*.3);p.drawPath(path)
+        p.setFont(self.font());p.setPen(QColor(colors['muted']));p.drawText(QRectF(size+6,0,self.width()-size-6,self.height()),Qt.AlignVCenter|Qt.AlignLeft,self.text())
+
+class WaveLogo(QWidget):
+    def __init__(self):super().__init__();self.setFixedSize(17,24)
+    def paintEvent(self,event):
+        from .theme import palette
+        p=QPainter(self);p.setRenderHint(QPainter.Antialiasing);p.setPen(QPen(QColor(palette()['text']),1.4));path=QPainterPath()
+        for i in range(31):
+            x=i/2;y=12-4*math.sin(x/15*math.pi*2)
+            path.moveTo(x+1,y) if i==0 else path.lineTo(x+1,y)
+        p.drawPath(path)
 def field(title,control,unit=None):
     return Field(title,control,unit)
 def number_edit(value='',minimum=-1e12,maximum=1e12,decimals=6):
-    edit=QLineEdit(str(value)); edit.setAlignment(Qt.AlignRight); edit.setProperty('mono',True)
+    edit=QLineEdit(str(value)); edit.setAlignment(Qt.AlignLeft); edit.setProperty('mono',True)
     from PySide6.QtGui import QDoubleValidator
     validator=QDoubleValidator(minimum,maximum,decimals,edit); validator.setNotation(QDoubleValidator.StandardNotation); edit.setValidator(validator)
     return edit
@@ -54,19 +108,19 @@ def number_value(edit):
     except Exception: return None
     return value if math.isfinite(value) else None
 def spin(value=0.0,minimum=-1e12,maximum=1e12,decimals=4,step=0.1):
-    box=QDoubleSpinBox(); box.setRange(minimum,maximum); box.setDecimals(decimals); box.setSingleStep(step); box.setValue(value); box.setButtonSymbols(QDoubleSpinBox.NoButtons); box.setKeyboardTracking(True)
+    box=NativeDoubleSpinBox(); box.setRange(minimum,maximum); box.setDecimals(decimals); box.setSingleStep(step); box.setValue(value); box.setButtonSymbols(QDoubleSpinBox.NoButtons); box.setKeyboardTracking(True)
     return box
 def int_spin(value=0,minimum=0,maximum=1000000,step=1):
-    box=QSpinBox(); box.setRange(minimum,maximum); box.setSingleStep(step); box.setValue(value); box.setButtonSymbols(QSpinBox.NoButtons)
+    box=NativeSpinBox(); box.setRange(minimum,maximum); box.setSingleStep(step); box.setValue(value); box.setButtonSymbols(QSpinBox.NoButtons)
     return box
 class Segmented(QWidget):
     changed=Signal(str)
     def __init__(self,items=None,parent=None):
-        super().__init__(parent); self.setObjectName('segmented'); self.layout=QHBoxLayout(self); self.layout.setContentsMargins(2,2,2,2); self.layout.setSpacing(2)
+        super().__init__(parent); self.setObjectName('segmented');self.setAttribute(Qt.WA_StyledBackground,True);self.setFixedHeight(29); self.layout=QHBoxLayout(self); self.layout.setContentsMargins(2,2,2,2); self.layout.setSpacing(2)
         self.buttons=[]; self._value=''
         for text,value in (items or []): self.add(text,value,False)
     def add(self,text,value,selected=False):
-        button=QPushButton(text); button.setCheckable(True); button.setProperty('segmentValue',value); button.clicked.connect(lambda checked=False,b=button,v=value:self.set_selected(v,emit=True))
+        button=QPushButton(text);button.setFixedHeight(25); button.setCheckable(True); button.setProperty('segmentValue',value); button.clicked.connect(lambda checked=False,b=button,v=value:self.set_selected(v,emit=True))
         self.layout.addWidget(button,1); self.buttons.append(button)
         if selected or not self._value: self.set_selected(value,emit=False)
         return button
@@ -99,14 +153,180 @@ class CollapsibleSection(QWidget):
         self.button.setChecked(open); self.content.setVisible(open)
     def add(self,widget):
         self.content_layout.addWidget(widget)
+def pixel_edges(widget,rect):
+    """Edges of rect (widget coordinates) moved onto the centres of the device pixels just inside it.
+
+    A one-device-pixel cosmetic pen drawn through these stays a single crisp pixel at any
+    fractional Windows scale, where a plain 1 px QSS border is smeared over two pixels."""
+    dpr=widget.devicePixelRatioF() or 1.0;origin=widget.mapTo(widget.window(),QPoint(0,0))
+    def span(low,high,offset):
+        first=math.ceil((offset+low)*dpr-1e-6);last=math.floor((offset+high)*dpr+1e-6)-1
+        return (first+.5)/dpr-offset,(last+.5)/dpr-offset
+    left,right=span(rect.left(),rect.right(),origin.x());top,bottom=span(rect.top(),rect.bottom(),origin.y())
+    return left,top,right,bottom
+def crisp_pen(color,width=1.0):
+    pen=QPen(QColor(color));pen.setCosmetic(True);pen.setWidthF(width);return pen
+class FocusRing(QWidget):
+    """One crisp focus outline that follows the focused text field / combo box (inputs have no stroke of their own)."""
+    TARGETS=(QLineEdit,QComboBox,QAbstractSpinBox)
+    def __init__(self):
+        super().__init__();self.setAttribute(Qt.WA_TransparentForMouseEvents,True);self.setAttribute(Qt.WA_NoSystemBackground,True);self.target=None;self.hide()
+    def follow(self,old,new):
+        widget=new
+        if isinstance(widget,QLineEdit) and isinstance(widget.parentWidget(),QAbstractSpinBox):widget=widget.parentWidget()
+        if widget is not None and (not isinstance(widget,self.TARGETS) or widget.objectName() in ('delay','axisEndpointEdit','inlineValue') or widget.window() is widget):widget=None
+        if self.target is not None:
+            try:self.target.removeEventFilter(self);self.target.destroyed.disconnect(self._target_destroyed)
+            except (RuntimeError,TypeError):pass
+        self.target=widget
+        if widget is None:self.hide();self.setParent(None);return
+        self.setParent(widget);widget.installEventFilter(self);widget.destroyed.connect(self._target_destroyed)
+        self.setGeometry(widget.rect());self.show();self.raise_()
+    def _target_destroyed(self,*args):
+        # Detach before the target's destructor deletes its children (this ring included).
+        self.target=None;self.hide();self.setParent(None)
+    def eventFilter(self,obj,event):
+        if obj is self.target and event.type() in (QEvent.Resize,QEvent.Move):self.setGeometry(obj.rect());self.update()
+        return False
+    def paintEvent(self,event):
+        from .theme import palette
+        target=self.target;radius=0 if target is not None and target.parentWidget() is not None and target.parentWidget().objectName()=='segmentRow' else 4
+        left,top,right,bottom=pixel_edges(self,QRectF(self.rect()))
+        p=QPainter(self);p.setRenderHint(QPainter.Antialiasing);p.setPen(crisp_pen(palette()['blue']));p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(left,top,right-left,bottom-top),radius,radius)
+_FOCUS_RING=None
+def install_focus_ring(app):
+    global _FOCUS_RING
+    if _FOCUS_RING is None:
+        _FOCUS_RING=FocusRing();app.focusChanged.connect(_FOCUS_RING.follow)
+    return _FOCUS_RING
+def apply_pointer_cursors(root):
+    """Clickable controls show a hand cursor; text fields keep the I-beam."""
+    for widget in root.findChildren(QWidget):
+        if isinstance(widget,(QPushButton,QComboBox,QCheckBox,QToolButton)):widget.setCursor(Qt.PointingHandCursor)
+def parse_count(text):
+    """'35.3k' / '2e4' / '1.2M' -> float; empty -> None; anything else raises ValueError."""
+    text=str(text).strip().replace(',','')
+    if not text:return None
+    scale={'k':1e3,'m':1e6}.get(text[-1].lower(),1.0)
+    value=float(text[:-1] if scale!=1.0 else text)*scale
+    if not math.isfinite(value):raise ValueError('not finite')
+    return value
+class InlineValueEdit(QLineEdit):
+    """A value that reads as plain text and becomes editable on click.
+
+    Enter or focus-out emits committed(text); the owner answers accept() or reject().
+    Esc (or a rejected focus-out) restores the shown value."""
+    committed=Signal(str)
+    def __init__(self,text='',parent=None):
+        super().__init__(text,parent);self.setObjectName('inlineValue');self.setFrame(False);self.setAlignment(Qt.AlignCenter);self.setFixedHeight(18)
+        self._shown=str(text);self.textChanged.connect(self._fit);self._fit()
+    def set_value_text(self,text):
+        self._shown=str(text)
+        if not self.hasFocus():self.setText(self._shown)
+    def _fit(self,*args):
+        self.setFixedWidth(max(26,self.fontMetrics().horizontalAdvance(self.text() or ' ')+10))
+    def focusInEvent(self,event):
+        super().focusInEvent(event);QTimer.singleShot(0,self.selectAll)
+    def keyPressEvent(self,event):
+        if event.key()==Qt.Key_Escape:
+            self._revert();self.clearFocus();return
+        if event.key() in (Qt.Key_Return,Qt.Key_Enter):
+            self._commit();return
+        super().keyPressEvent(event)
+    def focusOutEvent(self,event):
+        super().focusOutEvent(event);self._commit()
+    def _commit(self):
+        if self.text().strip()==self._shown:
+            self._revert();self.clearFocus();return
+        self.committed.emit(self.text())
+    def _revert(self):
+        set_prop(self,'invalid',False);self.setText(self._shown)
+    def accept(self):
+        self._shown=self.text().strip();set_prop(self,'invalid',False);self.clearFocus()
+    def reject(self):
+        if self.hasFocus():set_prop(self,'invalid',True)
+        else:self._revert()
+class ElidedLabel(QLabel):
+    """Single-line label that elides with … and keeps the full text in its tooltip."""
+    def __init__(self,text='',parent=None):
+        super().__init__(parent);self._full='';self.setText(text)
+    def setText(self,text):
+        self._full=str(text);self.setToolTip(self._full);super().setText(self._full);self.update()
+    def text(self):
+        return self._full
+    def minimumSizeHint(self):
+        hint=super().minimumSizeHint();return QSize(min(hint.width(),self.minimumWidth() or 40),hint.height())
+    def paintEvent(self,event):
+        p=QPainter(self);p.setPen(self.palette().color(self.foregroundRole()));p.setFont(self.font())
+        p.drawText(self.contentsRect(),Qt.AlignVCenter|Qt.AlignLeft,self.fontMetrics().elidedText(self._full,Qt.ElideMiddle,self.contentsRect().width()))
+class PanelOutline(QWidget):
+    """Draw the shared rounded edge above flush chart children.
+
+    The edge is a one-device-pixel cosmetic line centred on whole device pixels, so
+    fractional Windows scaling (125 %, 150 %) does not smear it into a soft two-pixel band."""
+    def __init__(self,parent):
+        super().__init__(parent);self.setAttribute(Qt.WA_TransparentForMouseEvents,True)
+    def paintEvent(self,event):
+        from .theme import palette
+        left,top,right,bottom=pixel_edges(self,QRectF(self.rect()));colors=palette()
+        p=QPainter(self);p.setRenderHint(QPainter.Antialiasing)
+        # Flush children (plots, tables) paint square; cover their corners with the page background.
+        outside=QPainterPath();outside.addRect(QRectF(self.rect()));inside=QPainterPath();inside.addRoundedRect(QRectF(left,top,right-left,bottom-top),7,7)
+        p.fillPath(outside.subtracted(inside),QColor(colors['bg']))
+        p.setPen(crisp_pen(colors['line']));p.setBrush(Qt.NoBrush);p.drawRoundedRect(QRectF(left,top,right-left,bottom-top),7,7)
+class _OutlineFollower(QObject):
+    def __init__(self,frame):
+        super().__init__(frame);self.outline=PanelOutline(frame);frame.installEventFilter(self)
+    def eventFilter(self,obj,event):
+        if event.type() in (QEvent.Resize,QEvent.Show,QEvent.Move,QEvent.ChildAdded):
+            self.outline.setGeometry(obj.rect());self.outline.raise_()
+        return False
+def add_outline(frame):
+    """Give a card frame the crisp painted edge used by Panel (its QSS border stays 0)."""
+    return _OutlineFollower(frame).outline
+
+_RUN_ICONS={}
+def run_icon(kind,color,size=12):
+    """Painted play / pause / stop glyph; font glyphs such as ❚❚ render unevenly in Segoe UI."""
+    key=(kind,color,size)
+    if key in _RUN_ICONS:return _RUN_ICONS[key]
+    scale=4;pixmap=QPixmap(size*scale,size*scale);pixmap.fill(Qt.transparent);pixmap.setDevicePixelRatio(scale)
+    p=QPainter(pixmap);p.setRenderHint(QPainter.Antialiasing);p.setPen(Qt.NoPen);p.setBrush(QColor(color));s=float(size)
+    if kind=='play':p.drawPolygon(QPolygonF([QPointF(s*.2,s*.1),QPointF(s*.9,s*.5),QPointF(s*.2,s*.9)]))
+    elif kind=='pause':p.drawRoundedRect(QRectF(s*.18,s*.12,s*.22,s*.76),1,1);p.drawRoundedRect(QRectF(s*.6,s*.12,s*.22,s*.76),1,1)
+    else:p.drawRoundedRect(QRectF(s*.15,s*.15,s*.7,s*.7),1.5,1.5)
+    p.end();_RUN_ICONS[key]=QIcon(pixmap);return _RUN_ICONS[key]
+class ThemeButton(QPushButton):
+    def __init__(self):
+        super().__init__('');self.setAccessibleName('Toggle light or dark theme');self.setToolTip('Toggle light or dark theme')
+    def paintEvent(self,event):
+        super().paintEvent(event)
+        from .theme import palette
+        # Drawn in device pixels: the half-disc is an outline-free fill cut on a pixel boundary,
+        # and the ring stroke is a whole number of device pixels, so nothing smears at 125 % / 150 %.
+        color=QColor(palette()['text']);dpr=self.devicePixelRatioF()
+        p=QPainter(self);p.setRenderHint(QPainter.Antialiasing);p.scale(1/dpr,1/dpr)
+        cx=round(self.width()*dpr/2);cy=round(self.height()*dpr/2);stroke=max(1,round(1.3*dpr));radius=round(13*dpr)/2-stroke/2
+        disc=QPainterPath();disc.addEllipse(QPointF(cx,cy),radius,radius)
+        half=QPainterPath();half.addRect(QRectF(cx-radius-stroke,cy-radius-stroke,radius+stroke,2*radius+2*stroke))
+        p.setPen(Qt.NoPen);p.setBrush(color);p.drawPath(disc.intersected(half))
+        p.setBrush(Qt.NoBrush);p.setPen(QPen(color,stroke));p.drawEllipse(QPointF(cx,cy),radius,radius)
+
 class Panel(QFrame):
     def __init__(self,title,parent=None):
         super().__init__(parent); self.setObjectName('panel'); self.layout=QVBoxLayout(self); self.layout.setContentsMargins(0,0,0,0); self.layout.setSpacing(0)
-        self.header=QWidget(); self.header.setObjectName('panelHead'); self.header_layout=QHBoxLayout(self.header); self.header_layout.setContentsMargins(14,10,14,10); self.header_layout.setSpacing(10)
+        self.header=QWidget(); self.header.setObjectName('panelHead');self.header.setFixedHeight(49); self.header_layout=QHBoxLayout(self.header); self.header_layout.setContentsMargins(14,0,14,0); self.header_layout.setSpacing(10)
         self.title_label=QLabel(title); self.title_label.setProperty('h2',True); self.title_layout=QHBoxLayout(); self.title_layout.setContentsMargins(0,0,0,0); self.title_layout.setSpacing(10); self.title_layout.addWidget(self.title_label); self.header_layout.addLayout(self.title_layout); self.header_layout.addStretch(1)
         self.tools=QWidget(); self.tools_layout=QHBoxLayout(self.tools); self.tools_layout.setContentsMargins(0,0,0,0); self.tools_layout.setSpacing(10); self.header_layout.addWidget(self.tools)
         self.body=QWidget(); self.body.setObjectName('panelBody'); self.body_layout=QVBoxLayout(self.body); self.body_layout.setContentsMargins(0,0,0,0); self.body_layout.setSpacing(0)
-        self.layout.addWidget(self.header); self.layout.addWidget(self.body,1)
+        self.layout.addWidget(self.header); self.layout.addWidget(self.body,1);self.outline=PanelOutline(self)
+    def resizeEvent(self,event):
+        super().resizeEvent(event);self.outline.setGeometry(self.rect());self.outline.raise_()
+    def moveEvent(self,event):
+        super().moveEvent(event);self.outline.update()
+    def showEvent(self,event):
+        super().showEvent(event);self.outline.setGeometry(self.rect());self.outline.raise_()
     def add_tool(self,widget):
         self.tools_layout.addWidget(widget)
     def add_body(self,widget,stretch=0):
@@ -116,14 +336,16 @@ class Swatch(QWidget):
         super().__init__(parent); self.dashed=dashed; self.dot=dot; self.color=color; self.setFixedSize(16,10)
     def paintEvent(self,event):
         from .theme import palette
-        colors=palette(); painter=QPainter(self); color=QColor(self.color or colors['data']); pen=QPen(color,2); pen.setStyle(Qt.DashLine if self.dashed else Qt.SolidLine); painter.setPen(pen); y=5
+        colors=palette(); painter=QPainter(self); color=QColor(self.color or (colors['amber'] if self.dashed else colors['data'])); pen=QPen(color,2); pen.setStyle(Qt.DashLine if self.dashed else Qt.SolidLine); painter.setPen(pen); y=5
         if self.dot: painter.setBrush(color); painter.drawEllipse(5,1,7,7)
         else: painter.drawLine(0,y,15,y)
 class Legend(QWidget):
     def __init__(self,parent=None):
         super().__init__(parent); self.layout=QHBoxLayout(self); self.layout.setContentsMargins(0,0,0,0); self.layout.setSpacing(10)
     def add(self,text,dashed=False,dot=False,color=None):
-        box=QWidget(); row=QHBoxLayout(box); row.setContentsMargins(0,0,0,0); row.setSpacing(5); row.addWidget(Swatch(dashed,dot,color)); item=QLabel(text); item.setProperty('muted',True); row.addWidget(item); self.layout.addWidget(box); return box
+        box=QWidget(); row=QHBoxLayout(box); row.setContentsMargins(0,0,0,0); row.setSpacing(5); row.addWidget(Swatch(dashed,dot,color)); item=QLabel(text); item.setProperty('muted',True)
+        item.setSizePolicy(QSizePolicy.Fixed,QSizePolicy.Preferred)  # never clipped when a neighbouring entry's text grows
+        row.addWidget(item); self.layout.addWidget(box); return box
 class GradientBar(QWidget):
     def __init__(self,parent=None):
         super().__init__(parent); self.setMinimumWidth(85); self.setFixedHeight(7); self.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed)
@@ -183,6 +405,9 @@ class MetricsOverlay(QFrame):
         self._drag=None; self._moved=False
     def set_values(self,rms=None,max_error=None,coverage=None):
         self.values['rms'].setText(rms or '—'); self.values['max'].setText(max_error or '—'); self.values['range'].setText(coverage or '—')
+        for child in self.findChildren(QWidget,options=Qt.FindDirectChildrenOnly):
+            if child.layout() is not None:child.layout().invalidate();child.layout().activate()
+        self.layout().invalidate();self.layout().activate();self.setFixedSize(self.layout().sizeHint());self.place()
     def place(self):
         parent=self.parentWidget()
         if parent is not None and not self._moved: self.move(max(8,parent.width()-self.sizeHint().width()-24),16)

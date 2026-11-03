@@ -1,11 +1,20 @@
 '''Native pyqtgraph plots with inline editable axis endpoints.'''
 import math
+import time
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal, QEvent, QPointF, QRectF
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QFrame, QLineEdit, QHBoxLayout
-from .theme import palette, map_color, map_qcolors
+import pyqtgraph.functions as fn
+from PySide6.QtCore import Qt, Signal, QEvent, QPointF, QRectF, QRect
+from PySide6.QtGui import QColor,QFont,QFontMetricsF,QPen,QPainterPath
+from PySide6.QtWidgets import QFrame, QLineEdit, QHBoxLayout, QGraphicsRectItem, QGraphicsPathItem, QGraphicsSimpleTextItem, QWidget, QPushButton, QLabel
+from .theme import palette, map_color, map_qcolors, SATURATED_COLOR
+
+def saturated_rgb():
+    color = QColor(SATURATED_COLOR)
+    return np.array([color.red(), color.green(), color.blue()], dtype=np.uint8)
+
+# left axis width, right / top gutter, bottom axis height. The right gutter matches the 14 px panel header padding.
+PLOT_MARGINS=(68,14,10,46)
 
 def fmt(value, digits=4):
     try:
@@ -18,45 +27,356 @@ def fmt(value, digits=4):
         return f'{value:.3e}'
     return f'{value:.{digits}g}'
 
+def nice_step(span, target, integer=False):
+    '''Tick spacing from the 1 / 2 / 2.5 / 5 x 10^n series for about `target` intervals over span.'''
+    raw = span / max(1, target)
+    if not math.isfinite(raw) or raw <= 0:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(raw))
+    candidates = [factor * magnitude for factor in (1, 2, 2.5, 5, 10)]
+    if integer:
+        candidates = [value for value in candidates if value >= 1 - 1e-9 and abs(value - round(value)) < 1e-6] or [1.0]
+        candidates = [float(round(value)) for value in candidates]
+    # Largest round step not much coarser than requested, so short axes still get 3-5 labelled ticks.
+    fitting = [value for value in candidates if value <= raw * 1.25]
+    return max(fitting) if fitting else min(candidates)
+
+def _decimals(step):
+    for digits in range(7):
+        scaled = step * 10 ** digits
+        if abs(scaled - round(scaled)) < 1e-6 * max(1.0, abs(scaled)):
+            return digits
+    return 6
+
+def format_tick(value, step, extra=0):
+    '''Tick text with just enough decimals for the step; steps of 1000 and more use a k suffix.'''
+    if abs(value) < abs(step) * 1e-6:
+        return '0'
+    suffix = ''
+    if abs(step) >= 1000:
+        value, step, suffix = value / 1000, step / 1000, 'k'
+    text = f'{value:.{_decimals(step) + extra}f}'
+    if extra and '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text + suffix
+
+def format_count(value, significant=3):
+    '''Counts without exponent notation: 1, 10, 100, 1k, 10k, 1.2M.'''
+    for divisor, suffix in ((1e6, 'M'), (1e3, 'k'), (1.0, '')):
+        if abs(value) >= divisor or divisor == 1.0:
+            scaled = value / divisor
+            break
+    digits = max(0, significant - 1 - math.floor(math.log10(abs(scaled)))) if scaled else 0
+    text = f'{scaled:.{digits}f}'
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text + suffix
+
+def is_pixel_label(label):
+    label = (label or '').strip().lower()
+    if ' / ' in label:
+        name, unit = label.split(' / ', 1)
+        return unit.strip() in ('px', 'pixel', 'pixels') and not name.strip().startswith('count')
+    return label in ('pixel', 'pixels', 'ccd pixel', 'ccd row', 'ccd column', 'row', 'column')
+
+def format_duration(seconds):
+    '''Seconds below 1.5 min, then minutes, then hours: "48 s", "12 min 05 s", "2 h 07 min".'''
+    seconds = max(0.0, float(seconds))
+    if seconds < 10:
+        return f'{seconds:.1f} s'
+    if seconds < 90:
+        return f'{seconds:.0f} s'
+    total = int(round(seconds))
+    if total < 3600:
+        minutes, rest = divmod(total, 60)
+        return f'{minutes} min {rest:02d} s'
+    hours, rest = divmod(total, 3600)
+    return f'{hours} h {round(rest / 60):02d} min'
+
 def _polyval(coeffs, x):
     values = np.zeros_like(np.asarray(x, dtype=float))
     for coefficient in reversed(list(coeffs)):
         values = values * x + float(coefficient)
     return values
 
+def set_invalid(widget, value):
+    widget.setProperty('invalid', bool(value))
+    widget.style().unpolish(widget); widget.style().polish(widget)
+
+def label_parts(label):
+    '''(prefix, unit) for readouts from an axis title: "Delay / ps" -> ("", "ps"), "counts / s" -> ("", "counts/s"),
+    "Residual" -> ("Residual", "").'''
+    label = (label or '').strip()
+    if ' / ' in label:
+        name, unit = label.split(' / ', 1)
+        return '', label.replace(' ', '') if name.strip().lower().startswith('count') else unit.strip()
+    return label, ''
+
+def format_reading(value, label):
+    prefix, unit = label_parts(label)
+    return f'{prefix} {fmt(value, 5)} {unit}'.strip()
+
+class ZoomGroup:
+    '''Shared zoom history for plots whose axes are linked or synchronised.
+
+    Every entry is a snapshot of each member's manual (user-chosen) axis ranges taken before a
+    zoom, pan, reset or limit edit, so one undo restores all linked views together.'''
+    LIMIT = 40
+    def __init__(self, plot):
+        self.members = [plot]
+        self.stack = []
+    def merge(self, other):
+        if other is self:
+            return
+        for plot in other.members:
+            plot.zoom_group = self
+            if plot not in self.members:
+                self.members.append(plot)
+        self.stack = []
+    def push(self):
+        snapshot = [(plot, dict(plot._manual_ranges)) for plot in self.members]
+        if self.stack and all(a[1] == b[1] for a, b in zip(self.stack[-1], snapshot)):
+            return
+        self.stack.append(snapshot)
+        del self.stack[:-self.LIMIT]
+    def undo(self):
+        if not self.stack:
+            return False
+        for plot, manual in self.stack.pop():
+            plot._restore_manual(manual)
+        self.changed()
+        return True
+    def changed(self):
+        for plot in self.members:
+            plot._refresh_zoom_bar()
+
+class ZoomViewBox(pg.ViewBox):
+    '''Left-drag draws a zoom box (Shift: x only, Alt: y only); right / middle drag pans;
+    the wheel zooms in finer steps (Ctrl: finer still), on an axis only that axis.'''
+    WHEEL_STEP = 1.15
+    FINE_STEP = 1.04
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.owner = None
+        self._box = None
+        self._box_label = None
+        self._last_wheel = 0.0
+        self.setCursor(Qt.CrossCursor)
+    def _ensure_box(self):
+        if self._box is None:
+            self._box = QGraphicsRectItem(self)
+            self._box.setZValue(1e8)
+            self._box.setAcceptedMouseButtons(Qt.NoButton)
+            self._box_label = QGraphicsRectItem(self)
+            self._box_label.setZValue(1e8 + 1)
+            self._box_label.setAcceptedMouseButtons(Qt.NoButton)
+            self._box_text = QGraphicsSimpleTextItem(self._box_label)
+            font = QFont('Consolas'); font.setPixelSize(11); self._box_text.setFont(font)
+        colors = palette()
+        pen = pg.mkPen(colors['blue']); pen.setCosmetic(True)
+        fill = QColor(colors['blue']); fill.setAlpha(36)
+        self._box.setPen(pen); self._box.setBrush(fill)
+        back = QColor(colors['surface']); back.setAlpha(230)
+        self._box_label.setPen(pg.mkPen(None)); self._box_label.setBrush(back)
+        self._box_text.setBrush(QColor(colors['text']))
+    def _hide_box(self):
+        if self._box is not None:
+            self._box.hide(); self._box_label.hide()
+    def mouseDragEvent(self, ev, axis=None):
+        owner = self.owner
+        if owner is None:
+            return super().mouseDragEvent(ev, axis)
+        button = ev.button()
+        if axis is not None or button in (Qt.RightButton, Qt.MiddleButton):
+            ev.accept()
+            if ev.isStart():
+                owner.zoom_group.push()
+                self.setCursor(Qt.ClosedHandCursor)
+            mask = [1, 1]
+            if axis in (0, 1):
+                mask[1 - axis] = 0
+            dif = (ev.pos() - ev.lastPos()) * -1
+            transform = fn.invertQTransform(self.childGroup.transform())
+            shift = transform.map(QPointF(dif.x() * mask[0], dif.y() * mask[1])) - transform.map(QPointF(0, 0))
+            self._resetTarget()
+            self.translateBy(x=shift.x() if mask[0] else None, y=shift.y() if mask[1] else None)
+            owner._commit_view([name for name, used in zip('xy', mask) if used])
+            if ev.isFinish():
+                self.setCursor(Qt.CrossCursor)
+            return
+        if button != Qt.LeftButton:
+            ev.ignore()
+            return
+        ev.accept()
+        modifiers = ev.modifiers()
+        mode = 'x' if modifiers & Qt.ShiftModifier else 'y' if modifiers & Qt.AltModifier else 'xy'
+        bounds = self.rect()
+        start = ev.buttonDownPos(Qt.LeftButton); current = ev.pos()
+        x0, x1 = sorted((start.x(), current.x())); y0, y1 = sorted((start.y(), current.y()))
+        x0, x1 = max(bounds.left(), x0), min(bounds.right(), x1)
+        y0, y1 = max(bounds.top(), y0), min(bounds.bottom(), y1)
+        if mode == 'x':
+            y0, y1 = bounds.top(), bounds.bottom()
+        elif mode == 'y':
+            x0, x1 = bounds.left(), bounds.right()
+        first = self.mapToView(QPointF(x0, y0)); second = self.mapToView(QPointF(x1, y1))
+        x_range = tuple(sorted((first.x(), second.x()))); y_range = tuple(sorted((first.y(), second.y())))
+        if ev.isFinish():
+            self._hide_box()
+            if (mode != 'y' and x1 - x0 < 4) or (mode != 'x' and y1 - y0 < 4):
+                return
+            owner.apply_user_range(x=x_range if mode != 'y' else None, y=y_range if mode != 'x' else None)
+            return
+        self._ensure_box()
+        self._box.setRect(QRectF(x0, y0, x1 - x0, y1 - y0)); self._box.show()
+        self._box_text.setText(owner.range_text(x_range if mode != 'y' else None, y_range if mode != 'x' else None))
+        text = self._box_text.boundingRect()
+        label = QRectF(0, 0, text.width() + 12, text.height() + 6)
+        lx = min(max(bounds.left() + 4, x1 - label.width()), bounds.right() - label.width() - 4)
+        ly = y1 + 6 if y1 + 6 + label.height() < bounds.bottom() - 4 else max(bounds.top() + 4, y0 - label.height() - 6)
+        self._box_label.setRect(label); self._box_label.setPos(lx, ly); self._box_text.setPos(6, 3); self._box_label.show()
+    def wheelEvent(self, ev, axis=None):
+        owner = self.owner
+        if owner is None:
+            return super().wheelEvent(ev, axis)
+        mask = [True, True]
+        if axis in (0, 1):
+            mask[1 - axis] = False
+        step = self.FINE_STEP if ev.modifiers() & Qt.ControlModifier else self.WHEEL_STEP
+        scale = step ** (-ev.delta() / 120.0)
+        center = fn.invertQTransform(self.childGroup.transform()).map(ev.pos())
+        now = time.monotonic()
+        if now - self._last_wheel > 0.8:
+            owner.zoom_group.push()
+        self._last_wheel = now
+        self._resetTarget()
+        self.scaleBy(x=scale if mask[0] else None, y=scale if mask[1] else None, center=center)
+        owner._commit_view([name for name, used in zip('xy', mask) if used])
+        ev.accept()
+    def mouseClickEvent(self, ev):
+        if self.owner is not None and ev.button() == Qt.LeftButton and ev.double():
+            ev.accept()
+            self.owner.reset_view()
+            return
+        super().mouseClickEvent(ev)
+
+AXIS_TEXT_OFFSET=4
+AXIS_TITLE_GAP=4
 class InlineAxis(pg.AxisItem):
     def __init__(self, orientation, owner=None):
         super().__init__(orientation=orientation)
         self.owner = owner
+        self._hovered = None
+    def _end_font(self):
+        font = QFont('Segoe UI'); font.setPixelSize(12)
+        return font
+    def endpoint_rects(self):
+        '''Where drawPicture puts the min / max labels, in axis coordinates.'''
+        metrics = QFontMetricsF(self._end_font())
+        ends = self.endpoint_strings()
+        out = {}
+        for index, text in enumerate(ends[:2]):
+            width = metrics.horizontalAdvance(text)
+            if self.orientation == 'bottom':
+                x = self.geometry().width() - width if index else 0
+                baseline = 20
+            else:
+                top = (index == 0) if self.owner._invert_y else (index == 1)
+                x = self.geometry().width() - AXIS_TEXT_OFFSET - width
+                baseline = metrics.ascent() - 1 if top else self.geometry().height() - 1
+            out['min' if index == 0 else 'max'] = QRectF(x, baseline - metrics.ascent(), width, metrics.height())
+        return out
+    def endpoint_at(self, pos):
+        if self.owner is None or not self.style['showValues']:
+            return None
+        for endpoint, rect in self.endpoint_rects().items():
+            if rect.adjusted(-6, -4, 6, 4).contains(pos):
+                return endpoint
+        return None
+    def hoverEvent(self, ev):
+        hovered = None if ev.isExit() else self.endpoint_at(ev.pos())
+        if hovered != self._hovered:
+            self._hovered = hovered
+            if hovered:
+                self.setCursor(Qt.PointingHandCursor)
+                self.setToolTip('Click to type this axis limit')
+            else:
+                self.unsetCursor()
+                self.setToolTip('')
+            self.picture = None
+            self.update()
+    def integer_axis(self):
+        '''Pixel / row axes only ever show whole numbers.'''
+        forced = getattr(self, 'integer_ticks', None)
+        return bool(forced) if forced is not None else is_pixel_label(self.labelText)
+    def _step(self):
+        low, high = sorted(self.range)
+        if self.logMode:
+            return max(1.0, nice_step(high - low, getattr(self, 'divisions', 4), integer=True))
+        return nice_step(high - low, getattr(self, 'divisions', 4), integer=self.integer_axis())
     def tickValues(self,minVal,maxVal,size):
-        levels=super().tickValues(minVal,maxVal,size)
-        if not levels or maxVal<=minVal:return levels
-        spacing,major=levels[0]
-        margin=(maxVal-minVal)*.06
-        return [(spacing,sorted(set([minVal,maxVal]+[value for value in major if minVal+margin<value<maxVal-margin])))]
+        # Interior ticks fall on round numbers (1-2-2.5-5 steps); the exact range ends are drawn separately
+        # as editable endpoint labels, so ticks too close to them are dropped instead of overlapping.
+        minVal,maxVal=sorted((minVal,maxVal));span=maxVal-minVal
+        if span<=0 or size<=0:return []
+        step=self._step();gap=(44 if self.orientation in ('bottom','top') else 26)*span/size
+        first=math.ceil((minVal+gap)/step-1e-9);last=math.floor((maxVal-gap)/step+1e-9)
+        values=[index*step for index in range(first,last+1)][:50]
+        return [(step,values)]
+    def tickStrings(self,values,scale,spacing):
+        if getattr(self,'tick_format',None):return [self.tick_format(value) for value in values]
+        step=spacing or self._step()
+        return [self._format(value,step) for value in values]
+    def endpoint_strings(self):
+        step=self._step()
+        return [self._format(value,step,endpoint=True) for value in sorted(self.range)]
+    def _format(self,value,step,endpoint=False):
+        if self.logMode:
+            return format_count(10**value, 2 if endpoint else 1)
+        if self.integer_axis():
+            return str(int(round(value)))
+        return format_tick(value,step,extra=1 if endpoint else 0)
+    def drawPicture(self,p,axisSpec,tickSpecs,textSpecs):
+        ends=self.endpoint_strings()
+        super().drawPicture(p,axisSpec,tickSpecs,textSpecs)
+        if not self.style['showValues'] or self.owner is None:return
+        p.save();p.setClipping(False);p.setPen(self.textPen());font=QFont('Segoe UI');font.setPixelSize(12);p.setFont(font)
+        metrics=p.fontMetrics()
+        for index,text in enumerate(ends):
+            width=metrics.horizontalAdvance(text)
+            # Endpoint labels sit inside the axis span so neighbouring plots can share a narrow gutter.
+            if self.orientation=='bottom':point=QPointF(self.geometry().width()-width if index else 0,20)
+            else:
+                top=(index==0) if self.owner._invert_y else (index==1)
+                point=QPointF(self.geometry().width()-AXIS_TEXT_OFFSET-width,metrics.ascent()-1 if top else self.geometry().height()-1)
+            if self._hovered==('min' if index==0 else 'max'):
+                # Editable affordance: the hovered limit turns blue with a dotted underline.
+                blue=QColor(palette()['blue']);p.setPen(blue);p.drawText(point,text)
+                underline=QPen(blue,1,Qt.DotLine);underline.setCosmetic(True);p.setPen(underline)
+                p.drawLine(QPointF(point.x(),point.y()+2),QPointF(point.x()+width,point.y()+2));p.setPen(self.textPen())
+            else:
+                p.drawText(point,text)
+        p.restore()
+    def _updateMaxTextSize(self,x):
+        super()._updateMaxTextSize(x);self._place_label()
+    def resizeEvent(self,ev=None):
+        super().resizeEvent(ev);self._place_label()
+    def _place_label(self):
+        # pyqtgraph pins the title to the far edge of the axis; keep it next to the tick text instead.
+        if self.label is None or not self.label.isVisible() or not self.style['showValues']:return
+        br=self.label.boundingRect();doc=self.label.document().documentMargin()
+        if self.orientation=='bottom':
+            self.label.setPos(QPointF(int(self.size().width()/2-br.width()/2),AXIS_TEXT_OFFSET+min(self.textHeight,18)+AXIS_TITLE_GAP-doc))
+        elif self.orientation=='left':
+            x=self.size().width()-AXIS_TEXT_OFFSET-self.textWidth-AXIS_TITLE_GAP-br.height()+doc
+            self.label.setPos(QPointF(max(-doc,int(x)),int(self.size().height()/2+br.width()/2)))
     def mouseClickEvent(self, ev):
-        if ev.button() == Qt.LeftButton and self.owner is not None:
-            try:
-                if self.orientation in ('bottom', 'top'):
-                    width = max(1, self.geometry().width())
-                    x = ev.pos().x()
-                    if x < 36 or x > width - 36:
-                        self.owner.begin_axis_edit('x', 'min' if x < width / 2 else 'max')
-                        ev.accept()
-                        return
-                else:
-                    height = max(1, self.geometry().height())
-                    y = ev.pos().y()
-                    if y < 30 or y > height - 30:
-                        if self.owner._invert_y:
-                            endpoint = 'min' if y < height / 2 else 'max'
-                        else:
-                            endpoint = 'max' if y < height / 2 else 'min'
-                        self.owner.begin_axis_edit('y', endpoint)
-                        ev.accept()
-                        return
-            except Exception:
-                pass
+        if ev.button() == Qt.LeftButton and self.owner is not None and not ev.double():
+            endpoint = self.endpoint_at(ev.pos())
+            if endpoint:
+                self.owner.begin_axis_edit('x' if self.orientation in ('bottom', 'top') else 'y', endpoint)
+                ev.accept()
+                return
         super().mouseClickEvent(ev)
 
 class EditablePlot(pg.PlotWidget):
@@ -64,14 +384,22 @@ class EditablePlot(pg.PlotWidget):
         self._grid = bool(grid)
         self._invert_y = bool(invert_y)
         self._editor = None
-        self._editor_edit = None
         self._edit_axis = None
         self._edit_endpoint = None
         self._manual_ranges = {}
         self._linked_axes={}
+        self._data_bounds = {}
+        self._limits = {}
+        self.clamp_to_data = False
+        self._x_peers = []
+        self._editor_busy = False
+        self.readout_units = {}
         bottom = InlineAxis('bottom')
         left = InlineAxis('left')
-        super().__init__(parent=parent, axisItems={'bottom': bottom, 'left': left}, **kwargs)
+        view_box = ZoomViewBox()
+        super().__init__(parent=parent, axisItems={'bottom': bottom, 'left': left}, viewBox=view_box, **kwargs)
+        view_box.owner = self
+        self.zoom_group = ZoomGroup(self)
         bottom.owner = self
         left.owner = self
         self.bottom_axis = bottom
@@ -90,24 +418,102 @@ class EditablePlot(pg.PlotWidget):
                 self.plotItem.invertY(True)
             except Exception:
                 pass
+        # The frame is drawn over the view box itself; axis lines sit one pixel outside it and left a
+        # background-coloured seam between image data and the frame.
+        self._frame=QGraphicsRectItem(self.plotItem.vb);self._frame.setZValue(1e9);self._frame.setBrush(Qt.NoBrush)
+        self._frame.setAcceptedMouseButtons(Qt.NoButton);self._frame.setAcceptHoverEvents(False)
+        self.plotItem.vb.sigResized.connect(self._place_frame)
         self._apply_style()
+        self.set_plot_margins(*PLOT_MARGINS)
+        self._empty=pg.TextItem('',anchor=(.5,.5),color=colors['muted'] if (colors:=palette()) else '#63748a')
+        font=QFont('Segoe UI');font.setPixelSize(12);self._empty.setFont(font);self._empty.setZValue(50);self.plotItem.addItem(self._empty,ignoreBounds=True)
+        self.plotItem.vb.sigRangeChanged.connect(self._position_empty)
+        self._build_zoom_overlays()
+        self.setFocusPolicy(Qt.ClickFocus)
+        self.plotItem.vb.sigResized.connect(self._place_overlays)
+        self.scene().sigMouseMoved.connect(self._hover_moved)
+    def _build_zoom_overlays(self):
+        # Floating controls inside the plot frame: readout top-left, Back / Full view top-right.
+        self._readout = QLabel(self)
+        self._readout.setObjectName('plotReadout')
+        self._readout.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._readout.hide()
+        self._zoom_bar = QWidget(self)
+        self._zoom_bar.setObjectName('plotZoomBar')
+        bar = QHBoxLayout(self._zoom_bar); bar.setContentsMargins(0, 0, 0, 0); bar.setSpacing(4)
+        self._back_chip = QPushButton('‹ Back')
+        self._back_chip.setToolTip('Previous zoom (Backspace)')
+        self._back_chip.clicked.connect(lambda: self.zoom_group.undo())
+        self._fit_chip = QPushButton('Full view')
+        self._fit_chip.setToolTip('Show all data (double-click the plot)')
+        self._fit_chip.clicked.connect(self.reset_view)
+        for chip in (self._back_chip, self._fit_chip):
+            chip.setObjectName('plotChip'); chip.setCursor(Qt.PointingHandCursor); chip.setFocusPolicy(Qt.NoFocus); bar.addWidget(chip)
+        self._zoom_bar.hide()
+        self._editor = QLineEdit(self)
+        self._editor.setObjectName('axisEndpointEdit')
+        self._editor.installEventFilter(self)
+        self._editor.hide()
+    def _view_rect(self):
+        return self.mapFromScene(self.plotItem.vb.sceneBoundingRect()).boundingRect()
+    def _place_overlays(self, *args):
+        rect = self._view_rect()
+        self._readout.move(rect.left() + 6, rect.top() + 6)
+        self._zoom_bar.adjustSize()
+        self._zoom_bar.move(rect.right() - self._zoom_bar.width() - 5, rect.top() + 6)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_zoom_bar'):
+            self._refresh_zoom_bar()
+            self._place_overlays()
+    def set_plot_margins(self,left,right,top,bottom):
+        self.plotItem.layout.setContentsMargins(0,0,0,0);self.plotItem.layout.setHorizontalSpacing(0);self.plotItem.layout.setVerticalSpacing(0)
+        self.left_axis.setWidth(left);self.bottom_axis.setHeight(bottom)
+        for name,size in [('top',top),('right',right)]:
+            self.plotItem.showAxis(name);axis=self.plotItem.getAxis(name);axis.setStyle(showValues=False,tickLength=0);axis.setGrid(False);axis.setPen(pg.mkPen(None));axis.setTickPen(pg.mkPen(None));axis.setHeight(size) if name=='top' else axis.setWidth(size)
+    def _place_frame(self,*args):
+        rect=self.plotItem.vb.rect();dpr=self.devicePixelRatioF() or 1.0;half=.5/dpr
+        self._frame.setRect(rect.adjusted(half,half,-half,-half))
+    def set_empty(self,text):
+        self._empty.setText(text,color=palette()['muted']);self._empty.setVisible(bool(text));self._position_empty()
+    def _position_empty(self,*args):
+        if hasattr(self,'_empty'):
+            x,y=self.viewRange();self._empty.setPos((x[0]+x[1])/2,(y[0]+y[1])/2)
     def _apply_style(self):
         colors = palette()
         self.setBackground(colors['surface'])
         self.plotItem.vb.setBackgroundColor(colors['plot'])
+        frame_pen=pg.mkPen(colors['plot_border']);frame_pen.setCosmetic(True);self._frame.setPen(frame_pen)
         for axis in (self.bottom_axis, self.left_axis):
-            axis.setPen(pg.mkPen(colors['plot_border']))
+            axis.setPen(pg.mkPen(None))
             axis.setTextPen(pg.mkPen(colors['muted']))
+            axis.setTickPen(pg.mkPen(colors['chart_grid']))
+            font=QFont('Segoe UI');font.setPixelSize(12);axis.setTickFont(font);axis.setStyle(autoExpandTextSpace=False)
+            axis.enableAutoSIPrefix(False)
             try:
                 axis.setStyle(tickLength=0, tickTextOffset=4,hideOverlappingLabels=False)
             except Exception:
                 pass
         try:
-            self.plotItem.showGrid(x=self._grid, y=self._grid, alpha=0.22 if self._grid else 0.0)
+            self.plotItem.showGrid(x=self._grid, y=self._grid, alpha=1.0 if self._grid else 0.0)
+            for name in ('top','right'):self.plotItem.getAxis(name).setGrid(False)
         except Exception:
             pass
     def update_theme(self):
         self._apply_style()
+        if hasattr(self,'_empty'):self._empty.setColor(palette()['muted'])
+        self._style_cursor_lines()
+    def _style_cursor_lines(self):
+        # Draggable cursors: blue on hover (pyqtgraph defaults to red) and readable value tags.
+        colors=palette();hover=pg.mkPen(colors['blue'],width=1.5)
+        tag=QColor(colors['surface']);tag.setAlpha(225)
+        for item in self.plotItem.items:
+            lines=item.lines if isinstance(item,pg.LinearRegionItem) else [item] if isinstance(item,pg.InfiniteLine) else []
+            for line in lines:
+                line.setHoverPen(hover)
+                label=getattr(line,'label',None)
+                if label is not None:
+                    label.setColor(colors['text']);label.fill=pg.mkBrush(tag)
     def set_x_label(self, text):
         self.bottom_axis.setLabel(text, color=palette()['muted'])
     def set_y_label(self, text):
@@ -116,14 +522,20 @@ class EditablePlot(pg.PlotWidget):
         source=self._linked_axes.get(axis)
         if source is not None:
             return source.set_axis_bounds(axis,low,high,manual=True) if manual else True
-        log_mode=bool((self.bottom_axis if axis=='x' else self.left_axis).logMode)
+        log_mode=self._log_mode(axis)
         saved=self._manual_ranges.get(axis)
         if manual:
             self._manual_ranges[axis]=(float(low),float(high),log_mode)
-        elif saved and saved[2]==log_mode:
-            low,high=saved[:2]
-        elif saved:
-            self._manual_ranges.pop(axis,None)
+        else:
+            # Remember the data extent so Full view / undo can return to it without waiting for new data.
+            self._data_bounds[axis]=(float(low),float(high),log_mode)
+            if self.clamp_to_data:
+                self._apply_limits(axis,float(low),float(high))
+            if saved and saved[2]==log_mode:
+                low,high=saved[:2]
+            elif saved:
+                self._manual_ranges.pop(axis,None)
+                self.zoom_group.changed()
         low = float(low)
         high = float(high)
         if not math.isfinite(low) or not math.isfinite(high) or high <= low:
@@ -134,93 +546,239 @@ class EditablePlot(pg.PlotWidget):
             self.plotItem.vb.setYRange(low, high, padding=0)
         return True
     def auto_axis(self, axis):
-        if axis not in self._manual_ranges and axis not in self._linked_axes:
+        if axis in self._linked_axes:
+            return
+        self._data_bounds[axis]='auto'
+        if axis not in self._manual_ranges:
             self.plotItem.vb.enableAutoRange(axis=pg.ViewBox.XAxis if axis=='x' else pg.ViewBox.YAxis,enable=True)
     def link_axis(self,axis,source):
         self._linked_axes[axis]=source
         if axis=='x':self.plotItem.vb.setXLink(source.plotItem.vb)
         else:self.plotItem.vb.setYLink(source.plotItem.vb)
+        source.zoom_group.merge(self.zoom_group)
+    def sync_x_with(self,*others):
+        '''Zooming the x axis of any of these plots applies the same range to the others while their x titles match.'''
+        plots=[self,*others]
+        for plot in plots[1:]:
+            self.zoom_group.merge(plot.zoom_group)
+        for plot in plots:
+            plot._x_peers=[other for other in plots if other is not plot]
+    # ---- user view: zoom, pan, reset, undo ----
+    def _log_mode(self,axis):
+        return bool((self.bottom_axis if axis=='x' else self.left_axis).logMode)
+    def x_unit(self):
+        return self.bottom_axis.labelText
+    def _axis_owner(self,axis):
+        return self._linked_axes.get(axis) or self
+    def _has_user_view(self):
+        return any(axis in self._axis_owner(axis)._manual_ranges for axis in ('x','y'))
+    def _matching_peers(self):
+        return [peer for peer in self._x_peers if peer.x_unit()==self.x_unit()]
+    def _apply_limits(self,axis,low,high):
+        # Image-like plots (TRPL map, CCD frame) may zoom in, but pan / zoom-out stops at the data edge.
+        if not high>low:return
+        linked=tuple(plot for plot in self.zoom_group.members if plot._linked_axes.get(axis) is self)
+        key=(low,high,tuple(id(plot) for plot in linked))
+        if self._limits.get(axis)==key:return
+        self._limits[axis]=key
+        limits={'xMin':low,'xMax':high} if axis=='x' else {'yMin':low,'yMax':high}
+        for plot in (self,)+linked:
+            plot.plotItem.vb.setLimits(**limits)
+    def _set_manual(self,axis,low,high):
+        if not high>low:return
+        owner=self._axis_owner(axis);bounds=owner._data_bounds.get(axis)
+        if bounds and bounds!='auto' and bounds[2]==owner._log_mode(axis):
+            tolerance=(bounds[1]-bounds[0])*1e-6
+            if abs(low-bounds[0])<=tolerance and abs(high-bounds[1])<=tolerance:
+                # Zoomed back out to exactly the data extent: that is the full view, not a manual range.
+                owner._clear_axis(axis);return
+        self.set_axis_bounds(axis,low,high,manual=True)
+    def apply_user_range(self,x=None,y=None):
+        self.zoom_group.push()
+        if x is not None:
+            self._set_manual('x',*x)
+            for peer in self._matching_peers():peer._set_manual('x',*x)
+        if y is not None:
+            self._set_manual('y',*y)
+        self.zoom_group.changed()
+    def _commit_view(self,axes):
+        # Called while the view box is panned or wheel-zoomed: keep the new range so live data refreshes respect it.
+        x_range,y_range=self.viewRange()
+        if 'x' in axes:
+            self._set_manual('x',*sorted(x_range))
+            for peer in self._matching_peers():peer._set_manual('x',*sorted(x_range))
+        if 'y' in axes:
+            self._set_manual('y',*sorted(y_range))
+        self.zoom_group.changed()
+    def _clear_axis(self,axis):
+        source=self._linked_axes.get(axis)
+        if source is not None:
+            return source._clear_axis(axis)
+        self._manual_ranges.pop(axis,None)
+        bounds=self._data_bounds.get(axis)
+        if bounds and bounds!='auto' and bounds[2]==self._log_mode(axis) and bounds[1]>bounds[0]:
+            (self.plotItem.vb.setXRange if axis=='x' else self.plotItem.vb.setYRange)(bounds[0],bounds[1],padding=0)
+        else:
+            self.plotItem.vb.enableAutoRange(axis=pg.ViewBox.XAxis if axis=='x' else pg.ViewBox.YAxis,enable=True)
+    def _restore_manual(self,manual):
+        for axis in ('x','y'):
+            if axis in self._linked_axes:
+                continue
+            saved=manual.get(axis)
+            if saved and saved[2]==self._log_mode(axis):
+                self.set_axis_bounds(axis,saved[0],saved[1],manual=True)
+            elif axis in self._manual_ranges or saved:
+                self._clear_axis(axis)
+    def _family(self):
+        # Plots sharing an axis link with this one (map + decay) act as one figure for reset and the zoom bar.
+        family=[self]
+        for plot in self.zoom_group.members:
+            if plot is not self and (self in plot._linked_axes.values() or plot in self._linked_axes.values()):
+                family.append(plot)
+        return family
+    def reset_view(self):
+        family=self._family()
+        peers=[peer for peer in self._matching_peers() if 'x' in peer._axis_owner('x')._manual_ranges]
+        if not any(plot._has_user_view() for plot in family) and not peers:
+            return
+        self.zoom_group.push()
+        for plot in family:
+            for axis in ('x','y'):
+                plot._clear_axis(axis)
+        for peer in peers:
+            peer._clear_axis('x')
+        self.zoom_group.changed()
+    def _refresh_zoom_bar(self):
+        if not hasattr(self,'_zoom_bar'):
+            return
+        family=self._family()
+        zoomed=any(plot._has_user_view() for plot in family)
+        self._back_chip.setVisible(bool(self.zoom_group.stack))
+        self._zoom_bar.adjustSize()
+        # A narrow companion plot (the decay beside the map) leaves the controls to the wider plot it is linked to.
+        wider=[plot for plot in family if plot is not self and plot._view_rect().width()>self._view_rect().width()]
+        fits=self._view_rect().width()>=self._zoom_bar.width()+12
+        visible=zoomed and fits and not wider
+        self._zoom_bar.setVisible(visible)
+        if visible:
+            self._place_overlays();self._zoom_bar.raise_()
+    def keyPressEvent(self,event):
+        if event.key()==Qt.Key_Backspace and self.zoom_group.undo():
+            event.accept();return
+        if event.key()==Qt.Key_Home:
+            self.reset_view();event.accept();return
+        super().keyPressEvent(event)
+    def mousePressEvent(self,event):
+        if event.button()==Qt.BackButton:
+            self.zoom_group.undo();event.accept();return
+        super().mousePressEvent(event)
+    # ---- hover readout ----
+    def _reading(self,axis,value):
+        if self._log_mode(axis):
+            value=10**value
+        label=self.readout_units.get(axis,(self.bottom_axis if axis=='x' else self.left_axis).labelText)
+        return format_reading(value,label)
+    def readout_text(self,x,y):
+        return f'{self._reading("x",x)}  ·  {self._reading("y",y)}'
+    def range_text(self,x_range,y_range):
+        parts=[]
+        for axis,span in (('x',x_range),('y',y_range)):
+            if span is None:continue
+            low,high=(10**span[0],10**span[1]) if self._log_mode(axis) else span
+            prefix,unit=label_parts(self.readout_units.get(axis,(self.bottom_axis if axis=='x' else self.left_axis).labelText))
+            parts.append(f'{prefix} {fmt(low,5)} – {fmt(high,5)} {unit}'.strip())
+        return '  ×  '.join(parts)
+    def _hover_moved(self,pos):
+        view=self.plotItem.vb
+        if self._empty.isVisible() or not view.sceneBoundingRect().contains(pos):
+            self._readout.hide();return
+        point=view.mapSceneToView(pos)
+        try:text=self.readout_text(point.x(),point.y())
+        except Exception:text=''
+        if not text:
+            self._readout.hide();return
+        self._readout.setText(text);self._readout.adjustSize()
+        if self._readout.width()>self._view_rect().width()-12:
+            # Narrow plots (the decay beside the map) stack the values instead of running past the frame.
+            self._readout.setText(text.replace('  ·  ','\n'));self._readout.adjustSize()
+        self._place_overlays();self._readout.show();self._readout.raise_()
+    def leaveEvent(self,event):
+        self._readout.hide()
+        super().leaveEvent(event)
     def begin_axis_edit(self, axis, endpoint):
-        ranges = self.viewRange()
-        values = sorted(ranges[0] if axis == 'x' else ranges[1])
-        low, high = values[0], values[1]
+        '''Turn the clicked axis limit into a text field in place, styled like the label it replaces.'''
+        axis_item = self.bottom_axis if axis == 'x' else self.left_axis
+        rect = axis_item.endpoint_rects().get(endpoint)
+        if rect is None:
+            return
+        low, high = sorted(self.viewRange()[0 if axis == 'x' else 1])
         value = low if endpoint == 'min' else high
-        if (self.bottom_axis if axis=='x' else self.left_axis).logMode:
-            value=10.0**value
-        if self._editor is None:
-            self._editor = QFrame(self)
-            self._editor.setObjectName('axisInlineEditor')
-            layout = QHBoxLayout(self._editor)
-            layout.setContentsMargins(4, 3, 4, 3)
-            layout.setSpacing(0)
-            self._editor_edit = QLineEdit()
-            self._editor_edit.setObjectName('axisInlineValue')
-            self._editor_edit.setFixedWidth(82)
-            self._editor_edit.installEventFilter(self)
-            layout.addWidget(self._editor_edit)
-            self._editor.setFixedSize(90, 32)
         self._edit_axis = axis
         self._edit_endpoint = endpoint
-        self._editor_edit.setStyleSheet('')
-        self._editor_edit.setText(fmt(value, 8))
-        if axis == 'x':
-            x = 8 if endpoint == 'min' else max(8, self.width() - 98)
-            y = max(4, self.height() - 36)
+        editor = self._editor
+        text = fmt(value, 8)
+        editor.setText(text)
+        set_invalid(editor, False)
+        width = int(max(64, editor.fontMetrics().horizontalAdvance(text) + 22, rect.width() + 22))
+        height = 22
+        area = QRect(self.mapFromScene(axis_item.mapToScene(rect.topLeft())), self.mapFromScene(axis_item.mapToScene(rect.bottomRight())))
+        if axis == 'x' and endpoint == 'min':
+            x = area.left() - 4
+            editor.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         else:
-            x = 8
-            if self._invert_y:
-                y = 8 if endpoint == 'min' else max(8, self.height() - 42)
-            else:
-                y = 8 if endpoint == 'max' else max(8, self.height() - 42)
-        bounds=self.plotItem.vb.sceneBoundingRect()
-        if axis=='x':
-            point=self.mapFromScene(QPointF(bounds.left() if endpoint=='min' else bounds.right(),bounds.bottom()))
-            x=point.x()-45;y=point.y()+3
-        else:
-            top=(endpoint=='min') if self._invert_y else (endpoint=='max')
-            point=self.mapFromScene(QPointF(bounds.left(),bounds.top() if top else bounds.bottom()))
-            x=point.x()-94;y=point.y()-16
-        self._editor.move(max(0,min(self.width()-90,int(x))),max(0,min(self.height()-32,int(y))))
-        self._editor.show()
-        self._editor.raise_()
-        self._editor_edit.setFocus()
-        self._editor_edit.selectAll()
+            x = area.right() - width + 5
+            editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        y = area.center().y() - height // 2
+        editor.setGeometry(max(0, min(self.width() - width, x)), max(0, min(self.height() - height, y)), width, height)
+        editor.show()
+        editor.raise_()
+        editor.setFocus()
+        editor.selectAll()
     def eventFilter(self, obj, event):
-        if obj is self._editor_edit and event.type() == QEvent.KeyPress:
-            if event.key() == Qt.Key_Escape:
-                self._close_editor()
-                return True
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-                self._commit_editor()
-                return True
+        if obj is self._editor:
+            if event.type() == QEvent.KeyPress:
+                key = event.key()
+                if key == Qt.Key_Escape:
+                    self._close_editor()
+                    return True
+                if key in (Qt.Key_Return, Qt.Key_Enter):
+                    self._commit_editor()
+                    return True
+                if key in (Qt.Key_Tab, Qt.Key_Backtab):
+                    # Tab moves to the other limit of the same axis.
+                    axis, other = self._edit_axis, 'max' if self._edit_endpoint == 'min' else 'min'
+                    if self._commit_editor():
+                        self.begin_axis_edit(axis, other)
+                    return True
+            elif event.type() == QEvent.FocusOut and self._editor.isVisible() and not self._editor_busy:
+                if not self._commit_editor():
+                    self._close_editor()
         return super().eventFilter(obj, event)
     def _close_editor(self):
-        if self._editor is not None:
+        self._editor_busy = True
+        try:
             self._editor.hide()
+            self.setFocus()
+        finally:
+            self._editor_busy = False
     def _commit_editor(self):
         try:
-            value = float(self._editor_edit.text().strip())
+            value = float(self._editor.text().strip())
         except Exception:
-            self._editor_edit.setStyleSheet('border-color:#b3263a')
-            return
-        if not math.isfinite(value):
-            self._editor_edit.setStyleSheet('border-color:#b3263a')
-            return
-        if (self.bottom_axis if self._edit_axis=='x' else self.left_axis).logMode:
-            if value<=0:
-                self._editor_edit.setStyleSheet('border-color:#b3263a');return
-            value=math.log10(value)
-        ranges = self.viewRange()
-        low, high = sorted(ranges[0] if self._edit_axis == 'x' else ranges[1])
+            value = math.nan
+        low, high = sorted(self.viewRange()[0 if self._edit_axis == 'x' else 1])
         if self._edit_endpoint == 'min':
             low = value
         else:
             high = value
-        if high <= low:
-            self._editor_edit.setStyleSheet('border-color:#b3263a')
-            return
-        self.set_axis_bounds(self._edit_axis, low, high, manual=True)
+        if not math.isfinite(value) or high <= low:
+            set_invalid(self._editor, True)
+            self._editor.setToolTip('Enter a number; the minimum must stay below the maximum')
+            return False
+        self._editor.setToolTip('')
         self._close_editor()
+        self.apply_user_range(x=(low, high) if self._edit_axis == 'x' else None, y=(low, high) if self._edit_axis == 'y' else None)
+        return True
 
 class SpectrumPlot(EditablePlot):
     wavePicked=Signal(float)
@@ -238,7 +796,7 @@ class SpectrumPlot(EditablePlot):
         self._marker_guard=True
         try:
             self.wave_line.setPos(wave);self.band.setRegion((wave-half_window,wave+half_window))
-            self.wave_line.setVisible(visible);self.band.setVisible(visible)
+            self.wave_line.setVisible(visible);self.band.setVisible(False);self.wave_line.label.hide()
         finally:self._marker_guard=False
     def _clear(self):
         for item in self._items:
@@ -247,8 +805,18 @@ class SpectrumPlot(EditablePlot):
             except Exception:
                 pass
         self._items = []
+    def readout_text(self, x, y):
+        # Read the drawn spectrum (the last curve, i.e. the current one) at the cursor wavelength.
+        curve = getattr(self, '_readout_curve', None)
+        if curve is None or not len(curve[0]):
+            return super().readout_text(x, y)
+        xs, ys = curve
+        index = int(np.nanargmin(np.abs(xs - x)))
+        return f'{format_reading(xs[index], self.bottom_axis.labelText)}  ·  {format_reading(ys[index], self.left_axis.labelText)}'
     def set_spectra(self, curves, x_label='Wavelength / nm', y_label='Counts', scale='linear'):
+        self.set_empty('Start preview or acquisition' if not curves else '')
         self._clear()
+        self._readout_curve = None
         try:
             self.plotItem.setLogMode(x=False, y=(scale == 'log'))
         except Exception:
@@ -272,8 +840,9 @@ class SpectrumPlot(EditablePlot):
             if scale == 'log':
                 ya = np.where(ya > 0, ya, np.nan)
             pen = pg.mkPen(color, width=width, style=Qt.DashLine if dashed else Qt.SolidLine)
-            item = self.plotItem.plot(xa, ya, pen=pen)
+            item = self.plotItem.plot(xa, ya, antialias=True,pen=pen)
             self._items.append(item)
+            self._readout_curve = (xa, ya)
             local_min = float(np.nanmin(xa))
             local_max = float(np.nanmax(xa))
             xmin = local_min if xmin is None else min(xmin, local_min)
@@ -302,19 +871,27 @@ class MapPlot(EditablePlot):
     wavePicked = Signal(float)
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=False, invert_y=True)
+        self.clamp_to_data = True
         self._settings = False
         self._x_axis = None
         self._delays = []
+        self._saturated = {}
         self.image_item = pg.ImageItem(axisOrder='row-major')
         self.image_item.setZValue(-20)
         self.plotItem.addItem(self.image_item)
+        self.saturated_item = QGraphicsPathItem()
+        pen = QPen(QColor(SATURATED_COLOR), 2); pen.setCosmetic(True); pen.setJoinStyle(Qt.MiterJoin)
+        self.saturated_item.setPen(pen); self.saturated_item.setBrush(QColor(SATURATED_COLOR))
+        self.saturated_item.setZValue(-15); self.saturated_item.setVisible(False)
+        self.plotItem.addItem(self.saturated_item)
         colors = palette()
-        self.delay_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine),label='{value:.3g} ps',labelOpts={'position':.85})
+        self.delay_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine),label='Δt = {value:.4g} ps',labelOpts={'position':.85})
         self.wave_line = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine),label='{value:.2f} nm',labelOpts={'position':.95})
         self.plotItem.addItem(self.delay_line)
         self.plotItem.addItem(self.wave_line)
         self.delay_line.sigPositionChanged.connect(self._delay_moved)
         self.wave_line.sigPositionChanged.connect(self._wave_moved)
+        self.wave_line.label.hide();self.wave_line.sigPositionChangeFinished.connect(lambda:self.wave_line.label.hide())
         try:
             self.scene().sigMouseClicked.connect(self._clicked)
         except Exception:
@@ -328,6 +905,24 @@ class MapPlot(EditablePlot):
             colors = palette()
             self.delay_line.setPen(pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine))
             self.wave_line.setPen(pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine))
+    def readout_text(self, x, y):
+        # Wavelength and delay under the cursor plus the measured counts of that map pixel.
+        text = super().readout_text(x, y)
+        x_values = getattr(self, '_readout_x', None)
+        cache = getattr(self, '_value_cache', {})
+        if x_values is None or not self._delays or not cache:
+            return text
+        delays = np.asarray(self._delays, dtype=float)
+        nearest = float(delays[int(np.argmin(np.abs(delays - y)))])
+        spacing = float(np.min(np.diff(delays))) if len(delays) > 1 else 1.0
+        if abs(nearest - y) > spacing or nearest not in cache:
+            return text
+        bins = cache[nearest][3]
+        column = int(np.argmin(np.abs(x_values - x)))
+        value = bins[column // 8] if len(bins) * 8 == len(x_values) else bins[min(column, len(bins) - 1)]
+        mask = self._saturated.get(nearest)
+        flag = '  ·  saturated' if mask is not None and column < mask.size and mask[column] else ''
+        return f'{text}  ·  {fmt(value, 5)} counts{flag}'
     def _delay_moved(self, line):
         if self._settings:
             return
@@ -335,26 +930,24 @@ class MapPlot(EditablePlot):
     def _wave_moved(self, line):
         if self._settings:
             return
-        self.wavePicked.emit(float(line.value()))
+        line.label.show();self.wavePicked.emit(float(line.value()))
     def _clicked(self, event):
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.LeftButton or event.double():
             return
         try:
-            if not self.plotItem.sceneBoundingRect().contains(event.scenePos()):
+            if not self.plotItem.vb.sceneBoundingRect().contains(event.scenePos()):
                 return
             point = self.plotItem.vb.mapSceneToView(event.scenePos())
             self.wavePicked.emit(float(point.x()))
             self.delayPicked.emit(float(point.y()))
         except Exception:
             pass
-    def set_marker(self, delay=None, wave=None):
+    def set_marker(self, delay=None, wave=None, show_delay=False):
         self._settings = True
         try:
-            if delay is not None and math.isfinite(float(delay)):
+            has_delay = delay is not None and math.isfinite(float(delay))
+            if has_delay:
                 self.delay_line.setPos(float(delay))
-                self.delay_line.setVisible(True)
-            else:
-                self.delay_line.setVisible(False)
             if wave is not None and math.isfinite(float(wave)):
                 self.wave_line.setPos(float(wave))
                 self.wave_line.setVisible(True)
@@ -362,10 +955,21 @@ class MapPlot(EditablePlot):
                 self.wave_line.setVisible(False)
         finally:
             self._settings = False
-    def set_map(self, x_axis, spectra, scale='log', planned_delays=None):
+        # The delay line marks the spectrum picked for display; while scanning it stays hidden.
+        self.delay_line.setVisible(bool(show_delay and has_delay))
+        if self.delay_line.isVisible():
+            self.delay_line.label.valueChanged()  # pyqtgraph skips label text updates while the line is hidden
+    def auto_levels(self):
+        # Data-driven colour range in counts from the last set_map (what the key shows in auto).
+        return getattr(self, '_auto_levels', (0.0, 1.0))
+    def set_map(self, x_axis, spectra, scale='log', planned_delays=None, saturated=None, levels=None):
+        # saturated: optional {delay: bool mask per CCD pixel}; those pixels are painted SATURATED_COLOR.
+        # levels: optional (low, high) counts overriding the colour range; None at an end keeps it automatic.
+        self.set_empty('No acquired data' if not spectra else '')
+        self._saturated={delay:np.asarray(mask,dtype=bool) for delay,mask in (saturated or {}).items() if mask is not None and np.any(mask)}
         planned=sorted(set(float(d) for d in (planned_delays or [])).union(spectra))
         if not planned:
-            self.image_item.clear();self._delays=[]
+            self.image_item.clear();self._delays=[];self.saturated_item.setVisible(False)
             self.set_axis_bounds('x',0,1024);self.set_axis_bounds('y',0,1)
             self._value_cache={}
             return 0.0,0.0
@@ -373,7 +977,8 @@ class MapPlot(EditablePlot):
         width=len(next(iter(spectra.values()))) if spectra else len(x_axis or []) or 1024
         x_values=np.asarray(x_axis if x_axis is not None and len(x_axis)==width else np.arange(width),dtype=float)
         self._x_axis=x_values if x_axis is not None else None
-        self.set_x_label('Wavelength / nm' if x_axis is not None else 'CCD pixel')
+        self._readout_x=x_values
+        self.set_x_label('Wavelength / nm' if x_axis is not None else 'Pixel')
         y_min,y_max=planned[0],planned[-1]
         if y_min==y_max:y_min-=.5;y_max+=.5
         x_min,x_max=float(x_values.min()),float(x_values.max())
@@ -385,13 +990,19 @@ class MapPlot(EditablePlot):
             if previous is not None and previous[0] is array:
                 updated[delay]=previous
             else:
-                finite=np.asarray(array)[np.isfinite(array)]
-                updated[delay]=(array,float(finite.min()) if finite.size else 0.0,float(finite.max()) if finite.size else 0.0)
+                samples=np.asarray(array,dtype=float)
+                bins=samples.reshape(-1,8).mean(axis=1) if samples.size%8==0 else samples
+                finite=bins[np.isfinite(bins)]
+                updated[delay]=(array,float(finite.min()) if finite.size else 0.0,float(finite.max()) if finite.size else 0.0,bins)
         self._value_cache=updated
         raw_min=min((entry[1] for entry in updated.values()),default=0.0)
         raw_max=max((entry[2] for entry in updated.values()),default=1.0)
-        low=math.log10(max(1.0,raw_min)) if scale=='log' else min(0.0,raw_min)
-        high=math.log10(max(1.0,raw_max)) if scale=='log' else raw_max
+        auto_low=1.0 if scale=='log' else min(0.0,raw_min)
+        self._auto_levels=(auto_low,raw_max)
+        shown_low,shown_high=[auto if value is None else value for value,auto in zip(levels or (None,None),self._auto_levels)]
+        if scale=='log':shown_low=max(1.0,shown_low)
+        low=math.log10(shown_low) if scale=='log' else shown_low
+        high=math.log10(max(2.0,shown_high)) if scale=='log' else shown_high
         if high<=low:high=low+1.0
         rows=min(512,max(128,len(planned)*4));cols=min(1024,width)
         rgba=np.zeros((rows,cols,4),dtype=np.uint8)
@@ -403,11 +1014,12 @@ class MapPlot(EditablePlot):
         x_samples=x_min+(np.arange(cols)+.5)*(x_max-x_min)/cols
         column_indices=np.searchsorted((sorted_x[:-1]+sorted_x[1:])/2,x_samples)
         if descending:column_indices=width-1-column_indices
-        lut=pg.ColorMap([0,.333,.666,1],map_qcolors()).getLookupTable(0,1,256)
+        lut=pg.ColorMap([0,1/3,2/3,1],map_qcolors()).getLookupTable(0,1,256)
         for index in np.unique(row_indices):
             delay=float(centers[index])
             if delay not in spectra:continue
-            values=np.asarray(spectra[delay],dtype=float)[column_indices]
+            bins=updated[delay][3]
+            values=bins[column_indices//8] if len(bins)*8==width else bins[column_indices]
             if scale=='log':values=np.log10(np.maximum(values,1.0))
             indices=np.rint(np.clip((values-low)/(high-low),0,1)*255).astype(np.int32)
             pixels=lut[indices,:3]
@@ -415,13 +1027,35 @@ class MapPlot(EditablePlot):
             rgba[selected,:,:3]=pixels;rgba[selected,:,3]=255
         self.image_item.setImage(rgba,autoLevels=False)
         self.image_item.setRect(QRectF(x_min,y_min,x_max-x_min,y_max-y_min))
+        self._draw_saturated(x_values,centers,y_min,y_max)
         self.set_axis_bounds('x',x_min,x_max);self.set_axis_bounds('y',y_min,y_max)
-        return (max(1.0,raw_min) if scale=='log' else min(0.0,raw_min)),raw_max
+        return shown_low,shown_high
+    def _draw_saturated(self,x_values,centers,y_min,y_max):
+        # Vector overlay rather than image pixels: a dense delay row can be thinner than one screen
+        # pixel, and the cosmetic pen keeps every saturated cell at least ~2 px wide at any zoom.
+        path=QPainterPath()
+        edges=np.concatenate(([y_min],(centers[:-1]+centers[1:])/2,[y_max]))
+        x_edges=np.concatenate(([x_values[0]],(x_values[:-1]+x_values[1:])/2,[x_values[-1]]))
+        for delay,mask in self._saturated.items():
+            if mask.size!=x_values.size:continue
+            row=int(np.searchsorted(centers,delay))
+            if row>=centers.size or centers[row]!=delay:continue
+            padded=np.concatenate(([False],mask,[False])).astype(np.int8)
+            starts=np.flatnonzero(np.diff(padded)==1);ends=np.flatnonzero(np.diff(padded)==-1)
+            for start,end in zip(starts,ends):
+                left,right=sorted((float(x_edges[start]),float(x_edges[end])))
+                path.addRect(QRectF(left,float(edges[row]),right-left,float(edges[row+1]-edges[row])))
+        self.saturated_item.setPath(path)
+        self.saturated_item.setVisible(not path.isEmpty())
 
 class DecayPlot(EditablePlot):
     delayPicked = Signal(float)
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True, invert_y=True)
+        self.set_plot_margins(10,14,10,46);self.left_axis.setStyle(showValues=False);self.left_axis.setLabel('');self.bottom_axis.divisions=2
+        # Counts are the horizontal coordinate and are not monotonic in delay.
+        # pyqtgraph's x-sorted clipping/downsampling would discard decay points.
+        self.plotItem.setClipToView(False);self.plotItem.setDownsampling(auto=False)
         self._settings = False
         self._delays = []
         self._intensities = []
@@ -436,8 +1070,8 @@ class DecayPlot(EditablePlot):
             self.scene().sigMouseClicked.connect(self._clicked)
         except Exception:
             pass
-        self.set_x_label('Intensity / counts')
-        self.set_y_label('Delay / ps')
+        self.set_x_label('counts / pixel')
+        self.set_y_label('')
         self.update_theme()
     def update_theme(self):
         super().update_theme()
@@ -445,19 +1079,26 @@ class DecayPlot(EditablePlot):
             colors = palette()
             self.marker.setPen(pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine))
             self.point.setBrush(pg.mkBrush(colors['cursor']))
+    def readout_text(self, x, y):
+        # The decay is read by delay: report the measured point nearest the cursor row.
+        if not self._delays:
+            return ''
+        index = min(range(len(self._delays)), key=lambda i: abs(self._delays[i] - y))
+        return f'{format_reading(self._delays[index], "Delay / ps")}  ·  {format_reading(self._intensities[index], self.bottom_axis.labelText)}'
     def _moved(self, line):
         if not self._settings:
             self.delayPicked.emit(float(line.value()))
     def _clicked(self, event):
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.LeftButton or event.double():
             return
         try:
-            if self.plotItem.sceneBoundingRect().contains(event.scenePos()):
+            if self.plotItem.vb.sceneBoundingRect().contains(event.scenePos()):
                 point = self.plotItem.vb.mapSceneToView(event.scenePos())
                 self.delayPicked.emit(float(point.y()))
         except Exception:
             pass
     def set_decay(self, delays, intensities, scale='linear'):
+        self.set_empty('No data' if not delays else '')
         for item in self._items:
             try:
                 self.plotItem.removeItem(item)
@@ -471,18 +1112,18 @@ class DecayPlot(EditablePlot):
         self._delays = [item[1] for item in pairs]
         self._intensities = [item[0] for item in pairs]
         if not pairs:
-            self.set_axis_bounds('x', 0, 1)
+            self.set_axis_bounds('x', 0, 1.1)
             self.set_axis_bounds('y', 0, 1)
             self.point.setData([], [])
             return
         colors = palette()
         xs = np.asarray([item[0] for item in pairs], dtype=float)
         ys = np.asarray([item[1] for item in pairs], dtype=float)
-        item = self.plotItem.plot(xs, ys, pen=pg.mkPen(colors['data'], width=1.4), symbol='o', symbolSize=5, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+        item = self.plotItem.plot(xs, ys, antialias=True,pen=pg.mkPen(colors['data'], width=1.4), symbol='o', symbolSize=6, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
         self._items.append(item)
         self.set_axis_bounds('y', min(ys), max(ys))
         try:
-            self.auto_axis('x')
+            self.set_axis_bounds('x',min(0,float(xs.min())),max(1,float(xs.max()))*1.1)
         except Exception:
             pass
     def set_marker(self, delay=None):
@@ -504,6 +1145,7 @@ class AnalysisCurvePlot(EditablePlot):
     delayPicked = Signal(float)
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True)
+        self.set_plot_margins(68,14,10,46)
         self._settings = False
         self._mode = 'decay'
         self._observed = []
@@ -535,6 +1177,7 @@ class AnalysisCurvePlot(EditablePlot):
                 pass
         self._items = []
     def set_decay(self, observed, fit=None, scale='linear'):
+        self.set_empty('Open an experiment to view its decay' if not observed else '')
         self._mode = 'decay'
         self._clear_items()
         self._observed = [(float(item[0]), float(item[1])) for item in (observed or [])]
@@ -548,24 +1191,30 @@ class AnalysisCurvePlot(EditablePlot):
             ys = np.asarray([item[1] for item in self._observed], dtype=float)
             if scale == 'log':
                 ys = np.where(ys > 0, ys, np.nan)
-            item = self.plotItem.plot(xs, ys, pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+            item = self.plotItem.plot(xs, ys, antialias=True,pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
             item.sigPointsClicked.connect(lambda item,points,event:self.delayPicked.emit(float(points[0].pos().x())) if points else None)
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
         else:
-            self.set_axis_bounds('x', 0, 1)
+            self.set_axis_bounds('x', -2, 20)
         fit_points = [(float(item[0]), float(item[1])) for item in (fit or [])]
         if fit_points:
             fx = np.asarray([item[0] for item in fit_points], dtype=float)
             fy = np.asarray([item[1] for item in fit_points], dtype=float)
             if scale == 'log':
                 fy = np.where(fy > 0, fy, np.nan)
-            item = self.plotItem.plot(fx, fy, pen=pg.mkPen(colors['amber'], width=1.8))
+            item = self.plotItem.plot(fx, fy, antialias=True,pen=pg.mkPen(colors['amber'], width=1.8))
             self._items.append(item)
         self.marker.setVisible(bool(self._observed))
-        self.point.setVisible(bool(self._observed))
+        self.point.setVisible(False)
+        self.marker.setVisible(False)
         self.set_x_label('Delay / ps')
-        self.set_y_label('Counts per second')
+        self.set_y_label('counts / s')
+        limits=[v for _,v in self._observed]+[v for _,v in fit_points]
+        if scale=='log':limits=[math.log10(v) for v in limits if v>0]
+        low=math.floor(min(limits)) if limits and scale=='log' else 0;high=max(limits,default=1)
+        if high<=low:high=low+1
+        self.set_axis_bounds('y',low,high+(high-low)*.1)
         if self._observed:
             self.set_marker(self._observed[0][0])
         else:
@@ -582,6 +1231,7 @@ class AnalysisCurvePlot(EditablePlot):
             pass
         xmin = None
         xmax = None
+        values=[]
         for curve in curves or []:
             if not curve:
                 continue
@@ -593,20 +1243,23 @@ class AnalysisCurvePlot(EditablePlot):
                 continue
             if xa.size == 0 or ya.size == 0:
                 continue
+            values.extend(ya[np.isfinite(ya)].tolist())
             if scale == 'log':
                 ya = np.where(ya > 0, ya, np.nan)
-            item = self.plotItem.plot(xa, ya, pen=pg.mkPen(color, width=1.7))
+            item = self.plotItem.plot(xa, ya, antialias=True,pen=pg.mkPen(color, width=1.7))
             self._items.append(item)
             xmin = float(np.nanmin(xa)) if xmin is None else min(xmin, float(np.nanmin(xa)))
             xmax = float(np.nanmax(xa)) if xmax is None else max(xmax, float(np.nanmax(xa)))
         self.set_x_label(x_label)
-        self.set_y_label('Normalized counts')
+        self.set_y_label('counts / s')
         if xmin is None or xmax is None or xmax <= xmin:
-            self.set_axis_bounds('x', 0, 1024)
+            self.set_axis_bounds('x',500,800)
         else:
             self.set_axis_bounds('x', xmin, xmax)
         try:
-            self.auto_axis('y')
+            valid=[math.log10(v) for v in values if v>0] if scale=='log' else values
+            low=math.floor(min(valid)) if valid and scale=='log' else 0
+            high=max(valid,default=1);self.set_axis_bounds('y',low,max(low+1,high+(high-low)*.1))
         except Exception:
             pass
     def set_marker(self, delay=None):
@@ -626,6 +1279,7 @@ class ResidualPlot(EditablePlot):
     delayPicked = Signal(float)
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True)
+        self.set_plot_margins(68,14,6,10);self.left_axis.divisions=2
         self._items = []
         self._settings = False
         colors = palette()
@@ -635,7 +1289,7 @@ class ResidualPlot(EditablePlot):
         self.plotItem.addItem(self.marker)
         self.marker.sigPositionChanged.connect(self._moved)
         self.set_x_label('Delay / ps')
-        self.set_y_label('Residual / counts per second')
+        self.set_y_label('Residual')
         self.update_theme()
     def update_theme(self):
         super().update_theme()
@@ -653,17 +1307,18 @@ class ResidualPlot(EditablePlot):
             except Exception:
                 pass
         self._items = []
+        self.set_empty('Residuals appear after fitting' if not points else '')
         data = [(float(item[0]), float(item[1])) for item in (points or [])]
         colors = palette()
         if data:
             xs = np.asarray([item[0] for item in data], dtype=float)
             ys = np.asarray([item[1] for item in data], dtype=float)
-            item = self.plotItem.plot(xs, ys, pen=None, symbol='o', symbolSize=5, symbolBrush=pg.mkBrush(colors['amber']), symbolPen=pg.mkPen(colors['amber']))
+            item = self.plotItem.plot(xs, ys, antialias=True,pen=None, symbol='o', symbolSize=6, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['amber']))
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
         else:
             self.set_axis_bounds('x', 0, 1)
-        span=max((abs(item[1]) for item in data),default=1)*1.15 or 1
+        span=max(1,max((abs(item[1]) for item in data),default=1))*1.15
         self.set_axis_bounds('y', -span, span)
         self.marker.setVisible(bool(data))
     def set_marker(self, delay=None):
@@ -680,8 +1335,13 @@ class ResidualPlot(EditablePlot):
 class CalibrationImagePlot(EditablePlot):
     rowPicked = Signal(int)
     roiChanged = Signal(int, int)
+    def x_unit(self):
+        # Columns of the CCD frame: zoom-synchronised with the extracted spectrum while it is shown in pixels.
+        return 'CCD pixel'
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=False, invert_y=True)
+        self.clamp_to_data = True
+        self.set_plot_margins(68,14,10,30);self.left_axis.divisions=3
         self._rows = 255
         self._cols = 1024
         self._region_guard = False
@@ -699,14 +1359,18 @@ class CalibrationImagePlot(EditablePlot):
             self.scene().sigMouseClicked.connect(self._clicked)
         except Exception:
             pass
-        self.set_x_label('CCD column / px')
-        self.set_y_label('Row')
+        self.set_x_label('')
+        self.set_y_label('CCD row')
+        self._full_scale = None
+        self._set_lookup(65535)
+        self.region.setBrush(pg.mkBrush(50,107,186,22));self.set_empty('No frame')
+        self.bottom_axis.integer_ticks=True  # unlabelled CCD columns
         self.update_theme()
     def update_theme(self):
         super().update_theme()
         if hasattr(self, 'region'):
             for line in self.region.lines:
-                line.setPen(pg.mkPen(palette()['amber'], width=1))
+                line.setPen(pg.mkPen(palette()['cursor'],width=1,style=Qt.DashLine))
     def _region_moved(self):
         if self._region_guard:
             return
@@ -717,10 +1381,10 @@ class CalibrationImagePlot(EditablePlot):
             start, end = end, start
         self.roiChanged.emit(start, end)
     def _clicked(self, event):
-        if event.button() != Qt.LeftButton or self._rows <= 1:
+        if event.button() != Qt.LeftButton or event.double() or self._rows <= 1:
             return
         try:
-            if self.plotItem.sceneBoundingRect().contains(event.scenePos()):
+            if self.plotItem.vb.sceneBoundingRect().contains(event.scenePos()):
                 point = self.plotItem.vb.mapSceneToView(event.scenePos())
                 self.rowPicked.emit(int(round(point.y())))
         except Exception:
@@ -731,28 +1395,52 @@ class CalibrationImagePlot(EditablePlot):
             self.region.setRegion((float(start), float(end)))
         finally:
             self._region_guard = False
-    def set_frame(self, image):
+    def readout_text(self, x, y):
+        text = super().readout_text(x, y)
+        image = self.image_item.image
+        if image is None or image.ndim != 2:
+            return text
+        row = 0 if self._rows == 1 else int(round(y)); column = int(round(x))
+        if not (0 <= row < image.shape[0] and 0 <= column < image.shape[1]):
+            return text
+        value = int(image[row, column])
+        flag = '  ·  saturated' if self._full_scale is not None and value >= self._full_scale else ''
+        return f'{text}  ·  {value} counts{flag}'
+    def _set_lookup(self, full_scale):
+        # One LUT entry per count (levels 0..65535); entries at or above full scale take the saturation colour.
+        full_scale = int(max(1, min(65535, round(full_scale))))
+        if full_scale == self._full_scale:
+            return
+        values=np.arange(65536,dtype=float);f=np.clip(np.maximum(0,values-55)/3300,0,1)**.55
+        lut=np.rint(np.column_stack((16+f*174,27+f*208,47+f*202))).astype(np.uint8)
+        lut[full_scale:]=saturated_rgb()
+        self.image_item.setLookupTable(lut)
+        self._full_scale = full_scale
+    def set_frame(self, image, full_scale=65535):
+        self.set_empty('No frame' if image is None else '')
         if image is None:
             self.image_item.clear()
             self.region.setVisible(False)
-            self.set_axis_bounds('x', 0, 1024)
-            self.set_axis_bounds('y', 0, 255)
+            self.set_axis_bounds('x', 0, 1023)
+            self.set_axis_bounds('y', 0, 254)
             return
         array = np.asarray(image)
         if array.ndim != 2:
             self.image_item.clear()
             return
         self._rows, self._cols = array.shape
-        self.image_item.setImage(array, autoLevels=True)
-        self.image_item.setRect(QRectF(0, 0, self._cols, self._rows))
-        self.set_axis_bounds('x', 0, self._cols)
-        self.set_axis_bounds('y', 0, self._rows)
+        self._set_lookup(full_scale)
+        self.image_item.setImage(array, autoLevels=False,levels=(0,65535))
+        self.image_item.setRect(QRectF(0,-.5 if self._rows==1 else 0,self._cols-1,1 if self._rows==1 else self._rows-1))
+        self.set_axis_bounds('x', 0, self._cols-1)
+        self.set_axis_bounds('y', -.5 if self._rows==1 else 0, .5 if self._rows==1 else self._rows-1)
         self.region.setVisible(self._rows > 1)
 
 class CalibrationProfilePlot(EditablePlot):
     pixelPicked = Signal(int)
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True)
+        self.set_plot_margins(68,14,10,46);self.left_axis.divisions=3
         self._items = []
         self._x_values = None
         try:
@@ -763,10 +1451,10 @@ class CalibrationProfilePlot(EditablePlot):
         self.set_y_label('Mean counts')
         self.update_theme()
     def _clicked(self, event):
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.LeftButton or event.double():
             return
         try:
-            if not self.plotItem.sceneBoundingRect().contains(event.scenePos()):
+            if not self.plotItem.vb.sceneBoundingRect().contains(event.scenePos()):
                 return
             point = self.plotItem.vb.mapSceneToView(event.scenePos())
             x = float(point.x())
@@ -778,6 +1466,7 @@ class CalibrationProfilePlot(EditablePlot):
         except Exception:
             pass
     def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None):
+        self.set_empty('No spectrum' if profile is None else '')
         for item in self._items:
             try:
                 self.plotItem.removeItem(item)
@@ -787,7 +1476,8 @@ class CalibrationProfilePlot(EditablePlot):
         colors = palette()
         if profile is None or len(profile) == 0:
             self._x_values = None
-            self.set_axis_bounds('x', 0, 1024)
+            self.set_axis_bounds('x', 0, 1023)
+            self.set_axis_bounds('y',0,65535)
             return
         values = np.asarray(profile, dtype=float)
         if x_values is not None and len(x_values) == len(values):
@@ -796,31 +1486,35 @@ class CalibrationProfilePlot(EditablePlot):
         else:
             x = np.arange(len(values), dtype=float)
             self._x_values = x
-        item = self.plotItem.plot(x, values, pen=pg.mkPen(colors['data'], width=1.6))
+        item = self.plotItem.plot(x, values, antialias=True,pen=pg.mkPen(colors['data'], width=1.6))
         self._items.append(item)
-        for reference in references or []:
+        for index,reference in enumerate(references or []):
             try:
                 line = pg.InfiniteLine(pos=float(reference), angle=90, movable=False, pen=pg.mkPen(colors['amber'], width=1, style=Qt.DashLine))
                 self.plotItem.addItem(line)
                 self._items.append(line)
+                label=pg.TextItem('L'+str(index+1),color=colors['muted'],anchor=(.5,0));font=QFont('Segoe UI');font.setPixelSize(11);label.setFont(font);label.setPos(float(reference),max(1,float(values.max()))*1.18);self.plotItem.addItem(label);self._items.append(label)
+                nearest=int(np.argmin(np.abs(x-float(reference))));point=self.plotItem.plot([x[nearest]],[values[nearest]],antialias=True,pen=None,symbol='o',symbolSize=5,symbolBrush=colors['data'],symbolPen=None);self._items.append(point)
             except Exception:
                 pass
-        self.set_x_label('Wavelength / nm' if axis_mode == 'wavelength' else 'CCD pixel')
-        self.set_y_label('Mean counts')
+        self.set_x_label('')
+        self.set_y_label('CCD / counts')
         self.set_axis_bounds('x', float(np.nanmin(x)), float(np.nanmax(x)))
         try:
-            self.auto_axis('y')
+            self.set_axis_bounds('y',0,max(1,float(values.max()))*1.18)
         except Exception:
             pass
 
 class CalibrationMappingPlot(EditablePlot):
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True)
+        self.set_plot_margins(62,14,10,30);self.left_axis.divisions=2
         self._items = []
-        self.set_x_label('CCD pixel')
-        self.set_y_label('Wavelength / nm')
+        self.set_x_label('')
+        self.set_y_label('λ / nm')
         self.update_theme()
     def set_data(self, lines, solution=None):
+        self.set_empty('No mapping' if solution is None else '')
         for item in self._items:
             try:
                 self.plotItem.removeItem(item)
@@ -840,31 +1534,32 @@ class CalibrationMappingPlot(EditablePlot):
             pixels.append(float(pixel))
             wavelengths.append(float(wavelength))
         if pixels:
-            item = self.plotItem.plot(np.asarray(pixels), np.asarray(wavelengths), pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+            item = self.plotItem.plot(np.asarray(pixels), np.asarray(wavelengths), antialias=True,pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
             self._items.append(item)
         if solution and solution.get('wavelengths_nm'):
             axis = np.asarray(solution.get('wavelengths_nm'), dtype=float)
             if axis.size:
-                item = self.plotItem.plot(np.arange(axis.size), axis, pen=pg.mkPen(colors['amber'], width=1.5))
+                item = self.plotItem.plot(np.arange(axis.size), axis, antialias=True,pen=pg.mkPen(colors['amber'], width=1.5))
                 self._items.append(item)
                 if not pixels:
                     self.set_axis_bounds('y', float(np.nanmin(axis)), float(np.nanmax(axis)))
         if pixels:
-            self.set_axis_bounds('x', min(pixels), max(pixels))
-            self.set_axis_bounds('y', min(wavelengths), max(wavelengths))
+            self.set_axis_bounds('x', 0,1023)
+            self.set_axis_bounds('y', min(wavelengths)-15,max(wavelengths)+15)
         elif not solution:
-            self.set_axis_bounds('x', 0, 1024)
-            self.set_axis_bounds('y', 0, 1)
+            self.set_axis_bounds('x', 0, 1023)
+            self.set_axis_bounds('y',490,770)
 
 class CalibrationResidualPlot(EditablePlot):
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True)
+        self.set_plot_margins(62,14,8,8);self.left_axis.divisions=2
         self._items = []
         colors = palette()
         self.zero = pg.InfiniteLine(pos=0, angle=0, movable=False, pen=pg.mkPen(colors['plot_border'], width=1))
         self.plotItem.addItem(self.zero)
         self.set_x_label('CCD pixel')
-        self.set_y_label('Residual / nm')
+        self.set_y_label('Δ nm')
         self.update_theme()
     def update_theme(self):
         super().update_theme()
@@ -879,7 +1574,7 @@ class CalibrationResidualPlot(EditablePlot):
         self._items = []
         if not solution:
             self.set_axis_bounds('x', 0, 1024)
-            self.set_axis_bounds('y', -1, 1)
+            self.set_axis_bounds('y', -.1, .1)
             return
         coeffs = solution.get('coefficients') or []
         origin = solution.get('pixel_origin', 511.5)
@@ -907,10 +1602,10 @@ class CalibrationResidualPlot(EditablePlot):
                     ys.append(float(residual))
         colors = palette()
         if xs:
-            item = self.plotItem.plot(np.asarray(xs), np.asarray(ys), pen=None, symbol='o', symbolSize=5, symbolBrush=pg.mkBrush(colors['amber']), symbolPen=pg.mkPen(colors['amber']))
+            item = self.plotItem.plot(np.asarray(xs), np.asarray(ys), antialias=True,pen=None, symbol='o', symbolSize=5, symbolBrush=pg.mkBrush(colors['amber']), symbolPen=pg.mkPen(colors['amber']))
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
-            span = max(1e-9, max(abs(value) for value in ys) * 1.2)
+            span = max(.002, max(abs(value) for value in ys) * 1.4)
             self.set_axis_bounds('y', -span, span)
         else:
             self.set_axis_bounds('x', 0, 1024)

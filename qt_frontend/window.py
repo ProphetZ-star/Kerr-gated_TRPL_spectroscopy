@@ -8,13 +8,16 @@ import uuid
 from pathlib import Path
 from typing import get_args
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSignalBlocker
-from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QInputDialog
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint
+from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QInputDialog, QApplication
+from .widgets import ArrowComboBox as QComboBox,CheckBox as QCheckBox,WaveLogo,ThemeButton,NativeSpinBox as QSpinBox,NativeDoubleSpinBox as QDoubleSpinBox
 from .controller import Controller
 from .theme import apply_to_app, palette, current_mode, map_color
-from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop
-from .plots import SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt
+from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count
+from .plots import SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt, format_duration
 from .dialogs import DeviceDialog, DetectorDialog
+
+DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 
 
 def payload_message(payload):
@@ -91,6 +94,7 @@ class MainWindow(QMainWindow):
         self._mode = 'scan'
         self._selected_source = 'hardware'
         self._selected_delay = None
+        self._picked_delay = None
         self._current_page = 'acquisition'
         self._updating_controls = False
         self._map_dirty = True
@@ -113,6 +117,12 @@ class MainWindow(QMainWindow):
         self._closing_started = False
         self.output_dir = Path.cwd() / 'data'
         self._build_ui()
+        # Plots that share a wavelength / pixel axis zoom together and share one undo history.
+        self.spectrum_plot.sync_x_with(self.map_plot)
+        self.cal_image.sync_x_with(self.cal_spectrum)
+        if QApplication.instance() is not None:
+            install_focus_ring(QApplication.instance())
+        apply_pointer_cursors(self)
         self._connect_controller()
         self._map_timer = QTimer(self)
         self._map_timer.setInterval(100)
@@ -125,6 +135,7 @@ class MainWindow(QMainWindow):
         self._cal_timer.timeout.connect(self._poll_calibration_capture)
         self._load_demo_reference(silent=True)
         self._apply_theme()
+        self._apply_visual_geometry()
         self._schedule_refresh()
         if auto_start:
             QTimer.singleShot(0, self.start_backend)
@@ -145,6 +156,7 @@ class MainWindow(QMainWindow):
         return frame, layout
     def _heading(self, title, control=None):
         row = QWidget()
+        row.setObjectName('sectionHeading');row.setFixedHeight(27 if title=='Acquisition' else 26)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -155,6 +167,15 @@ class MainWindow(QMainWindow):
         if control is not None:
             layout.addWidget(control)
         return row
+    def _set_run_button(self, kind, text):
+        if self._run_kind != kind or self.run_button.text() != text:
+            self._run_kind = kind
+            self.run_button.setText(text)
+            self._refresh_run_icons()
+    def _refresh_run_icons(self):
+        colors = palette()
+        self.run_button.setIcon(run_icon(self._run_kind, colors['bg'] if self.run_button.isEnabled() else '#ccffffff'))
+        self.stop_button.setIcon(run_icon('stop', colors['bg'] if self.stop_button.isEnabled() else colors['muted']))
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -176,7 +197,9 @@ class MainWindow(QMainWindow):
         root.addWidget(self.top)
         root.addWidget(self.subnav)
         root.addWidget(self.stack, 1)
-        root.addWidget(self.footer)
+        self.footer_host=QWidget();self.footer_host.setObjectName('footerHost')
+        foot_layout=QVBoxLayout(self.footer_host);foot_layout.setContentsMargins(14,10,14,12);foot_layout.addWidget(self.footer)
+        root.addWidget(self.footer_host)
         self.startup = StartupOverlay(self)
         self._reg('startupOverlay', self.startup, False)
         self._reg('startupMessage', self.startup.message, False)
@@ -194,40 +217,46 @@ class MainWindow(QMainWindow):
     def _build_top(self):
         self.top = QWidget()
         self.top.setObjectName('top')
-        self.top.setFixedHeight(66)
+        self.top.setFixedHeight(62)
         layout = QHBoxLayout(self.top)
-        layout.setContentsMargins(20, 0, 20, 0)
+        layout.setContentsMargins(16, 0, 14, 0)
         layout.setSpacing(14)
         brand = QWidget()
+        brand.setFixedWidth(160)
         brand_layout = QHBoxLayout(brand)
         brand_layout.setContentsMargins(0, 0, 0, 0)
         brand_layout.setSpacing(10)
-        logo = QLabel('∿')
-        logo.setObjectName('logo')
+        logo = WaveLogo()
+        logo.setObjectName('logo');logo.setFixedWidth(17)
         logo.setStyleSheet('font:25px Consolas;')
         brand_text = QWidget()
+        brand_text.setFixedHeight(47)
         text_layout = QVBoxLayout(brand_text)
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(0)
         title = QLabel('Kerr Studio')
+        title.setObjectName('brandTitle');title.setFixedHeight(29)
         title.setStyleSheet('font-size:19px;font-weight:600;')
         self.run_status = QLabel('● Ready')
         self.run_status.setObjectName('runStatus')
+        self.run_status.setFixedHeight(18)
         text_layout.addWidget(title)
         text_layout.addWidget(self.run_status)
         brand_layout.addWidget(logo)
         brand_layout.addWidget(brand_text)
         layout.addWidget(brand)
         run_info = QWidget()
+        run_info.setFixedHeight(29)
         info_layout = QVBoxLayout(run_info)
         info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(4)
+        info_layout.setSpacing(7)
         info_row = QHBoxLayout()
         info_row.setContentsMargins(0, 0, 0, 0)
         self.progress_text = QLabel('Ready to start')
         self.progress_text.setObjectName('progressText')
         self.remaining = QLabel('111 points')
         self.remaining.setObjectName('remaining')
+        self.progress_text.setFixedHeight(17);self.remaining.setFixedHeight(17)
         info_row.addWidget(self.progress_text)
         info_row.addStretch(1)
         info_row.addWidget(self.remaining)
@@ -243,12 +272,18 @@ class MainWindow(QMainWindow):
         action_layout = QHBoxLayout(actions)
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(7)
-        self.run_button = QPushButton('▶ Start')
+        self.run_button = QPushButton('Start')
         self.run_button.setProperty('role', 'primary')
         self.run_button.setObjectName('run')
-        self.stop_button = QPushButton('■ Stop')
+        self.run_button.setFixedSize(96,34)
+        self.run_button.setIconSize(QSize(11,11))
+        self._run_kind = 'play'
+        self.stop_button = QPushButton('Stop')
         self.stop_button.setObjectName('stop')
+        self.stop_button.setFixedSize(80,34)
+        self.stop_button.setIconSize(QSize(11,11))
         self.stop_button.setEnabled(False)
+        self._refresh_run_icons()
         action_layout.addWidget(self.run_button)
         action_layout.addWidget(self.stop_button)
         layout.addWidget(actions)
@@ -265,9 +300,10 @@ class MainWindow(QMainWindow):
         self.subnav.setObjectName('subnav')
         self.subnav.setFixedHeight(39)
         layout = QHBoxLayout(self.subnav)
-        layout.setContentsMargins(21, 0, 21, 0)
+        layout.setContentsMargins(16, 0, 14, 0)
         layout.setSpacing(12)
         self.nav_buttons = {}
+        nav=QWidget();nav_layout=QHBoxLayout(nav);nav_layout.setContentsMargins(0,0,0,0);nav_layout.setSpacing(20)
         for key, text in [('acquisition', 'Acquisition'), ('analysis', 'Analysis'), ('calibration', 'Spectral Calibration')]:
             button = QPushButton(text)
             button.setObjectName(key)
@@ -276,50 +312,66 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda checked=False, page=key: self.show_page(page))
             self.nav_buttons[key] = button
             self._reg(key, button, False)
-            layout.addWidget(button)
+            nav_layout.addWidget(button)
+        layout.addWidget(nav)
         layout.addStretch(1)
-        self.sample_name = QLabel('Sample 01 TRPL')
+        # Mirrors the footer file name (kept in sync in _sync_sample_name).
+        self.sample_name = ElidedLabel(DEFAULT_SAMPLE_NAME)
         self.sample_name.setObjectName('sampleName')
+        self.sample_name.setMaximumWidth(320)
         self._reg('sampleName', self.sample_name, False)
         layout.addWidget(self.sample_name)
-        self.hardware_mode = QPushButton('HARDWARE · 0/2 connected ▾')
-        self.hardware_mode.setObjectName('hardwareMode')
+        self.hardware_mode = QComboBox()
+        self.hardware_mode.setObjectName('sourceMode')
+        self.hardware_mode.setProperty('ownTextColor', True)
+        self.hardware_mode.setProperty('centerText', True)
+        self.hardware_mode.addItem('HARDWARE', 'hardware')
+        self.hardware_mode.addItem('SIMULATION · hardware offline', 'simulation')
+        for index in range(self.hardware_mode.count()):
+            self.hardware_mode.setItemData(index, Qt.AlignCenter, Qt.TextAlignmentRole)
+        self.hardware_mode.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.hardware_mode.setToolTip('Acquisition source')
         self._reg('hardwareMode', self.hardware_mode, False)
-        self.hardware_mode.clicked.connect(self._choose_source)
+        self.hardware_mode.activated.connect(lambda index: self._choose_source(self.hardware_mode.itemData(index)))
         layout.addWidget(self.hardware_mode)
-        self.theme_button = QPushButton('◐')
+        self.theme_button = ThemeButton()
         self.theme_button.setObjectName('theme')
+        self.theme_button.setFixedSize(27,27)  # square, same height as the source dropdown
         self._reg('theme', self.theme_button, False)
         self.theme_button.clicked.connect(self._toggle_theme)
         layout.addWidget(self.theme_button)
     def _build_footer(self):
         self.footer = QFrame()
         self.footer.setObjectName('foot')
-        self.footer.setFixedHeight(54)
+        add_outline(self.footer)
+        self.footer.setFixedHeight(52)
         layout = QHBoxLayout(self.footer)
         layout.setContentsMargins(11, 8, 11, 8)
         layout.setSpacing(10)
         save_label = QLabel('File name')
         save_label.setObjectName('save-label')
         layout.addWidget(save_label)
-        self.save_path = QLineEdit('Sample 01 TRPL')
+        self.save_path = QLineEdit(DEFAULT_SAMPLE_NAME)
         self.save_path.setObjectName('savePath')
         self.save_path.setMaxLength(180)
         self.save_path.setProperty('mono', True)
-        self.save_path.setPlaceholderText('Sample 01 TRPL')
+        self.save_path.setPlaceholderText(DEFAULT_SAMPLE_NAME)
+        self.save_path.textChanged.connect(self._sync_sample_name)
         self._reg('savePath', self.save_path, False)
+        self.save_path.setFixedHeight(34)
         layout.addWidget(self.save_path, 1)
         self.path_button = QPushButton('Choose folder…')
         self.path_button.setObjectName('path')
         self._reg('path', self.path_button, False)
         self.path_button.clicked.connect(self._choose_output_folder)
+        self.path_button.setFixedHeight(34)
         layout.addWidget(self.path_button)
         self.autosave = QCheckBox('Autosave')
         self.autosave.setObjectName('autosave')
         self.autosave.setChecked(True)
         self._reg('autosave', self.autosave, False)
         layout.addWidget(self.autosave)
-        self.save_status = QLabel('Not saved to disk')
+        self.save_status = ElidedLabel('Not saved to disk')
         self.save_status.setObjectName('saveStatus')
         self._reg('saveStatus', self.save_status, False)
         layout.addWidget(self.save_status)
@@ -328,43 +380,47 @@ class MainWindow(QMainWindow):
         self.export_button.setProperty('role', 'accent')
         self._reg('export', self.export_button, False)
         self.export_button.clicked.connect(self.export_current_csv)
+        self.export_button.setFixedHeight(34);self.export_button.setEnabled(False)
         layout.addWidget(self.export_button)
     def _build_acquisition_page(self):
         page = QWidget()
         page.setObjectName('acquisitionPage')
         layout = QHBoxLayout(page)
-        layout.setContentsMargins(16, 16, 16, 0)
-        layout.setSpacing(21)
+        layout.setContentsMargins(14, 12, 14, 0)
+        layout.setSpacing(12)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setMinimumWidth(280)
         scroll.setMaximumWidth(340)
+        self.acquisition_scroll=scroll
         inner = QFrame()
         inner.setObjectName('sidebar')
+        add_outline(inner)
         side_layout = QVBoxLayout(inner)
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(0)
         self._build_stage_section(side_layout)
         self._build_detection_section(side_layout)
         self._build_scan_section(side_layout)
-        side_layout.addStretch(1)
+        side_layout.setStretch(2,1)
         scroll.setWidget(inner)
         layout.addWidget(scroll)
         data = QWidget()
         data_layout = QVBoxLayout(data)
         data_layout.setContentsMargins(0, 0, 0, 0)
-        data_layout.setSpacing(15)
-        data_layout.addWidget(self._build_live_spectrum_panel(), 1)
-        data_layout.addWidget(self._build_map_panel(), 1)
+        data_layout.setSpacing(12)
+        data_layout.addWidget(self._build_live_spectrum_panel(), 112)
+        data_layout.addWidget(self._build_map_panel(), 100)
         layout.addWidget(data, 1)
         self._reg('acquisitionPage', page, False)
         return page
     def _build_stage_section(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(14,13,14,14)
         self.stage_connection = QPushButton('○ Connect…')
         self.stage_connection.setObjectName('stageConnection')
-        self.stage_connection.setStyleSheet('background:transparent;border-color:transparent;color:#63748a;')
         self._reg('stageConnection', self.stage_connection, False)
         self.stage_connection.clicked.connect(self._open_stage_dialog)
         layout.addWidget(self._heading('Delay Stage', self.stage_connection))
@@ -377,7 +433,6 @@ class MainWindow(QMainWindow):
         delay_row.setSpacing(7)
         self.delay_edit = number_edit('0.350')
         self.delay_edit.setObjectName('delay')
-        self.delay_edit.setStyleSheet('font:28px Consolas;border:0;border-bottom:1px dashed #d4dde7;background:transparent;')
         self._reg('delay', self.delay_edit, False)
         delay_row.addWidget(self.delay_edit, 1)
         unit = QLabel('ps')
@@ -399,7 +454,8 @@ class MainWindow(QMainWindow):
         nudge_layout.setSpacing(5)
         for column, value in enumerate([-1, -0.1, 0.1, 1]):
             text = '-1' if value == -1 else '-0.1' if value == -0.1 else '+0.1' if value == 0.1 else '+1'
-            button = QPushButton(text)
+            button = QPushButton(text + ' ps')
+            button.setToolTip(f'Move the delay by {text} ps')
             button.clicked.connect(lambda checked=False, step=value: self.move_stage(step, relative=True))
             nudge_layout.addWidget(button, 0, column)
         stage_layout.addWidget(nudge)
@@ -413,22 +469,23 @@ class MainWindow(QMainWindow):
         self.return_zero.setProperty('role', 'accent')
         self.return_zero.clicked.connect(lambda: self.move_stage(0, relative=False))
         self._reg('returnZero', self.return_zero, False)
-        stage_layout.addWidget(self.zero_button)
-        stage_layout.addWidget(self.return_zero)
+        zero_row=QHBoxLayout();zero_row.setSpacing(8);zero_row.setContentsMargins(0,0,0,0)
+        self.zero_button.setFixedHeight(32);self.return_zero.setFixedHeight(32)
+        zero_row.addWidget(self.zero_button,1);zero_row.addWidget(self.return_zero,1);stage_layout.addLayout(zero_row)
         layout.addWidget(self.stage_fields)
         parent_layout.addWidget(frame)
     def _build_detection_section(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(14,13,14,15);layout.setSpacing(11)
         self.detector_connection = QPushButton('CCD off · Manual ▾')
         self.detector_connection.setObjectName('detectorConnection')
-        self.detector_connection.setStyleSheet('background:transparent;border-color:transparent;color:#63748a;')
         self._reg('detectorConnection', self.detector_connection, False)
         self.detector_connection.clicked.connect(self._open_detector_dialog)
         layout.addWidget(self._heading('Detection', self.detector_connection))
         self.detector_fields = QWidget()
         detector_layout = QVBoxLayout(self.detector_fields)
         detector_layout.setContentsMargins(0, 0, 0, 0)
-        detector_layout.setSpacing(8)
+        detector_layout.setSpacing(9)
         pair = QWidget()
         pair_layout = QGridLayout(pair)
         pair_layout.setContentsMargins(0, 0, 0, 0)
@@ -445,24 +502,16 @@ class MainWindow(QMainWindow):
         pair_layout.addWidget(field('Exposure', self.exposure_edit, 's'), 0, 0)
         pair_layout.addWidget(field('Center wavelength', self.center_edit, 'nm'), 0, 1)
         detector_layout.addWidget(pair)
-        self.advanced = CollapsibleSection('Advanced · Readout / ROI / Grating')
+        self.advanced = CollapsibleSection('Advanced · Grating / Slit / Readout')
         advanced_widget = QWidget()
-        advanced_grid = QGridLayout(advanced_widget)
-        advanced_grid.setContentsMargins(0, 0, 0, 0)
-        advanced_grid.setHorizontalSpacing(10)
-        advanced_grid.setVerticalSpacing(6)
-        readout = QComboBox()
-        readout.addItem('FVB')
-        readout.setEnabled(False)
-        binning = QComboBox()
-        binning.addItem('H bin 1 / full vertical')
-        binning.setEnabled(False)
-        roi_x_start = QLineEdit('0')
-        roi_x_end = QLineEdit('1024')
-        roi_y_start = QLineEdit('0')
-        roi_y_end = QLineEdit('255')
-        for edit in (roi_x_start, roi_x_end, roi_y_start, roi_y_end):
-            edit.setEnabled(False)
+        advanced_layout = QVBoxLayout(advanced_widget)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(8)
+        spectro_pair = QWidget()
+        spectro_grid = QGridLayout(spectro_pair)
+        spectro_grid.setContentsMargins(0, 0, 0, 0)
+        spectro_grid.setHorizontalSpacing(10)
+        spectro_grid.setVerticalSpacing(0)
         self.grating_combo = QComboBox()
         self.grating_combo.addItems(['300', '600', '1200'])
         self.grating_combo.setObjectName('grating')
@@ -472,43 +521,42 @@ class MainWindow(QMainWindow):
         self.slit_edit.setObjectName('slit')
         self.slit_edit.editingFinished.connect(self._apply_spectrograph)
         self._reg('slit', self.slit_edit, False)
-        advanced_grid.addWidget(QLabel('Readout mode'), 0, 0)
-        advanced_grid.addWidget(readout, 0, 1)
-        advanced_grid.addWidget(QLabel('Binning'), 1, 0)
-        advanced_grid.addWidget(binning, 1, 1)
-        advanced_grid.addWidget(QLabel('ROI X start'), 2, 0)
-        advanced_grid.addWidget(roi_x_start, 2, 1)
-        advanced_grid.addWidget(QLabel('ROI X end (excl.)'), 3, 0)
-        advanced_grid.addWidget(roi_x_end, 3, 1)
-        advanced_grid.addWidget(QLabel('ROI Y start'), 4, 0)
-        advanced_grid.addWidget(roi_y_start, 4, 1)
-        advanced_grid.addWidget(QLabel('ROI Y end (excl.)'), 5, 0)
-        advanced_grid.addWidget(roi_y_end, 5, 1)
-        advanced_grid.addWidget(QLabel('Grating / g·mm⁻¹'), 6, 0)
-        advanced_grid.addWidget(self.grating_combo, 6, 1)
-        advanced_grid.addWidget(QLabel('Slit / μm'), 7, 0)
-        advanced_grid.addWidget(self.slit_edit, 7, 1)
+        spectro_grid.addWidget(field('Grating / g·mm⁻¹', self.grating_combo), 0, 0)
+        spectro_grid.addWidget(field('Slit', self.slit_edit, 'μm'), 0, 1)
+        spectro_grid.setColumnStretch(0, 1)
+        spectro_grid.setColumnStretch(1, 1)
+        advanced_layout.addWidget(spectro_pair)
+        # Scans always read the CCD in full vertical binning; show the fixed geometry instead of dead inputs.
+        readout_info = QLabel('Readout  FVB · H bin 1\nROI  X 0–1024 · Y 0–255 (full chip)')
+        readout_info.setObjectName('advancedInfo')
+        readout_info.setToolTip('Scan acquisition uses full vertical binning over the whole chip.\nRow selection is available on the Spectral Calibration page.')
+        advanced_layout.addWidget(readout_info)
         self.advanced.add(advanced_widget)
         detector_layout.addWidget(self.advanced)
         layout.addWidget(self.detector_fields)
         parent_layout.addWidget(frame)
     def _build_scan_section(self, parent_layout):
         frame, layout = self._section()
+        layout.setAlignment(Qt.AlignTop);layout.setSpacing(13)
         self.preview_button = QPushButton('Live preview')
         self.preview_button.setObjectName('preview')
+        self.preview_button.setProperty('role','accent');self.preview_button.setFixedHeight(27)
         self._reg('preview', self.preview_button, False)
         self.preview_button.clicked.connect(self.toggle_preview)
         layout.addWidget(self._heading('Acquisition', self.preview_button))
         self.mode_seg = Segmented([('Scan', 'scan'), ('Single', 'single'), ('Repeat', 'repeat')])
         self.mode_seg.set_selected('scan')
+        self.mode_seg.setObjectName('mode');self.mode_seg.setFixedHeight(33);self.mode_seg.layout.setContentsMargins(3,3,3,3)
+        for button in self.mode_seg.buttons:button.setFixedHeight(27)
         self.mode_seg.changed.connect(self._mode_changed)
         self._reg('mode', self.mode_seg, False)
         layout.addWidget(self.mode_seg)
         self.scan_params = QWidget()
         scan_layout = QVBoxLayout(self.scan_params)
         scan_layout.setContentsMargins(0, 0, 0, 0)
-        scan_layout.setSpacing(5)
-        segment_head = QWidget()
+        scan_layout.setSpacing(6)
+        scan_layout.setAlignment(Qt.AlignTop)
+        segment_head = QWidget();segment_head.setFixedHeight(28)
         head_layout = QHBoxLayout(segment_head)
         head_layout.setContentsMargins(0, 0, 0, 0)
         head_layout.setSpacing(4)
@@ -522,39 +570,37 @@ class MainWindow(QMainWindow):
         self.add_segment.clicked.connect(lambda: self._add_segment_row())
         head_layout.addWidget(self.add_segment)
         scan_layout.addWidget(segment_head)
-        labels = QWidget()
-        labels_layout = QGridLayout(labels)
-        labels_layout.setContentsMargins(0, 0, 0, 0)
-        labels_layout.setHorizontalSpacing(0)
-        for column, text in enumerate(['Start', 'End', 'Step', '']):
+        labels = QWidget();labels.setFixedHeight(16)
+        header_cells = []
+        for text in ['Start', 'End', 'Step']:
             item = QLabel(text)
             item.setProperty('muted', True)
-            labels_layout.addWidget(item, 0, column)
+            item.setContentsMargins(10, 0, 0, 0)
+            header_cells.append(item)
+        remove_column = QWidget();remove_column.setFixedWidth(self._SEGMENT_REMOVE_WIDTH)
+        self._segment_cells(labels, header_cells, remove_column, False)
         scan_layout.addWidget(labels)
-        self.segments_scroll = QScrollArea()
-        self.segments_scroll.setWidgetResizable(True)
-        self.segments_scroll.setFrameShape(QFrame.NoFrame)
-        self.segments_scroll.setFixedHeight(98)
+        # Rows grow with the sidebar (which scrolls as a whole) so the column grid never shifts under a nested scrollbar.
         self.segments_host = QWidget()
         self.segments_host.setObjectName('segments')
         self.segments_layout = QVBoxLayout(self.segments_host)
         self.segments_layout.setContentsMargins(0, 0, 0, 0)
-        self.segments_layout.setSpacing(4)
-        self.segments_layout.addStretch(1)
-        self.segments_scroll.setWidget(self.segments_host)
+        self.segments_layout.setSpacing(6)
         self._reg('segments', self.segments_host, False)
-        scan_layout.addWidget(self.segments_scroll)
+        scan_layout.addWidget(self.segments_host)
         self.repeat_wrap = QWidget()
         repeat_layout = QHBoxLayout(self.repeat_wrap)
-        repeat_layout.setContentsMargins(0, 0, 0, 0)
-        repeat_layout.setSpacing(8)
+        repeat_layout.setContentsMargins(0, 6, 0, 0)
+        repeat_layout.setSpacing(10)
         repeat_label = QLabel('Repeat count')
         repeat_label.setProperty('muted', True)
         repeat_layout.addWidget(repeat_label)
+        repeat_layout.addStretch(1)
         self.repeats_input = int_spin(3, 1, 100, 1)
         self.repeats_input.setObjectName('repeats')
+        self.repeats_input.setFixedSize(96, 30)
         self._reg('repeats', self.repeats_input, False)
-        repeat_layout.addWidget(self.repeats_input, 1)
+        repeat_layout.addWidget(self.repeats_input)
         self.repeat_wrap.hide()
         scan_layout.addWidget(self.repeat_wrap)
         layout.addWidget(self.scan_params)
@@ -563,7 +609,7 @@ class MainWindow(QMainWindow):
         self._reg('validation', self.validation, False)
         layout.addWidget(self.validation)
         self._segment_rows = []
-        self._add_segment_row('0.0', '11.0', '0.1')
+        self._add_segment_row('-2','0','0.1');self._add_segment_row('0','2','0.05');self._add_segment_row('2','20','0.5')
         self._mode_changed('scan')
         parent_layout.addWidget(frame)
     def _build_live_spectrum_panel(self):
@@ -575,7 +621,8 @@ class MainWindow(QMainWindow):
         self._reg('saturation', self.saturation, False)
         panel.title_layout.addWidget(self.saturation)
         legend = Legend()
-        legend.add('Current')
+        # Reads "Current" for the live frame, or "Δt = … ps" for a delay picked on the map after a scan.
+        self._spectrum_legend_current = legend.add('Current').findChild(QLabel)
         legend.add('Background', dashed=True)
         panel.add_tool(legend)
         self.capture_background = QPushButton('Acquire background')
@@ -601,19 +648,39 @@ class MainWindow(QMainWindow):
         key_layout = QHBoxLayout(color_key)
         key_layout.setContentsMargins(0, 0, 0, 0)
         key_layout.setSpacing(6)
-        self.color_min = QLabel('0')
-        self.color_min.setObjectName('colorLabel')
+        # Colour range ends: click to type a count (k / M accepted); empty returns that end to auto.
+        self.color_min = InlineValueEdit('0')
+        self.color_min.committed.connect(lambda text: self._color_range_edited(0, text))
         self._reg('colorLabel', self.color_min, False)
+        self.map_levels_auto = QPushButton('Auto')
+        self.map_levels_auto.setObjectName('colorAuto')
+        self.map_levels_auto.setToolTip('Return the colour range to the data range')
+        self.map_levels_auto.clicked.connect(self._color_range_auto)
+        self.map_levels_auto.hide()
         self.gradient = GradientBar()
+        self.gradient.setFixedSize(130,6)
         self.gradient.setObjectName('mapGradient')
         self._reg('mapGradient', self.gradient, False)
-        self.color_max = QLabel('1k')
-        self.color_max.setObjectName('colorMax')
+        self.color_max = InlineValueEdit('1k')
+        self.color_max.committed.connect(lambda text: self._color_range_edited(1, text))
         self._reg('colorMax', self.color_max, False)
+        for edit in (self.color_min, self.color_max):
+            edit.setToolTip('Click to set the colour range in counts · empty = auto')
+        # Shown once any acquired pixel reached CCD full scale; matches the colour painted on the map.
+        self.map_saturated_key = QWidget();self.map_saturated_key.setObjectName('saturatedKey')
+        saturated_layout = QHBoxLayout(self.map_saturated_key);saturated_layout.setContentsMargins(0,0,8,0);saturated_layout.setSpacing(4)
+        swatch = QFrame();swatch.setObjectName('saturatedSwatch');swatch.setFixedSize(9,9)
+        saturated_text = QLabel('Saturated');saturated_text.setObjectName('saturatedText')
+        saturated_layout.addWidget(swatch);saturated_layout.addWidget(saturated_text)
+        self.map_saturated_key.setToolTip('Pixels that reached CCD full scale in at least one frame')
+        self.map_saturated_key.hide()
+        key_layout.addWidget(self.map_levels_auto)
+        key_layout.addWidget(self.map_saturated_key)
         key_layout.addWidget(self.color_min)
         key_layout.addWidget(self.gradient)
         key_layout.addWidget(self.color_max)
-        panel.add_tool(color_key)
+        color_key.setParent(panel.header);color_key.setFixedHeight(20);self.map_color_key=color_key
+        self._map_levels = None  # (low, high) counts; None at either end = follow the data
         self.map_scale = Segmented([('Linear', 'linear'), ('Log', 'log')])
         self.map_scale.set_selected('log')
         self.map_scale.changed.connect(self._scale_changed)
@@ -626,13 +693,15 @@ class MainWindow(QMainWindow):
         self.map_plot = MapPlot()
         self.map_plot.setObjectName('map')
         self._reg('map', self.map_plot, False)
-        self.decay_plot = DecayPlot()
+        self.decay_plot = DecayPlot();self.decay_plot.set_y_label('');self.decay_plot.left_axis.setStyle(showValues=False)
         self.decay_plot.setObjectName('decay')
         self._reg('decay', self.decay_plot, False)
         try:
             self.decay_plot.link_axis('y',self.map_plot)
         except Exception:
             pass
+        # Map and decay share the y axis: the map keeps no right gutter, the decay keeps a narrow one on its left.
+        self.map_plot.set_plot_margins(68, 0, 10, 46)
         charts_layout.addWidget(self.map_plot, 4)
         charts_layout.addWidget(self.decay_plot, 1)
         self.map_plot.delayPicked.connect(self._map_delay_picked)
@@ -644,15 +713,18 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName('analysisPage')
         layout = QHBoxLayout(page)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(21)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(12)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setMinimumWidth(280)
         scroll.setMaximumWidth(340)
+        self.analysis_scroll=scroll
         inner = QFrame()
         inner.setObjectName('analysisControls')
+        add_outline(inner)
         controls = QVBoxLayout(inner)
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(0)
@@ -667,7 +739,7 @@ class MainWindow(QMainWindow):
         results.setObjectName('analysisResults')
         results_layout = QVBoxLayout(results)
         results_layout.setContentsMargins(0, 0, 0, 0)
-        results_layout.setSpacing(15)
+        results_layout.setSpacing(12)
         results_layout.addWidget(self._build_analysis_curve(), 1)
         self.analysis_bottom=self._build_analysis_bottom()
         results_layout.addWidget(self.analysis_bottom)
@@ -676,6 +748,7 @@ class MainWindow(QMainWindow):
         return page
     def _build_analysis_experiment(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,17)
         self.analysis_fit_state = QLabel('No data')
         self.analysis_fit_state.setObjectName('analysisFitState')
         self._reg('analysisFitState', self.analysis_fit_state, False)
@@ -692,7 +765,7 @@ class MainWindow(QMainWindow):
         meta_layout.setSpacing(8)
         self.analysis_points = QLabel('0 delays')
         self.analysis_points.setObjectName('analysisPoints')
-        self.analysis_frames = QLabel('0 repeat times')
+        self.analysis_frames = QLabel('0 repeats')
         self.analysis_frames.setObjectName('analysisFrames')
         self._reg('analysisPoints', self.analysis_points, False)
         self._reg('analysisFrames', self.analysis_frames, False)
@@ -702,6 +775,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(meta)
         open_label = QLabel('Open HDF5 file')
         open_label.setProperty('muted', True)
+        layout.addSpacing(14)
         layout.addWidget(open_label)
         open_row = QWidget()
         open_layout = QHBoxLayout(open_row)
@@ -713,7 +787,7 @@ class MainWindow(QMainWindow):
         self.open_path.setPlaceholderText('Choose an HDF5 file')
         self._reg('openPath', self.open_path, False)
         self.open_run = QPushButton('Open…')
-        self.open_run.setObjectName('openRun')
+        self.open_run.setObjectName('openRun');self.open_run.setFixedHeight(32)
         self._reg('openRun', self.open_run, False)
         self.open_run.clicked.connect(lambda: self.open_analysis_file())
         open_layout.addWidget(self.open_path, 1)
@@ -728,11 +802,11 @@ class MainWindow(QMainWindow):
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(7)
         self.save_run = QPushButton('Save HDF5')
-        self.save_run.setObjectName('saveRun')
+        self.save_run.setObjectName('saveRun');self.save_run.setFixedHeight(32)
         self._reg('saveRun', self.save_run, False)
         self.save_run.clicked.connect(self._save_analysis_run)
         self.export_fit = QPushButton('Export fit CSV')
-        self.export_fit.setObjectName('exportFit')
+        self.export_fit.setObjectName('exportFit');self.export_fit.setFixedHeight(32)
         self.export_fit.setEnabled(False)
         self._reg('exportFit', self.export_fit, False)
         self.export_fit.clicked.connect(self._export_fit_csv)
@@ -750,6 +824,7 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_analysis_view(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,17);layout.setSpacing(16)
         label = QLabel('View')
         label.setProperty('muted', True)
         layout.addWidget(label)
@@ -799,6 +874,7 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_analysis_fit_controls(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,17)
         self.analysis_fit_controls = frame
         self.analysis_fit_controls.setObjectName('analysisFitControls')
         self._reg('analysisFitControls', self.analysis_fit_controls, False)
@@ -833,6 +909,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(irf_label)
         self.irf_width = number_edit('.25')
         self.irf_width.setObjectName('irfWidth')
+        self.irf_width.setFixedHeight(32)
         self._reg('irfWidth', self.irf_width, False)
         layout.addWidget(field('', self.irf_width, 'ps'))
         range_grid = QWidget()
@@ -851,7 +928,7 @@ class MainWindow(QMainWindow):
         range_layout.addWidget(field('Fit end', self.fit_end, 'ps'), 0, 1)
         layout.addWidget(range_grid)
         self.run_fit_button = QPushButton('▶ Run fit')
-        self.run_fit_button.setObjectName('runFit')
+        self.run_fit_button.setObjectName('runFit');self.run_fit_button.setFixedHeight(36)
         self.run_fit_button.setProperty('role', 'primary')
         self.run_fit_button.setEnabled(False)
         self._reg('runFit', self.run_fit_button, False)
@@ -865,9 +942,10 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_analysis_curve(self):
         panel = Panel('Decay & fit')
+        panel.title_label.hide();panel.header.setFixedHeight(57)
         self._reg('analysisPlotPanel', panel, False)
         self.analysis_plot_title = QLabel('Decay & fit')
-        self.analysis_plot_title.setObjectName('analysisPlotTitle')
+        self.analysis_plot_title.setObjectName('analysisPlotTitle');self.analysis_plot_title.setProperty('h2',True)
         self._reg('analysisPlotTitle', self.analysis_plot_title, False)
         panel.title_layout.addWidget(self.analysis_plot_title)
         self.analysis_window_label = QLabel('600 ± 5 nm')
@@ -881,7 +959,7 @@ class MainWindow(QMainWindow):
         panel.add_tool(self.analysis_point)
         self.analysis_legend = Legend()
         self.analysis_legend.add('Observed', dot=True)
-        self.analysis_legend.add('Fit', dashed=True)
+        self.analysis_legend.add('Fit',color=palette()['amber'])
         self.analysis_legend.setObjectName('analysisDecayLegend')
         self._reg('analysisDecayLegend', self.analysis_legend, False)
         panel.add_tool(self.analysis_legend)
@@ -896,11 +974,11 @@ class MainWindow(QMainWindow):
         self._reg('analysisTimeMin', self.analysis_time_min, False)
         self._reg('analysisTimeMax', self.analysis_time_max, False)
         gradient = GradientBar()
-        gradient.setObjectName('analysisTimeGradient')
+        gradient.setObjectName('analysisTimeGradient');gradient.setFixedSize(100,7)
         self._reg('analysisTimeGradient', gradient, False)
         time_layout.addWidget(self.analysis_time_min)
         time_layout.addWidget(gradient)
-        time_layout.addWidget(self.analysis_time_max)
+        time_layout.addWidget(self.analysis_time_max);time_layout.addWidget(QLabel('ps'))
         self.analysis_time_key.setObjectName('analysisTimeKey')
         self.analysis_time_key.hide()
         self._reg('analysisTimeKey', self.analysis_time_key, False)
@@ -916,6 +994,7 @@ class MainWindow(QMainWindow):
         self.analysis_curve.delayPicked.connect(self._analysis_delay_picked)
         panel.add_body(self.analysis_curve, 1)
         self.analysis_residual_wrap = QWidget()
+        self.analysis_residual_wrap.setFixedHeight(90)
         self.analysis_residual_wrap.setObjectName('analysisResidualWrap')
         residual_layout = QVBoxLayout(self.analysis_residual_wrap)
         residual_layout.setContentsMargins(0, 0, 0, 0)
@@ -932,31 +1011,34 @@ class MainWindow(QMainWindow):
         self.analysis_spectrum_legend = QWidget()
         self.analysis_spectrum_legend.setObjectName('analysisSpectrumLegend')
         spectrum_layout = QHBoxLayout(self.analysis_spectrum_legend)
-        spectrum_layout.setContentsMargins(0, 0, 0, 0)
+        spectrum_layout.setContentsMargins(17, 9, 17, 9)
         spectrum_layout.setSpacing(7)
+        self.analysis_spectrum_legend.setFixedHeight(48)
         self.analysis_spectrum_legend.hide()
         self._reg('analysisSpectrumLegend', self.analysis_spectrum_legend, False)
         panel.add_body(self.analysis_spectrum_legend, 0)
         return panel
     def _build_analysis_bottom(self):
         outer = QWidget()
+        outer.setFixedHeight(240)
         outer.setObjectName('analysisBottom')
         layout = QHBoxLayout(outer)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(15)
+        layout.setSpacing(12)
         table_panel = Panel('Fit parameters')
         table_panel.add_tool(QLabel('Value ± local SE'))
         self.fit_table = QTableWidget(0, 4)
-        self.fit_table.setObjectName('fitParameters')
+        self.fit_table.setObjectName('fitParameters');self.fit_table.setShowGrid(False)
         self.fit_table.setHorizontalHeaderLabels(['Parameter', 'Value', 'Std. error', 'Unit'])
         self.fit_table.verticalHeader().setVisible(False)
         self.fit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.fit_table.setSelectionMode(QAbstractItemView.NoSelection)
         self.fit_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.fit_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self._reg('fitParameters', self.fit_table, False)
         table_panel.add_body(self.fit_table, 1)
         layout.addWidget(table_panel, 1)
-        diagnostics = Panel('Fit diagnostics')
+        diagnostics = Panel('Fit diagnostics');diagnostics.setFixedWidth(250)
         body = QWidget()
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(14, 8, 14, 12)
@@ -999,15 +1081,18 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName('calibrationPage')
         layout = QHBoxLayout(page)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(21)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(12)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setMinimumWidth(280)
         scroll.setMaximumWidth(340)
+        self.calibration_scroll=scroll
         inner = QFrame()
         inner.setObjectName('calibrationControls')
+        add_outline(inner)
         controls = QVBoxLayout(inner)
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(0)
@@ -1022,7 +1107,7 @@ class MainWindow(QMainWindow):
         results.setObjectName('calResults')
         results_layout = QVBoxLayout(results)
         results_layout.setContentsMargins(0, 0, 0, 0)
-        results_layout.setSpacing(15)
+        results_layout.setSpacing(12)
         results_layout.addWidget(self._build_cal_image_panel(), 1)
         results_layout.addWidget(self._build_cal_spectrum_panel(), 1)
         results_layout.addWidget(self._build_cal_lower(), 1)
@@ -1031,6 +1116,7 @@ class MainWindow(QMainWindow):
         return page
     def _build_cal_ccd(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,19)
         self.cal_source = QLabel('HARDWARE')
         self.cal_source.setObjectName('calSource')
         self.cal_source.setProperty('warning', True)
@@ -1040,11 +1126,12 @@ class MainWindow(QMainWindow):
         grid_layout = QGridLayout(grid)
         grid_layout.setContentsMargins(0, 0, 0, 0)
         grid_layout.setHorizontalSpacing(12)
-        grid_layout.setVerticalSpacing(8)
+        grid_layout.setVerticalSpacing(8);grid_layout.setColumnStretch(0,1);grid_layout.setColumnStretch(1,1)
         self.cal_exposure = number_edit('1.0')
         self.cal_exposure.setObjectName('calExposure')
         self._reg('calExposure', self.cal_exposure, False)
         self.cal_readout = QComboBox()
+        self.cal_readout.setMinimumWidth(110)
         self.cal_readout.setObjectName('calReadout')
         self.cal_readout.addItem('Full image', 'full_image')
         self.cal_readout.addItem('FVB', 'fvb')
@@ -1071,9 +1158,11 @@ class MainWindow(QMainWindow):
         self.cal_capture.setProperty('role', 'primary')
         self.cal_capture.clicked.connect(self.capture_calibration)
         self._reg('calCapture', self.cal_capture, False)
+        self.cal_capture.setFixedHeight(36);self.cal_capture.setStyleSheet('min-height:34px;max-height:34px;')
+        layout.addSpacing(9)
         layout.addWidget(self.cal_capture)
         self.cal_connection_note = QLabel('Connect a CCD to acquire a frame.')
-        self.cal_connection_note.setObjectName('calConnectionNote')
+        self.cal_connection_note.setObjectName('calConnectionNote');self.cal_connection_note.setMinimumHeight(18)
         self.cal_connection_note.setWordWrap(True)
         self.cal_connection_note.setProperty('muted', True)
         self._reg('calConnectionNote', self.cal_connection_note, False)
@@ -1081,6 +1170,7 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_cal_extraction(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,20)
         layout.addWidget(self._heading('Spectrum extraction'))
         grid = QWidget()
         grid_layout = QGridLayout(grid)
@@ -1089,13 +1179,13 @@ class MainWindow(QMainWindow):
         grid_layout.setVerticalSpacing(8)
         self.cal_row_start = QSpinBox()
         self.cal_row_start.setObjectName('calRowStart')
-        self.cal_row_start.setRange(0, 254)
+        self.cal_row_start.setRange(0, 254);self.cal_row_start.setFixedHeight(32);self.cal_row_start.setButtonSymbols(QSpinBox.NoButtons)
         self.cal_row_start.setValue(85)
         self.cal_row_start.valueChanged.connect(lambda value: self._cal_roi_spin_changed())
         self._reg('calRowStart', self.cal_row_start, False)
         self.cal_row_end = QSpinBox()
         self.cal_row_end.setObjectName('calRowEnd')
-        self.cal_row_end.setRange(0, 254)
+        self.cal_row_end.setRange(0, 254);self.cal_row_end.setFixedHeight(32);self.cal_row_end.setButtonSymbols(QSpinBox.NoButtons)
         self.cal_row_end.setValue(165)
         self.cal_row_end.valueChanged.connect(lambda value: self._cal_roi_spin_changed())
         self._reg('calRowEnd', self.cal_row_end, False)
@@ -1104,7 +1194,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(grid)
         self.cal_extraction_note = QLabel('Mean of selected rows · Click the CCD image to move the band.')
         self.cal_extraction_note.setObjectName('calExtractionNote')
-        self.cal_extraction_note.setWordWrap(True)
+        self.cal_extraction_note.setWordWrap(True);self.cal_extraction_note.setFixedHeight(36)
         self.cal_extraction_note.setProperty('muted', True)
         self._reg('calExtractionNote', self.cal_extraction_note, False)
         layout.addWidget(self.cal_extraction_note)
@@ -1112,22 +1202,26 @@ class MainWindow(QMainWindow):
         self.cal_find_peaks.setObjectName('calFindPeaks')
         self.cal_find_peaks.clicked.connect(self.extract_calibration)
         self._reg('calFindPeaks', self.cal_find_peaks, False)
+        self.cal_find_peaks.setFixedHeight(36);self.cal_find_peaks.setStyleSheet('min-height:34px;max-height:34px;')
         layout.addWidget(self.cal_find_peaks)
         parent_layout.addWidget(frame)
     def _build_cal_reference(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,17)
         layout.addWidget(self._heading('Reference spectrum'))
         self.cal_reference_name = QLabel('Illustrative demo lines')
         self.cal_reference_name.setObjectName('calReferenceName')
         self.cal_reference_name.setWordWrap(True)
         self.cal_reference_name.setProperty('mono', True)
         self._reg('calReferenceName', self.cal_reference_name, False)
+        self.cal_reference_name.setStyleSheet('font:12px Consolas;');self.cal_reference_name.setFixedHeight(18)
         layout.addWidget(self.cal_reference_name)
         self.cal_reference_file = QPushButton('Import reference CSV')
         self.cal_reference_file.setObjectName('calReferenceFile')
         self.cal_reference_file.clicked.connect(self._import_reference_csv)
         self._reg('calReferenceFile', self.cal_reference_file, False)
-        layout.addWidget(self.cal_reference_file)
+        layout.addSpacing(3)
+        self.cal_reference_file.setFixedHeight(34);self.cal_reference_file.setStyleSheet('min-height:32px;max-height:32px;');layout.addWidget(self.cal_reference_file)
         demo_row = QWidget()
         demo_layout = QHBoxLayout(demo_row)
         demo_layout.setContentsMargins(0, 0, 0, 0)
@@ -1141,7 +1235,8 @@ class MainWindow(QMainWindow):
         demo_layout.addWidget(caption)
         demo_layout.addStretch(1)
         demo_layout.addWidget(self.cal_demo_reference)
-        layout.addWidget(demo_row)
+        layout.addSpacing(4)
+        self.cal_demo_reference.setFixedSize(47,32);self.cal_demo_reference.setStyleSheet('padding:0 8px;');layout.addWidget(demo_row)
         conv_label = QLabel('Wavelength convention')
         conv_label.setProperty('muted', True)
         layout.addWidget(conv_label)
@@ -1154,10 +1249,11 @@ class MainWindow(QMainWindow):
         note = QLabel('wavelength_nm,relative_intensity. Intensity is optional. No air/vacuum conversion is performed.')
         note.setWordWrap(True)
         note.setProperty('muted', True)
-        layout.addWidget(note)
+        format_section=CollapsibleSection('Reference format');format_section.add(note);layout.addWidget(format_section)
         parent_layout.addWidget(frame)
     def _build_cal_model(self, parent_layout):
         frame, layout = self._section()
+        layout.setContentsMargins(17,17,17,17)
         self.cal_fit_state = QLabel('Draft')
         self.cal_fit_state.setObjectName('calFitState')
         self._reg('calFitState', self.cal_fit_state, False)
@@ -1178,6 +1274,7 @@ class MainWindow(QMainWindow):
         self.cal_fit_mapping.setProperty('role', 'primary')
         self.cal_fit_mapping.clicked.connect(self.fit_calibration)
         self._reg('calFitMapping', self.cal_fit_mapping, False)
+        self.cal_fit_mapping.setFixedHeight(36)
         layout.addWidget(self.cal_fit_mapping)
         self.cal_feedback = QLabel('')
         self.cal_feedback.setObjectName('calFeedback')
@@ -1189,12 +1286,14 @@ class MainWindow(QMainWindow):
         self.cal_export.setEnabled(False)
         self.cal_export.clicked.connect(self._export_calibration_json)
         self._reg('calExport', self.cal_export, False)
+        self.cal_export.setFixedHeight(36)
         layout.addWidget(self.cal_export)
         self.cal_apply = QPushButton('Apply to acquisition')
         self.cal_apply.setObjectName('calApply')
         self.cal_apply.setEnabled(False)
         self.cal_apply.clicked.connect(self.apply_calibration)
         self._reg('calApply', self.cal_apply, False)
+        self.cal_apply.setFixedHeight(36)
         layout.addWidget(self.cal_apply)
         note = QLabel('Apply updates future acquisitions; existing experiments keep their recorded calibration.')
         note.setWordWrap(True)
@@ -1221,6 +1320,7 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_cal_image_panel(self):
         panel = Panel('CCD frame / pixel')
+        panel.header.setFixedHeight(52)
         self.cal_roi_label = QLabel('')
         self.cal_roi_label.setObjectName('calRoiLabel')
         self.cal_roi_label.hide()
@@ -1239,9 +1339,14 @@ class MainWindow(QMainWindow):
         return panel
     def _build_cal_spectrum_panel(self):
         panel = Panel('Extracted spectrum /')
+        panel.header.setFixedHeight(52)
         self.cal_spectrum_axis = QLabel('pixel')
         self.cal_spectrum_axis.setObjectName('calSpectrumAxis')
         self._reg('calSpectrumAxis', self.cal_spectrum_axis, False)
+        # Read as one title, "Extracted spectrum / pixel", with the switchable unit muted.
+        self.cal_spectrum_axis.setProperty('h2', True)
+        self.cal_spectrum_axis.setProperty('muted', True)
+        panel.title_layout.setSpacing(5)
         panel.title_layout.addWidget(self.cal_spectrum_axis)
         legend = Legend()
         legend.add('CCD')
@@ -1265,11 +1370,13 @@ class MainWindow(QMainWindow):
         return panel
     def _build_cal_lower(self):
         outer = QWidget()
+        self.cal_lower=outer
+        outer.setFixedHeight(240)
         outer.setObjectName('calLower')
         layout = QHBoxLayout(outer)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(15)
-        table_panel = Panel('Line assignments')
+        layout.setSpacing(12)
+        table_panel = Panel('Line assignments');table_panel.header.setFixedHeight(46)
         self.cal_line_count = QLabel('0 enabled lines')
         self.cal_line_count.setObjectName('calLineCount')
         self.cal_line_count.setProperty('muted', True)
@@ -1281,19 +1388,24 @@ class MainWindow(QMainWindow):
         self._reg('calAddLine', self.cal_add_line, False)
         table_panel.add_tool(self.cal_add_line)
         self.cal_table = QTableWidget(0, 5)
-        self.cal_table.setObjectName('calPairs')
+        self.cal_table.setObjectName('calPairs');self.cal_table.setShowGrid(False)
         self.cal_table.setHorizontalHeaderLabels(['', 'Peak / px', 'Reference / nm', 'Δ / nm', ''])
         self.cal_table.verticalHeader().setVisible(False)
         self.cal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.cal_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.cal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.cal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.cal_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        for column,size in ((0,30),(4,36)):
+            self.cal_table.horizontalHeader().setSectionResizeMode(column,QHeaderView.Fixed);self.cal_table.setColumnWidth(column,size)
+        self.cal_table.horizontalHeader().setMinimumSectionSize(20);self.cal_table.horizontalHeader().setFixedHeight(34);self.cal_table.verticalHeader().setDefaultSectionSize(37)
         self.cal_table.itemSelectionChanged.connect(self._cal_selection_changed)
         self.cal_table.cellClicked.connect(lambda row, column: self.cal_table.selectRow(row))
         self._reg('calPairs', self.cal_table, False)
         table_panel.add_body(self.cal_table, 1)
-        layout.addWidget(table_panel, 1)
-        mapping_panel = Panel('Pixel → wavelength')
+        note=QLabel('Δ = reference − model · Demo lines are illustrative.');note.setProperty('muted',True);note.setFixedHeight(28);note.setContentsMargins(12,0,8,0);note.setStyleSheet('font-size:11px;');table_panel.add_body(note)
+        layout.addWidget(table_panel, 19)
+        mapping_panel = Panel('Pixel → wavelength');mapping_panel.header.setFixedHeight(46)
         mapping_panel.add_tool(QLabel('Mapping & residuals'))
         self.cal_mapping_holder = QWidget()
         self.cal_mapping_holder.setObjectName('calMappingPlot')
@@ -1313,10 +1425,10 @@ class MainWindow(QMainWindow):
         self.cal_residual.bottom_axis.setStyle(showValues=False)
         self.cal_residual.setObjectName('calResidual')
         self._reg('calResidual', self.cal_residual, False)
-        self.cal_residual.setFixedHeight(66)
+        self.cal_residual.setFixedHeight(57)
         holder_layout.addWidget(self.cal_residual)
         mapping_panel.add_body(self.cal_mapping_holder, 1)
-        layout.addWidget(mapping_panel, 1)
+        layout.addWidget(mapping_panel, 21)
         return outer
     def _connect_controller(self):
         self.cal_order.currentIndexChanged.connect(self._invalidate_cal_solution)
@@ -1375,12 +1487,27 @@ class MainWindow(QMainWindow):
         self._toast_timer.start(4200)
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._apply_visual_geometry()
         if hasattr(self, 'startup'):
             self.startup.setGeometry(self.rect())
         if hasattr(self, 'cal_metrics'):
             self.cal_metrics.place()
         if hasattr(self, 'toast') and self.toast.isVisible():
             self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 24))
+    def _apply_visual_geometry(self):
+        width=self.width();left=round(max(272,min(340,width*.2125)))
+        for name in ('acquisition_scroll','analysis_scroll','calibration_scroll'):
+            scroll=getattr(self,name,None)
+            if scroll is not None:scroll.setFixedWidth(260 if name=='acquisition_scroll' and 1000<=width<=1150 else left)
+        summary=round(max(190,min(240,self.height()*.27)))
+        if hasattr(self,'analysis_bottom'):self.analysis_bottom.setFixedHeight(summary)
+        if hasattr(self,'cal_lower'):self.cal_lower.setFixedHeight(summary)
+        if hasattr(self,'map_color_key'):
+            # Right end of the colour key lines up with the right edge of the map image.
+            panel=self.widgets['mapPanel'];self.map_color_key.adjustSize()
+            edge=self.map_plot.viewport().mapToGlobal(QPoint(self.map_plot._view_rect().right()+1,0))
+            right=panel.header.mapFromGlobal(edge).x()
+            self.map_color_key.move(right-self.map_color_key.width(),14)
     def _schedule_refresh(self):
         if not self._map_timer.isActive():
             self._map_timer.start()
@@ -1390,6 +1517,7 @@ class MainWindow(QMainWindow):
         if not isinstance(snapshot, dict):
             return
         self._snapshot = dict(snapshot)
+        self.export_button.setEnabled(bool(self.controller.acquisition.records))
         self._update_from_snapshot()
         self._schedule_refresh()
     def _on_state(self):
@@ -1438,28 +1566,29 @@ class MainWindow(QMainWindow):
             camera_connected = bool((devices.get('camera') or {}).get('connected'))
             connected_count = int(stage_connected) + int(camera_connected)
             mode_label = source_mode.upper()
-            self.hardware_mode.setText(f'{mode_label} · {connected_count}/2 connected ▾')
-            self.stage_connection.setText('● Connected ▾' if stage_connected else '○ Connect…')
-            self.stage_connection.setStyleSheet('background:transparent;border-color:transparent;color:%s;' % ('#00695f' if stage_connected else '#63748a'))
-            detector_text = 'CCD on · Manual ▾' if camera_connected else 'CCD off · Manual ▾'
+            self.hardware_mode.setItemText(0, f'HARDWARE · {connected_count}/2 connected')
+            index = self.hardware_mode.findData(source_mode)
+            if index >= 0 and index != self.hardware_mode.currentIndex():
+                self.hardware_mode.setCurrentIndex(index)
+            self.stage_connection.setText('● Simulated ▾' if source_mode=='simulation' else '● C-663.12 ▾' if stage_connected else '○ Connect…')
+            detector_text = '● Simulated ▾' if source_mode=='simulation' else 'CCD on · Manual ▾' if camera_connected else 'CCD off · Manual ▾'
             self.detector_connection.setText(detector_text)
-            self.detector_connection.setStyleSheet('background:transparent;border-color:transparent;color:%s;' % ('#00695f' if camera_connected else '#63748a'))
             stage = snapshot.get('stage') or {}
             delay = stage.get('delay_ps')
             if delay is None:
                 delay = stage.get('controller_reported_delay_ps')
             if delay is not None and not self.delay_edit.hasFocus():
-                self.delay_edit.setText(f'{float(delay):.6g}')
+                self.delay_edit.setText(f'{float(delay):.3f}')
             moving = bool(stage.get('moving'))
             if moving:
                 self.stage_status.setText('● Moving…')
-                self.stage_status.setStyleSheet('color:#855300;')
+                self.stage_status.setStyleSheet('color:'+palette()['warning']+';')
             elif stage_connected:
-                self.stage_status.setText('● In position')
-                self.stage_status.setStyleSheet('color:#63748a;')
+                self.stage_status.setText('<span style="color:'+palette()['success']+'">●</span> In position')
+                self.stage_status.setStyleSheet('color:'+palette()['muted']+';')
             else:
                 self.stage_status.setText('○ Stage disconnected')
-                self.stage_status.setStyleSheet('color:#63748a;')
+                self.stage_status.setStyleSheet('color:'+palette()['muted']+';')
             camera = snapshot.get('camera') or {}
             exposure = camera.get('exposure_s')
             if exposure is not None and not self.exposure_edit.hasFocus():
@@ -1496,6 +1625,9 @@ class MainWindow(QMainWindow):
             self.center_edit.setEnabled(spectrograph_ready and (not controls or 'center_nm' in controls) and busy in (None, 'preview'))
             self.grating_combo.setEnabled(spectrograph_ready and (not controls or 'grating' in controls) and busy in (None, 'preview'))
             self.slit_edit.setEnabled(spectrograph_ready and (not controls or 'slit_um' in controls) and busy in (None, 'preview'))
+            locked_tip = '' if spectrograph_ready else 'Select a spectrometer from the Detection menu to edit'
+            for control in (self.center_edit, self.grating_combo, self.slit_edit):
+                control.setToolTip('' if control.isEnabled() else (locked_tip or 'Locked while the devices are busy'))
             self.preview_button.setEnabled(bool(getattr(self.controller, 'online', False) and availability.get('preview') and busy not in ('scan', 'move', 'calibration')))
             if busy == 'preview':
                 self.preview_button.setEnabled(True)
@@ -1528,35 +1660,35 @@ class MainWindow(QMainWindow):
         if busy == 'scan':
             if status in ('paused', 'pausing'):
                 self.run_status.setText('● Paused')
-                self.run_button.setText('▶ Resume')
+                self._set_run_button('play', 'Resume')
             elif status in ('stopping', 'finalizing'):
                 self.run_status.setText('● Stopping')
-                self.run_button.setText('▶ Start')
+                self._set_run_button('play', 'Start')
             else:
                 self.run_status.setText('● Scanning')
-                self.run_button.setText('❚❚ Pause')
+                self._set_run_button('pause', 'Pause')
         elif busy == 'preview':
             self.run_status.setText('● Live preview')
-            self.run_button.setText('▶ Start')
+            self._set_run_button('play', 'Start')
         elif busy == 'calibration':
             self.run_status.setText('● Calibration')
-            self.run_button.setText('▶ Start')
+            self._set_run_button('play', 'Start')
         elif busy == 'moving':
             self.run_status.setText('● Moving')
-            self.run_button.setText('▶ Start')
+            self._set_run_button('play', 'Start')
         elif busy:
             self.run_status.setText(f'● {str(busy).capitalize()}')
-            self.run_button.setText('▶ Start')
+            self._set_run_button('play', 'Start')
         else:
-            self.run_status.setText('● Ready' if online else '● Starting…')
-            self.run_button.setText('▶ Start')
+            self.run_status.setText(status.capitalize() if status else 'Ready' if online else 'Starting…')
+            self._set_run_button('play', 'Start')
         if total and completed is not None:
             total_value = int(total)
             completed_value = int(completed)
             percent = int(round(100.0 * completed_value / total_value)) if total_value else 0
             self.progress_fill.setValue(max(0, min(100, percent)))
-            self.progress_text.setText(f'{status.capitalize() if status else "Acquisition"} · {completed_value}/{total_value}')
-            self.remaining.setText(f'{max(0, total_value - completed_value)} points')
+            self.progress_text.setText(f'{completed_value} / {total_value} points · {run.get("committed_frames",0)} frames')
+            self.remaining.setText(str(run.get('step') if busy=='scan' else status))
         else:
             self.progress_fill.setValue(0)
             if busy == 'preview':
@@ -1566,7 +1698,7 @@ class MainWindow(QMainWindow):
             elif busy:
                 self.progress_text.setText(str(busy).capitalize())
             else:
-                self.progress_text.setText('Ready to start')
+                self.progress_text.setText('Ready to start') if not getattr(self,'_plan_display_key',None) else None
             if online:
                 self._update_point_estimate()
             else:
@@ -1580,9 +1712,11 @@ class MainWindow(QMainWindow):
         set_prop(self.progress_fill, 'locked', locked)
         self.run_button.setEnabled(can_start)
         self.stop_button.setEnabled(bool(online and busy))
+        self._refresh_run_icons()
         if not online:
             self.run_status.setText('● Starting…')
     def _update_point_estimate(self):
+        self._mark_segment_rows()
         try:
             values = []
             for row in self._segment_rows:
@@ -1597,6 +1731,24 @@ class MainWindow(QMainWindow):
             unique = len(set(values))
             repeats = int(self.repeats_input.value()) if self._mode == 'repeat' else 1
             self.remaining.setText(f'{unique * repeats} points')
+            if hasattr(self,'save_path') and self.controller.online:
+                request=self.collect_run_request();identity=dict(request);identity.pop('request_id',None)
+                key=(self._selected_source,json.dumps(identity,sort_keys=True))
+                if key!=getattr(self,'_plan_display_key',None):
+                    self._plan_display_key=key
+                    def planned(plan):
+                        if key!=self._plan_display_key or self.controller.acquisition.run:return
+                        if not plan.get('delays_ps'):return
+                        self._last_plan=plan
+                        self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scans")
+                        duration="Estimated "+format_duration(plan['estimated_seconds'])
+                        self.remaining.setText(duration+f" / ×{request['speedup']:g} simulation" if self._selected_source=='simulation' else duration)
+                    self.controller.dispatch('plan',request,success=planned,failure=lambda error:None)
+                elif hasattr(self,'_last_plan'):
+                    plan=self._last_plan
+                    self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scans")
+                    duration="Estimated "+format_duration(plan['estimated_seconds'])
+                    self.remaining.setText(duration+f" / ×{request['speedup']:g} simulation" if self._selected_source=='simulation' else duration)
         except Exception:
             self.remaining.setText('- points')
     def _flush_labels(self):
@@ -1608,6 +1760,7 @@ class MainWindow(QMainWindow):
             if getattr(self,'_analysis_dirty',True):
                 self._redraw_analysis();self._analysis_dirty=False
         self._update_output_status()
+        self._apply_visual_geometry()
     def _flush_map(self):
         if self._current_page != 'acquisition':
             return
@@ -1623,22 +1776,25 @@ class MainWindow(QMainWindow):
             if cached is None or cached[0]!=group.count:
                 self._map_spectra_cache[delay]=(group.count,group.raw)
         spectra={delay:entry[1] for delay,entry in self._map_spectra_cache.items()}
-        planned=(dataset.run or {}).get('plan',{}).get('delays_ps',[])
-        vmin, vmax = self.map_plot.set_map(dataset.axis, spectra, scale, planned)
-        self.color_min.setText(_format_map_value(vmin))
-        self.color_max.setText(_format_map_value(vmax))
+        saturated={delay:group.saturated for delay,group in dataset.groups.items() if group.saturated.any()}
+        planned=(dataset.run or {}).get('plan',{}).get('delays_ps',[-2,20])
+        vmin, vmax = self.map_plot.set_map(dataset.axis, spectra, scale, planned, saturated, self._map_levels)
+        self.map_saturated_key.setVisible(bool(saturated))
+        self.color_min.set_value_text(_format_map_value(vmin))
+        self.color_max.set_value_text(_format_map_value(vmax))
+        self._apply_visual_geometry()  # key width follows the value texts; keep its right edge on the map edge
         if self._selected_delay is None and dataset.delays:
             self._selected_delay = dataset.delays[0]
         delays, intensities = self._raw_decay_points(dataset)
         self.decay_plot.set_decay(delays, intensities, 'linear')
-        self.map_plot.set_marker(self._selected_delay, dataset.wave)
+        self.map_plot.set_marker(self._selected_delay, dataset.wave if dataset.records else None, show_delay=self._picked_spectrum_active())
         self.decay_plot.set_marker(self._selected_delay)
         self._map_key = key
         self._map_dirty = False
     def _update_live_spectrum(self):
         dataset = self.controller.acquisition
         snapshot = self._snapshot or {}
-        latest = snapshot.get('latest') if snapshot.get('busy')=='preview' else dataset.latest_record
+        latest = snapshot.get('latest') or dataset.latest_record
         current = None
         saturated = 0
         if latest is not None:
@@ -1649,18 +1805,29 @@ class MainWindow(QMainWindow):
             if snapshot_latest.get('spectrum'):
                 current = np.asarray(snapshot_latest.get('spectrum'), dtype=float)
             saturated = int(snapshot_latest.get('saturated_pixels') or 0)
+        picked = self._picked_spectrum_active()
+        if picked:
+            current = np.asarray(dataset.groups[self._picked_delay].raw, dtype=float)
+            saturated = int(np.count_nonzero(dataset.groups[self._picked_delay].saturated))
+        legend_text = f'Δt = {fmt(self._picked_delay, 4)} ps' if picked else 'Current'
+        if self._spectrum_legend_current.text() != legend_text:
+            self._spectrum_legend_current.setText(legend_text)
         axis = dataset.axis or snapshot.get('live_axis')
-        if axis and len(axis) and current is not None and len(current):
-            x = np.asarray(axis[:len(current)], dtype=float)
+        if axis and len(axis):
+            x = np.asarray(axis[:len(current)] if current is not None else axis, dtype=float)
             x_label = 'Wavelength / nm'
         else:
             x = np.arange(0, len(current) if current is not None else 1024, dtype=float)
-            x_label = 'CCD pixel'
+            x_label = 'Pixel'
         background = snapshot.get('background') or {}
         bg = background.get('spectrum')
         bg_array = np.asarray(bg, dtype=float) if bg else None
         self.spectrum_plot.set_spectrum(x, current, bg_array, x_label, self.spectrum_scale.current())
-        self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(axis))
+        self.spectrum_plot.set_axis_bounds('x',float(np.min(x)),float(np.max(x)))
+        full_scale=float(snapshot.get('camera',{}).get('full_scale',65535));logarithmic=self.spectrum_scale.current()=='log'
+        self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else full_scale*1.05)
+        self.spectrum_plot.set_y_label('CCD / counts')  # log axes label decades in counts
+        self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(axis) and current is not None)
         if saturated > 0:
             self.saturation.setText(f'⚠ {saturated} saturated pixels')
             self.saturation.show()
@@ -1690,11 +1857,22 @@ class MainWindow(QMainWindow):
                 intensities.append(float(np.mean(values)))
             delays.append(float(delay))
         return delays, intensities
+    def _picked_spectrum_active(self):
+        # After a scan (or while idle) a delay picked on the map / decay replaces the live trace.
+        busy = (self._snapshot or {}).get('busy')
+        dataset = self.controller.acquisition
+        return self._picked_delay is not None and busy not in ('scan', 'preview') and dataset.groups.get(self._picked_delay) is not None
     def _map_delay_picked(self, delay):
         self._selected_delay = float(delay)
         dataset = self.controller.acquisition
-        self.map_plot.set_marker(self._selected_delay, dataset.wave)
+        if dataset.delays:
+            self._selected_delay = min(dataset.delays, key=lambda value: abs(value - float(delay)))
+            self._picked_delay = self._selected_delay
+        active = self._picked_spectrum_active()
+        self.map_plot.set_marker(self._selected_delay, dataset.wave, show_delay=active)
         self.decay_plot.set_marker(self._selected_delay)
+        if active:
+            self._update_live_spectrum()
         if self._current_page == 'analysis':
             self.analysis_delay.setCurrentIndex(self.analysis_delay.findData(self._selected_delay))
     def _map_wave_picked(self, wave):
@@ -1702,6 +1880,31 @@ class MainWindow(QMainWindow):
         dataset.wave = float(wave)
         self.map_plot.set_marker(self._selected_delay, dataset.wave)
         self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(dataset.axis or self._snapshot.get('live_axis')))
+        self._map_dirty = True
+        self._schedule_refresh()
+    def _color_range_edited(self, end, text):
+        edit = self.color_max if end else self.color_min
+        try:
+            value = parse_count(text)
+        except ValueError:
+            edit.reject(); return
+        levels = list(self._map_levels or (None, None))
+        levels[end] = value
+        auto = self.map_plot.auto_levels()
+        low = levels[0] if levels[0] is not None else auto[0]
+        high = levels[1] if levels[1] is not None else auto[1]
+        if self.map_scale.current() == 'log':
+            low = max(low, 1.0)
+        if not high > low:
+            edit.reject(); return
+        self._map_levels = None if levels == [None, None] else tuple(levels)
+        edit.accept()
+        self.map_levels_auto.setVisible(self._map_levels is not None)
+        self._map_dirty = True
+        self._schedule_refresh()
+    def _color_range_auto(self):
+        self._map_levels = None
+        self.map_levels_auto.hide()
         self._map_dirty = True
         self._schedule_refresh()
     def _scale_changed(self, value):
@@ -1719,14 +1922,14 @@ class MainWindow(QMainWindow):
             path = run.get('path') or run.get('run_id') or 'Imported experiment'
             self.analysis_source.setText(f'Imported · {path}')
         elif run:
-            self.analysis_source.setText(f'Current acquisition · {run.get("run_id", "")}')
+            self.analysis_source.setText(Path(run.get('path') or 'Current experiment').name)
         else:
             self.analysis_source.setText('No experiment loaded')
         delays = dataset.delays if dataset is not None else []
         records = len(dataset.records) if dataset is not None else 0
         repeat = records / len(delays) if delays else 0
         self.analysis_points.setText(f'{len(delays)} delays')
-        self.analysis_frames.setText(f'{repeat:.2f} repeat times' if repeat and abs(repeat - round(repeat)) > 1e-9 else f'{int(round(repeat))} repeat times')
+        self.analysis_frames.setText(f'{repeat:.2f} repeats' if repeat and abs(repeat - round(repeat)) > 1e-9 else f'{int(round(repeat))} repeat' + ('' if int(round(repeat)) == 1 else 's'))
         if dataset is not None:
             if not self.analysis_wave.hasFocus():
                 self.analysis_wave.setText(f'{dataset.wave:g}')
@@ -1734,7 +1937,7 @@ class MainWindow(QMainWindow):
                 self.analysis_window.setText(f'{dataset.half_window:g}')
         fit = dataset.fit if dataset is not None else None
         if fit is not None:
-            self.analysis_fit_state.setText('Fitted')
+            self.analysis_fit_state.setText('● Viewing spectra' if self.analysis_view.currentData()=='spectrum' else '● Fitted')
             set_prop(self.analysis_fit_state, 'data-state', 'success')
         elif self._fit_running:
             self.analysis_fit_state.setText('Fitting')
@@ -1747,7 +1950,7 @@ class MainWindow(QMainWindow):
             set_prop(self.analysis_fit_state, 'data-state', 'neutral')
         ready = bool(dataset is not None and run is not None and dataset.records and dataset.axis)
         self.run_fit_button.setEnabled(bool(self.controller.online and ready and not self._fit_running and (imported is not None or not self._snapshot.get('busy'))))
-        self.export_fit.setEnabled(fit is not None)
+        self.export_fit.setEnabled(fit is not None and self.analysis_view.currentData()!='spectrum')
         self.save_run.setEnabled(bool(imported is None and run is not None and not run.get('saved')))
         self._refresh_analysis_delay_combo(delays)
         self._refresh_spectrum_legend()
@@ -1759,7 +1962,7 @@ class MainWindow(QMainWindow):
         self.analysis_delay.blockSignals(True)
         self.analysis_delay.clear()
         for delay in delays:
-            self.analysis_delay.addItem(f'{delay:g}', float(delay))
+            self.analysis_delay.addItem(f'{delay:g} ps', float(delay))
         if current is not None:
             index = self.analysis_delay.findData(float(current))
             if index >= 0:
@@ -1781,7 +1984,7 @@ class MainWindow(QMainWindow):
             self.analysis_residual_wrap.show()
             self.analysis_legend.show()
             self.analysis_time_key.hide()
-        self._redraw_analysis()
+        self._update_analysis_labels();self._redraw_analysis()
     def _add_spectrum_overlay(self):
         value = self.analysis_delay.currentData()
         if value is None:
@@ -1795,24 +1998,30 @@ class MainWindow(QMainWindow):
         self._refresh_spectrum_legend()
         self._redraw_analysis()
     def _refresh_spectrum_legend(self):
+        dataset=self.controller.analysis_context
+        key=(id(dataset),tuple(self._spectrum_overlays),len(dataset.records) if dataset else 0,self.analysis_view.currentData(),current_mode())
+        if key==getattr(self,'_spectrum_legend_key',None):return
+        self._spectrum_legend_key=key
         while self.analysis_spectrum_legend.layout().count():
             item = self.analysis_spectrum_legend.layout().takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.deleteLater()
+                widget.hide();widget.deleteLater()
         dataset = self.controller.analysis_context
         delays = dataset.delays if dataset is not None else []
         self._spectrum_overlays = [delay for delay in self._spectrum_overlays if delay in delays]
-        for delay in self._spectrum_overlays:
-            button = QPushButton(f'{delay:g} ps  ×')
+        for delay in sorted(self._spectrum_overlays):
+            group=dataset.groups.get(delay)
+            count=len(group.records) if hasattr(group,'records') else len([r for r in dataset.records if float(r.get('delay_ps',0))==delay])
+            button = QPushButton(f'━  {delay:g} ps · {count} frames  ×');button.setFixedHeight(30)
             button.setProperty('small', True)
             color = map_color(_delay_fraction(delay, delays))
-            button.setStyleSheet(f'color:{color.name()};')
+            button.setStyleSheet(f'font:11px Consolas;color:{palette()["text"]};')
             button.clicked.connect(lambda checked=False, value=delay: self._remove_spectrum_overlay(value))
             self.analysis_spectrum_legend.layout().addWidget(button)
         self.analysis_spectrum_legend.layout().addStretch(1)
         self.analysis_spectrum_legend.setVisible(bool(self._spectrum_overlays) and self.analysis_view.currentData() == 'spectrum')
-        self.analysis_spectrum_status.setText(f'{len(self._spectrum_overlays)} overlaid delay(s)' if self._spectrum_overlays else 'No overlays')
+        self.analysis_spectrum_status.setText(f'{len(self._spectrum_overlays)} overlays · {len(delays)} acquired delays' if self._spectrum_overlays else 'No overlays')
     def _remove_spectrum_overlay(self, value):
         self._spectrum_overlays = [delay for delay in self._spectrum_overlays if delay != value]
         self._refresh_spectrum_legend()
@@ -1840,17 +2049,17 @@ class MainWindow(QMainWindow):
                     x_label = 'CCD pixel'
                 color = map_color(_delay_fraction(delay, delays))
                 curves.append((x, values, color, False, 1.7))
-            self.analysis_plot_title.setText('Spectrum')
+            self.analysis_fit_state.setText('● Viewing spectra');self.analysis_plot_title.setText('Spectrum')
             self.analysis_window_label.setText(f'{len(self._spectrum_overlays)} delay(s)')
             self.analysis_curve.set_spectra(curves, x_label if self._spectrum_overlays else 'Wavelength / nm', scale)
             self.analysis_residual.set_points([])
             if delays:
-                self.analysis_time_min.setText(f'{min(delays):g} ps')
-                self.analysis_time_max.setText(f'{max(delays):g} ps')
-            self.analysis_spectrum_status.setText(f'{len(self._spectrum_overlays)} overlaid delay(s)' if self._spectrum_overlays else 'Choose a delay and press Overlay')
+                self.analysis_time_min.setText(f'{min(delays):g}')
+                self.analysis_time_max.setText(f'{max(delays):g}')
+            self.analysis_spectrum_status.setText(f'{len(self._spectrum_overlays)} overlays · {len(delays)} acquired delays' if self._spectrum_overlays else 'Choose a delay and press Overlay');self.analysis_add_delay.setEnabled(self.analysis_delay.currentData() not in self._spectrum_overlays)
             return
-        observed = dataset.observed()
         fit = dataset.fit
+        observed = list(zip(fit['delays_ps'],fit['observed'])) if fit else dataset.observed()
         fit_points = self._fit_curve_points(fit)
         self.analysis_plot_title.setText('Decay & fit')
         self.analysis_window_label.setText(f'{dataset.wave:g} ± {dataset.half_window:g} nm')
@@ -1861,6 +2070,8 @@ class MainWindow(QMainWindow):
         if observed:
             self.analysis_curve.set_marker(observed[0][0])
             self.analysis_residual.set_marker(observed[0][0])
+            if not getattr(self,'_analysis_point_selected',False):
+                self.analysis_curve.marker.hide();self.analysis_curve.point.hide();self.analysis_residual.marker.hide()
     def _analysis_selection_changed(self):
         dataset = self.controller.analysis_context
         if dataset is None:
@@ -1881,6 +2092,7 @@ class MainWindow(QMainWindow):
         self._fit_running=False
         self._update_analysis_labels();self._redraw_analysis()
     def _analysis_delay_picked(self, delay):
+        self._analysis_point_selected=True
         dataset = self.controller.analysis_context
         observed = dataset.observed() if dataset is not None else []
         if not observed:
@@ -1941,30 +2153,10 @@ class MainWindow(QMainWindow):
                 output.append((float(delay), float(intensity) - model))
             return output
         return []
-    def _fit_parameters(self, fit):
-        if not isinstance(fit, dict):
-            return []
-        result = []
-        parameters = fit.get('parameters')
-        if isinstance(parameters, list):
-            for item in parameters:
-                if isinstance(item, dict):
-                    result.append((str(item.get('name') or item.get('parameter') or 'parameter'), item.get('value'), item.get('std_error', item.get('stderr')), item.get('unit', '')))
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    result.append((str(item[0]), item[1], item[2] if len(item) > 2 else None, item[3] if len(item) > 3 else ''))
-        elif isinstance(parameters, dict):
-            for name, item in parameters.items():
-                if isinstance(item, dict):
-                    result.append((str(name), item.get('value'), item.get('std_error', item.get('stderr')), item.get('unit', '')))
-                else:
-                    units='ps' if name.endswith('_ps') else 'counts/s'
-                    result.append((str(name), item,fit.get('standard_errors',{}).get(name),units))
-        if not result:
-            lifetimes = fit.get('lifetimes_ps')
-            if isinstance(lifetimes, list):
-                for index, value in enumerate(lifetimes):
-                    result.append((f'tau{index + 1}', value, None, 'ps'))
-        return result
+    def _fit_parameters(self,fit):
+        if not isinstance(fit,dict):return []
+        names={'tau_ps':('τ','ps'),'tau_1_ps':('τ₁','ps'),'tau_2_ps':('τ₂','ps'),'amplitude':('Amplitude','counts/s'),'amplitude_1':('Amplitude 1','counts/s'),'amplitude_2':('Amplitude 2','counts/s'),'t0_ps':('t₀','ps'),'offset_counts_s':('Offset','counts/s')}
+        return [(label,fit['parameters'][key],fit.get('standard_errors',{}).get(key),unit) for key,(label,unit) in names.items() if key in fit.get('parameters',{})]
     def _update_fit_panel(self, fit, observed):
         self.fit_table.clearSpans()
         self.fit_table.setRowCount(0)
@@ -1972,7 +2164,7 @@ class MainWindow(QMainWindow):
         if not parameters:
             self.fit_table.setRowCount(1)
             item = QTableWidgetItem('Run a fit to inspect lifetimes and parameter uncertainty.')
-            item.setForeground(Qt.gray)
+            item.setForeground(Qt.gray);item.setTextAlignment(Qt.AlignCenter)
             self.fit_table.setItem(0, 0, item)
             self.fit_table.setSpan(0, 0, 1, 4)
             self.fit_sample_count.setText('No fit result')
@@ -1983,10 +2175,9 @@ class MainWindow(QMainWindow):
         self.fit_table.setRowCount(len(parameters))
         for row, parameter in enumerate(parameters):
             name, value, error, unit = parameter
-            self.fit_table.setItem(row, 0, QTableWidgetItem(str(name)))
-            self.fit_table.setItem(row, 1, QTableWidgetItem(fmt(value, 6)))
-            self.fit_table.setItem(row, 2, QTableWidgetItem(fmt(error, 6)))
-            self.fit_table.setItem(row, 3, QTableWidgetItem(str(unit or '')))
+            for column, text in enumerate((str(name), fmt(value, 6), fmt(error, 6), str(unit or ''))):
+                cell = QTableWidgetItem(text); cell.setTextAlignment(Qt.AlignCenter)
+                self.fit_table.setItem(row, column, cell)
         samples = len(fit.get('delays_ps') or [])
         rmse = fit.get('rmse', fit.get('rmse_counts_s')) if isinstance(fit, dict) else None
         if rmse is None and fit.get('residuals'):
@@ -2079,16 +2270,24 @@ class MainWindow(QMainWindow):
             self.show_toast(str(error))
     def _open_stage_dialog(self):
         dialog = DeviceDialog(self.controller, 'stage', self._snapshot, self)
+        apply_pointer_cursors(dialog)
         dialog.exec()
         self.controller.request_status()
     def _open_detector_dialog(self):
         dialog = DetectorDialog(self.controller, self._snapshot, self)
+        apply_pointer_cursors(dialog)
         dialog.exec()
         self.controller.request_status()
-    def _choose_source(self):
-        value, ok = QInputDialog.getItem(self, 'Acquisition source', 'Source', ['hardware', 'simulation'], 0, False)
-        if ok and value:
+    def _choose_source(self, value):
+        current = str((self._snapshot or {}).get('source_mode') or 'hardware')
+        if value and value != current:
             self.select_mode(value)
+    def _sync_sample_name(self, text=None):
+        name = (self.save_path.text() if text is None else text).strip()
+        for suffix in ('.h5', '.hdf5'):
+            if name.lower().endswith(suffix):
+                name = name[:-len(suffix)]
+        self.sample_name.setText(name or DEFAULT_SAMPLE_NAME)
     def select_mode(self, mode):
         mode = str(mode)
         if mode in ('hardware', 'simulation'):
@@ -2103,35 +2302,68 @@ class MainWindow(QMainWindow):
         self.scan_params.setVisible(mode != 'single')
         self.repeat_wrap.setVisible(mode == 'repeat')
         self._update_point_estimate()
-    def _add_segment_row(self, start='0.0', end='1.0', step='0.1'):
-        row = QWidget()
-        layout = QGridLayout(row)
+    _SEGMENT_REMOVE_WIDTH = 32
+    def _segment_cells(self, host, cells, trailing, dividers):
+        # Shared column geometry for the Start / End / Step header and every joined segment row:
+        # three equal cells, a 1 px divider before each following cell, then the fixed remove column.
+        layout = QHBoxLayout(host)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setHorizontalSpacing(0)
-        layout.setVerticalSpacing(0)
+        layout.setSpacing(0)
+        for index, cell in enumerate(list(cells) + [trailing]):
+            if index:
+                divider = QFrame() if dividers else QWidget()
+                divider.setFixedSize(1, 16)
+                if dividers:
+                    divider.setObjectName('segmentDivider')
+                layout.addWidget(divider, 0, Qt.AlignVCenter)
+            layout.addWidget(cell, 0 if cell is trailing else 1)
+        return layout
+    def _add_segment_row(self, start='0.0', end='1.0', step='0.1'):
+        row = QFrame()
+        row.setObjectName('segmentRow')
+        row.setFixedHeight(30)
         start_edit = number_edit(start)
         end_edit = number_edit(end)
         step_edit = number_edit(step)
-        for edit in (start_edit, end_edit, step_edit):
+        for edit, name in ((start_edit, 'Start'), (end_edit, 'End'), (step_edit, 'Step')):
             edit.setFixedHeight(30)
+            edit.setMinimumWidth(0)
+            edit.setAccessibleName(f'Segment {name.lower()} / ps')
             edit.textChanged.connect(lambda text: self._update_point_estimate())
         remove = QPushButton('×')
-        remove.setFixedSize(29, 30)
+        remove.setObjectName('segmentRemove')
+        remove.setToolTip('Remove segment')
+        remove.setCursor(Qt.PointingHandCursor)
+        remove.setFixedSize(self._SEGMENT_REMOVE_WIDTH, 30)
         record = {'widget': row, 'start': start_edit, 'end': end_edit, 'step': step_edit, 'remove': remove}
         remove.clicked.connect(lambda checked=False, item=record: self._remove_segment_row(item))
-        layout.addWidget(start_edit, 0, 0)
-        layout.addWidget(end_edit, 0, 1)
-        layout.addWidget(step_edit, 0, 2)
-        layout.addWidget(remove, 0, 3)
-        self.segments_layout.insertWidget(max(0, self.segments_layout.count() - 1), row)
+        self._segment_cells(row, (start_edit, end_edit, step_edit), remove, True)
+        self.segments_layout.addWidget(row)
         self._segment_rows.append(record)
         self._update_point_estimate()
+        return record
     def _remove_segment_row(self, record):
-        if record in self._segment_rows:
+        if record in self._segment_rows and len(self._segment_rows) > 1:
             self._segment_rows.remove(record)
             record['widget'].setParent(None)
             record['widget'].deleteLater()
         self._update_point_estimate()
+    def _mark_segment_rows(self):
+        # Tint rows that would be rejected instead of only reporting the first problem in text.
+        for row in self._segment_rows:
+            start, end, step = number_value(row['start']), number_value(row['end']), number_value(row['step'])
+            if start is None or end is None or step is None:
+                problem = 'Enter start, end and step'
+            elif step <= 0:
+                problem = 'Step must be positive'
+            elif end < start:
+                problem = 'End must not be before start'
+            else:
+                problem = ''
+            if bool(row['widget'].property('invalid')) != bool(problem):
+                set_prop(row['widget'], 'invalid', bool(problem))
+            row['widget'].setToolTip(problem)
+            row['remove'].setEnabled(len(self._segment_rows) > 1)
     def _segments(self):
         output = []
         for row in self._segment_rows:
@@ -2177,8 +2409,8 @@ class MainWindow(QMainWindow):
             'frames_per_point': 1,
             'exposure_s': float(exposure),
             'settle_s': 0.05,
-            'seed': 12345,
-            'speedup': 20.0,
+            'seed': 42,
+            'speedup': 50.0,
             'fault': {'kind': 'none', 'point_index': 0},
             'autosave': bool(self.autosave.isChecked()),
             'save_path': path,
@@ -2241,6 +2473,7 @@ class MainWindow(QMainWindow):
         self.validation.setText('')
         self.save_status.setText('Saving acquisition…')
         self._selected_delay = None
+        self._picked_delay = None
         self._map_dirty = True
         self._schedule_refresh()
     def _run_failed(self, payload):
@@ -2317,7 +2550,7 @@ class MainWindow(QMainWindow):
         elif run:
             self.save_status.setText('Memory-only · not saved to disk')
         else:
-            self.save_status.setText('Not saved to disk')
+            self.save_status.setText('No experiment saved')
     def export_current_csv(self):
         run = self.controller.acquisition.run
         if not run:
@@ -2395,7 +2628,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self._pages[name])
         for key, button in self.nav_buttons.items():
             set_prop(button, 'active', key == name)
-        self.footer.setVisible(name == 'acquisition')
+        self.footer_host.setVisible(name == 'acquisition')
         self._update_header(self._snapshot or {})
         if name == 'analysis':
             self._update_analysis_labels()
@@ -2406,6 +2639,7 @@ class MainWindow(QMainWindow):
     def _toggle_theme(self):
         mode = 'dark' if current_mode() == 'light' else 'light'
         apply_to_app(mode)
+        self._refresh_run_icons()
         for plot in (self.spectrum_plot, self.map_plot, self.decay_plot, self.analysis_curve, self.analysis_residual, self.cal_image, self.cal_spectrum, self.cal_mapping, self.cal_residual):
             plot.update_theme()
         self._map_dirty = True
@@ -2507,11 +2741,12 @@ class MainWindow(QMainWindow):
             self.cal_row_end.setValue(end)
         self.cal_row_start.blockSignals(False)
         self.cal_row_end.blockSignals(False)
-        self.cal_image.set_frame(array)
+        self.cal_image.set_frame(array, float(frame.get('full_scale') or 65535))
+        self.cal_image.reset_view()  # a new frame always opens in full view (Backspace restores the old zoom)
         self.cal_image.set_roi(self.cal_row_start.value(), self.cal_row_end.value())
         source = frame.get('source') or frame.get('source_mode') or 'unknown'
         measured = str(source).lower() == 'measured'
-        self.cal_frame_state.setText(('Measured frame' if measured else 'Synthetic frame') + f' · {array.shape[1]}×{array.shape[0]}')
+        self.cal_frame_state.setText('● '+('Measured frame' if measured else 'Simulated frame')+' 1')
         self.cal_source.setText(str(frame.get('source_mode') or 'HARDWARE').upper())
         self.cal_roi_label.hide()
         self.cal_feedback.setText('Frame acquired. Extracting spectrum…')
@@ -2630,7 +2865,7 @@ class MainWindow(QMainWindow):
             self.cal_nm_axis.setEnabled(True)
         warnings = solution.get('warnings') or []
         self.cal_feedback.setText('; '.join(str(item) for item in warnings) if warnings else 'Calibration mapping fitted')
-        self.cal_metrics.set_values(fmt(solution.get('rms_nm'), 4) + ' nm', fmt(solution.get('max_error_nm'), 4) + ' nm', _range_text(solution.get('wavelength_range_nm')))
+        self.cal_metrics.set_values(_metric(solution.get('rms_nm')) + ' nm', _metric(solution.get('max_error_nm')) + ' nm', _range_text(solution.get('wavelength_range_nm')))
         self._update_deltas()
         self._update_cal_plots()
         self._update_cal_controls()
@@ -2759,7 +2994,7 @@ class MainWindow(QMainWindow):
         wavelengths = [490+.24*p+.00002*p*p for p in (115.23,282.65,449.38,655.14,851.72)]
         self._cal_solution=None
         self.cal_fit_state.setText('Draft')
-        self._cal_lines = [{'enabled': True, 'pixel': None, 'wavelength_nm': value} for value in wavelengths]
+        self._cal_lines = [{'enabled':True,'pixel':round(p+offset,3),'wavelength_nm':round(value,3)} for p,offset,value in zip((115.23,282.65,449.38,655.14,851.72),(.07,-.11,.09,-.05,.08),wavelengths)]
         self._reference_source = 'synthetic'
         self._reference_imported = False
         self._reference_name = 'Illustrative demo lines'
@@ -2841,14 +3076,14 @@ class MainWindow(QMainWindow):
             check.toggled.connect(lambda checked, item=line: self._line_enabled_changed(item, checked))
             pixel = QDoubleSpinBox()
             pixel.setRange(-1.0, 1023.0)
-            pixel.setDecimals(2)
+            pixel.setDecimals(3);pixel.setButtonSymbols(QDoubleSpinBox.NoButtons);pixel.setAlignment(Qt.AlignCenter);pixel.setFixedHeight(28)
             pixel.setSingleStep(0.01)
             pixel.setSpecialValueText('-')
             pixel.setValue(float(line.get('pixel')) if line.get('pixel') is not None else -1.0)
             pixel.valueChanged.connect(lambda value, item=line: self._line_pixel_changed(item, value))
             wavelength = QDoubleSpinBox()
             wavelength.setRange(0.001, 1000000.0)
-            wavelength.setDecimals(4)
+            wavelength.setDecimals(3);wavelength.setButtonSymbols(QDoubleSpinBox.NoButtons);wavelength.setAlignment(Qt.AlignCenter);wavelength.setFixedHeight(28)
             wavelength.setSingleStep(0.1)
             wavelength.setValue(float(line.get('wavelength_nm') or 0.001))
             wavelength.valueChanged.connect(lambda value, item=line: self._line_wavelength_changed(item, value))
@@ -2859,7 +3094,7 @@ class MainWindow(QMainWindow):
             self.cal_table.setCellWidget(row, 0, check_container)
             self.cal_table.setCellWidget(row, 1, pixel)
             self.cal_table.setCellWidget(row, 2, wavelength)
-            self.cal_table.setItem(row, 3, delta)
+            delta.setTextAlignment(Qt.AlignCenter);self.cal_table.setItem(row, 3, delta)
             self.cal_table.setCellWidget(row, 4, remove)
             self._cal_row_widgets.append({'check': check, 'pixel': pixel, 'wavelength': wavelength, 'delta': delta, 'line': line})
         self.cal_table.blockSignals(False)
@@ -2948,7 +3183,7 @@ class MainWindow(QMainWindow):
         self.cal_mapping.set_data(self._cal_lines, solution)
         self.cal_residual.set_data(self._cal_lines, solution)
         if solution:
-            self.cal_metrics.set_values(fmt(solution.get('rms_nm'), 4) + ' nm', fmt(solution.get('max_error_nm'), 4) + ' nm', _range_text(solution.get('wavelength_range_nm')))
+            self.cal_metrics.set_values(_metric(solution.get('rms_nm')) + ' nm', _metric(solution.get('max_error_nm')) + ' nm', _range_text(solution.get('wavelength_range_nm')))
             self.cal_metrics.place()
         else:
             self.cal_metrics.set_values('-', '-', '-')
@@ -3004,7 +3239,7 @@ class MainWindow(QMainWindow):
         elif frozen:
             self.cal_connection_note.setText('Calibration controls are frozen while an acquisition is active. Stop remains available.')
         else:
-            self.cal_connection_note.setText('Full image mode supports ROI extraction; FVB captures one row.')
+            self.cal_connection_note.setText('Backend simulated frame' if snapshot.get('source_mode')=='simulation' else 'CCD connected · SDK2 acquisition')
     def _update_calibration_state(self):
         snapshot = self._snapshot or {}
         calibration = snapshot.get('calibration') or {}
@@ -3122,3 +3357,6 @@ def _delay_fraction(delay, delays):
 
 def available_background(busy):
     return busy in (None, 'background')
+
+def _metric(value):
+    return f"{float(value):.4f}".rstrip("0").rstrip(".") if value is not None else "—"

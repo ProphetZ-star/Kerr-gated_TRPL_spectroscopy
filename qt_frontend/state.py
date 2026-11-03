@@ -1,10 +1,13 @@
 '''Plain Python acquisition datasets and grouped spectra.'''
 import numpy as np
 
+FULL_SCALE=65535.0
+
 class SpectrumGroup:
-    __slots__=('delay','raw_sum','norm_sum','count')
+    __slots__=('delay','raw_sum','norm_sum','count','saturated')
     def __init__(self,delay,size):
         self.delay=float(delay); self.raw_sum=np.zeros(size,dtype=float); self.norm_sum=np.zeros(size,dtype=float); self.count=0
+        self.saturated=np.zeros(size,dtype=bool)  # pixels that hit full scale in any frame of this delay
     @property
     def raw(self):
         return self.raw_sum/max(1,self.count)
@@ -14,8 +17,9 @@ class SpectrumGroup:
     @property
     def size(self):
         return int(self.raw_sum.size)
-    def add(self,spectrum,exposure):
+    def add(self,spectrum,exposure,full_scale=FULL_SCALE):
         self.raw_sum+=spectrum; self.norm_sum+=spectrum/exposure; self.count+=1
+        self.saturated|=spectrum>=full_scale
 
 class Dataset:
     def __init__(self,run=None,records=None,fit=None,wave=600.0,half_window=5.0):
@@ -59,6 +63,13 @@ class Dataset:
             return [float(v) for v in axis]
         return None
     @property
+    def full_scale(self):
+        try:
+            value=float(self.run['metadata']['devices']['camera']['full_scale'])
+        except Exception:
+            return FULL_SCALE
+        return value if np.isfinite(value) and value>0 else FULL_SCALE
+    @property
     def latest_record(self):
         return self.records[-1] if self.records else None
     def clear_fit(self):
@@ -93,7 +104,7 @@ class Dataset:
         if group is None:
             group=SpectrumGroup(delay,spectrum.size); self._groups[delay]=group
             self._sorted_delays=None
-        group.add(spectrum,exposure)
+        group.add(spectrum,exposure,self.full_scale)
         if key is not None:
             self._seen.add(key)
         self.records.append(record); self._revision+=1
