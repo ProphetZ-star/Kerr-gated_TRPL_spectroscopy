@@ -4,7 +4,7 @@
 
 ## 启动
 
-Windows 10/11 64 位，使用 Python 3.12 或更新的 64 位版本。完整解压本文件夹后双击 **TRPL.exe**；也可双击 `start-app.vbs` 或 `start-app.cmd`。
+Windows 10/11 64 位，使用 Python 3.12 或更新的 64 位版本。完整解压本文件夹后双击 **Kerr studio.exe**；也可双击 `start-app.vbs` 或 `start-app.cmd`。
 
 第一次启动会在当前软件文件夹创建 `.venv` 并下载依赖，安装窗口显示四步进度、下载量及等待状态，完成后打开软件。之后通过 `pythonw.exe` 启动原生 Qt 窗口。窗口先显示工作台与加载遮罩，后台采集进程就绪后解除遮罩。
 
@@ -26,7 +26,7 @@ Windows 10/11 64 位，使用 Python 3.12 或更新的 64 位版本。完整解�
 
 应用通过 Qt 信号和后台工作进程通信，无需浏览器、本地 HTTP 服务、WebView 或 Python.NET。源目录只包含原生界面、后端、图标和启动/依赖文件，没有旧的 HTML、CSS、JavaScript 或 WebView 加载配置。
 
-`TRPL.exe` 是带图标的轻量启动器，使用 Windows 的 .NET Framework 4.x 启动 `start-app.vbs`；Qt/Python 进程不加载 CLR。启动器源码为 `launcher.cs`，图标为 `assets/TRPL.ico`。
+`Kerr studio.exe` 是带图标的轻量启动器，使用 Windows 的 .NET Framework 4.x 启动 `start-app.vbs`；Qt/Python 进程不加载 CLR。启动器源码为 `launcher.cs`，图标为 `assets/TRPL.ico`。
 
 ## 不打开界面的检查入口
 
@@ -35,7 +35,7 @@ Windows 10/11 64 位，使用 Python 3.12 或更新的 64 位版本。完整解�
 ```powershell
 .\start-app.ps1 -SetupOnly # 安装/检查依赖，不启动窗口
 .\start-app.ps1 -Probe     # 已安装环境的依赖检查
-.\TRPL.exe --check        # 检查必要程序文件，不启动窗口
+& ".\Kerr studio.exe" --check        # 检查必要程序文件，不启动窗口
 ```
 
 后台进程首次启动不加载 SciPy 拟合/标定计算模块，调用相关功能时再加载；界面使用增量记录与绘图节流。开发验收脚本保留在工作区 `.publish`，不随精简软件分发。
@@ -45,5 +45,5 @@ Windows 10/11 64 位，使用 Python 3.12 或更新的 64 位版本。完整解�
 在本目录运行：
 
 ```powershell
-& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /out:TRPL.exe /win32icon:assets\TRPL.ico /reference:System.Windows.Forms.dll launcher.cs
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /out:"Kerr studio.exe" /win32icon:assets\TRPL.ico /reference:System.Windows.Forms.dll launcher.cs
 ```

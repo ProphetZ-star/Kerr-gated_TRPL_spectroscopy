@@ -7,7 +7,7 @@ from backend.contracts import ConnectBody,DeviceBody,SDKBody,PIUSBBody,DeviceNam
 class ValidationError(ValueError):
     pass
 
-COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard export analysis_open analysis_close fit task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
+COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard run_files_removed export analysis_open analysis_close fit task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
 
 def _pydantic_text(name,error):
     try:
@@ -111,7 +111,7 @@ def validate_command(name,data=None):
         return _model(name,RunRequest,data)
     if name=='background':
         return _model(name,BackgroundRequest,data)
-    if name in {'pause','resume','stop','get_run','discard'}:
+    if name in {'pause','resume','stop','get_run','discard','run_files_removed'}:
         return {'run_id':_str(data,'run_id',name)}
     if name=='records':
         return {'run_id':_str(data,'run_id',name),'analysis':_bool(data,'analysis',name,False),'offset':_int(data,'offset',name,0),'limit':_int(data,'limit',name,100,1)}

@@ -1,7 +1,7 @@
 '''Reusable native widgets, layout helpers and plot-adjacent presentation pieces.'''
 import math
-from PySide6.QtCore import Qt,Signal,QPoint,QTimer,QRectF,QObject,QEvent,QPointF,QSize
-from PySide6.QtGui import QColor,QPainter,QPen,QLinearGradient,QFont,QPainterPath,QIcon,QPixmap,QPolygonF,QPalette
+from PySide6.QtCore import Qt,Signal,QPoint,QTimer,QRectF,QObject,QEvent,QPointF,QSize,QVariantAnimation
+from PySide6.QtGui import QColor,QPainter,QPen,QLinearGradient,QFont,QPainterPath,QIcon,QPixmap,QPolygonF,QPalette,QFontMetricsF
 from PySide6.QtWidgets import QWidget,QLabel,QPushButton,QFrame,QVBoxLayout,QHBoxLayout,QGridLayout,QScrollArea,QLineEdit,QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QSizePolicy,QProgressBar,QToolButton,QAbstractSpinBox,QStylePainter,QStyleOptionComboBox,QStyle
 
 def repolish(widget):
@@ -174,7 +174,7 @@ class FocusRing(QWidget):
     def follow(self,old,new):
         widget=new
         if isinstance(widget,QLineEdit) and isinstance(widget.parentWidget(),QAbstractSpinBox):widget=widget.parentWidget()
-        if widget is not None and (not isinstance(widget,self.TARGETS) or widget.objectName() in ('delay','axisEndpointEdit','inlineValue') or widget.window() is widget):widget=None
+        if widget is not None and (not isinstance(widget,self.TARGETS) or widget.objectName() in ('delay','axisEndpointEdit','inlineValue','sourceMode') or widget.window() is widget):widget=None
         if self.target is not None:
             try:self.target.removeEventFilter(self);self.target.destroyed.disconnect(self._target_destroyed)
             except (RuntimeError,TypeError):pass
@@ -431,15 +431,31 @@ def fmt_value(value,digits=4):
     if value!=0 and (abs(value)>=100000 or abs(value)<0.001): return f'{value:.2e}'
     text=f'{value:.{digits}g}'
     return text
+class HoverReveal(QObject):
+    '''Shows a scroll area's thin scrollbar only while the pointer is over it (styled by [hovered=true]).'''
+    def __init__(self,area):
+        super().__init__(area);self.area=area;area.setProperty('hovered',False);area.installEventFilter(self)
+    def eventFilter(self,obj,event):
+        if event.type() in (QEvent.Enter,QEvent.Leave):
+            self.area.setProperty('hovered',event.type()==QEvent.Enter)
+            for bar in (self.area.verticalScrollBar(),self.area.horizontalScrollBar()):repolish(bar)
+        return False
 class StatusButton(QPushButton):
     '''Heading button that draws one status dot per device: off, connecting (blinking), connected, error or simulated.'''
     DOT={'connected':'success','connecting':'warning','simulated':'warning','error':'danger','off':'muted','manual':'muted'}
     def __init__(self,parent=None):
-        super().__init__('',parent); self._parts=[]; self._blink_on=True
+        super().__init__('',parent); self._parts=[]; self._blink_on=True; self._previous={}; self._fade=1.0
         self._blink=QTimer(self); self._blink.setInterval(450); self._blink.timeout.connect(self._toggle_blink)
+        # Dot colours cross-fade over 180 ms when a device changes state.
+        self._fader=QVariantAnimation(self); self._fader.setDuration(180); self._fader.setStartValue(0.0); self._fader.setEndValue(1.0)
+        self._fader.valueChanged.connect(self._fade_step)
     def set_parts(self,parts):
         parts=[(str(state),str(text)) for state,text in parts]
         if parts==self._parts: return
+        from .theme import palette
+        colors=palette();self._previous={i:QColor(colors[self.DOT.get(state,'muted')]) for i,(state,_) in enumerate(self._parts)}
+        self._fade=0.0 if self._previous else 1.0;self._fader.stop()
+        if self._previous:self._fader.start()
         self._parts=parts; self.setAccessibleName(' · '.join(f'{text} {state}' for state,text in parts))
         if any(state=='connecting' for state,_ in parts):
             if not self._blink.isActive(): self._blink_on=True; self._blink.start()
@@ -447,6 +463,7 @@ class StatusButton(QPushButton):
         self.updateGeometry(); self.update()
     def parts(self): return list(self._parts)
     def _toggle_blink(self): self._blink_on=not self._blink_on; self.update()
+    def _fade_step(self,value): self._fade=float(value); self.update()
     def _layout(self):
         metrics=self.fontMetrics(); dot=7; gap=5; between=10; items=[]; x=0
         for state,text in self._parts:
@@ -462,11 +479,16 @@ class StatusButton(QPushButton):
         colors=palette(); items,width,dot,gap=self._layout()
         p=QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setFont(self.font()); metrics=self.fontMetrics()
         left=(self.width()-width)/2; middle=self.height()/2; baseline=middle+(metrics.ascent()-metrics.descent())/2
+        # Dots centre on the letters (half the cap height above the baseline), not on the taller line box.
+        middle=baseline-QFontMetricsF(self.font()).capHeight()/2
         text_color=QColor(colors['text'] if self.underMouse() and self.isEnabled() else colors['muted'])
-        for x,state,text in items:
+        for index,(x,state,text) in enumerate(items):
             color=QColor(colors[self.DOT.get(state,'muted')])
+            previous=self._previous.get(index)
+            if previous is not None and self._fade<1:
+                t=self._fade;color=QColor(round(previous.red()+(color.red()-previous.red())*t),round(previous.green()+(color.green()-previous.green())*t),round(previous.blue()+(color.blue()-previous.blue())*t))
             if state=='connecting' and not self._blink_on: color.setAlphaF(.25)
-            rect=QRectF(left+x+.5,middle-dot/2,dot-1,dot-1)
+            rect=QRectF(left+x+.5,middle-(dot-1)/2,dot-1,dot-1)
             if state=='off': p.setPen(QPen(color,1.2)); p.setBrush(Qt.NoBrush)
             else: p.setPen(Qt.NoPen); p.setBrush(color)
             p.drawEllipse(rect)

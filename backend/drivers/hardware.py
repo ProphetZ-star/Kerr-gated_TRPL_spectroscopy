@@ -11,8 +11,10 @@ from ..readout import default_readout,normalize_readout,readout_shape,spectrum_f
 
 
 class HardwareError(ConnectionError):
-    def __init__(self, device, message):
-        self.device=device
+    '''link=False marks a command-level failure (rejected command, timeout, position check) on a device that is
+    still talking to us; only link failures should take the device offline.'''
+    def __init__(self, device, message, link=True):
+        self.device=device;self.link=link
         super().__init__(message)
 
 
@@ -197,6 +199,8 @@ class PIStage:
 
     def __init__(self,config):
         self.port=None
+        # One request/response at a time on the controller link, whichever thread asks.
+        self.lock=threading.RLock()
         try:
             if config.get('transport','serial')=='usb':
                 from .pi_usb import PIUSB
@@ -232,9 +236,9 @@ class PIStage:
     def set_velocity(self,requested):
         if not math.isfinite(requested) or requested<=0:raise ValueError('Velocity must be a positive number')
         applied=min(requested,self.max_velocity_mm_s)
-        self.port.write(f'VEL {self.axis} {applied:.6g}\n'.encode('ascii'))
+        self.send(f'VEL {self.axis} {applied:.6g}')
         error=self.query('ERR?')
-        if error!='0':raise HardwareError('stage','PI rejected the velocity (error '+error+')')
+        if error!='0':raise HardwareError('stage','PI rejected the velocity (error '+error+')',link=False)
         self.velocity_mm_s=self.value('VEL?')
         return dict(velocity_mm_s=self.velocity_mm_s,requested_mm_s=requested,max_velocity_mm_s=self.max_velocity_mm_s,clamped=applied<requested)
 
@@ -244,36 +248,52 @@ class PIStage:
     def reference(self,stop):
         if stop.is_set():raise AcquisitionCancelled()
         if not self.value('SVO?'):
-            self.port.write(f'SVO {self.axis} 1\n'.encode('ascii'))
-            if self.query('ERR?')!='0':raise HardwareError('stage','PI could not activate the motor')
+            self.send(f'SVO {self.axis} 1')
+            if self.query('ERR?')!='0':raise HardwareError('stage','PI could not activate the motor',link=False)
         self.motor_on=True;self.referenced=False
         # This setup references against the positive limit switch (FPL), not the middle reference switch (FRF).
-        self.port.write(f'FPL {self.axis}\n'.encode('ascii'))
-        if self.query('ERR?')!='0':raise HardwareError('stage','PI rejected the reference move')
+        self.send(f'FPL {self.axis}')
+        if self.query('ERR?')!='0':raise HardwareError('stage','PI rejected the reference move',link=False)
         deadline=time.monotonic()+self.travel_timeout(self.upper-self.lower)
         try:
             while True:
                 if stop.is_set():raise AcquisitionCancelled()
                 time.sleep(.05);self.position_mm=self.value('POS?')
                 if self.value('FRF?'):break
-                if time.monotonic()>deadline:raise HardwareError('stage','PI reference move timed out')
+                if time.monotonic()>deadline:raise HardwareError('stage','PI reference move timed out',link=False)
         except AcquisitionCancelled:
-            self.port.write(f'HLT {self.axis}\n'.encode('ascii'));self.query('ERR?');self.position_mm=self.value('POS?');raise
+            self.send(f'HLT {self.axis}');self.query('ERR?');self.position_mm=self.value('POS?');raise
         self.lower=self.value('TMN?');self.upper=self.value('TMX?')
         self.position_mm=self.value('POS?');self.referenced=True
 
     def query(self,command):
+        # Queries are side-effect free, so one transient USB/serial glitch is retried before the link is declared lost.
+        try:return self._query(command)
+        except HardwareError as first:
+            time.sleep(.1)
+            try:return self._query(command)
+            except HardwareError:raise first
+
+    def _query(self,command):
         lines=[]
-        try:
-            self.port.write((command+'\n').encode('ascii'))
-            for _ in range(32):
-                raw=self.port.readline()
-                if not raw:break
-                lines.append(raw.decode('ascii',errors='strict').strip())
-                if not raw.rstrip(b'\r\n').endswith(b' '):break
-        except (OSError,UnicodeError) as exc:raise HardwareError('stage','PI serial connection failed: '+str(exc)) from exc
+        with self.lock:
+            try:
+                self.port.write((command+'\n').encode('ascii'))
+                for _ in range(32):
+                    raw=self.port.readline()
+                    if not raw:break
+                    lines.append(raw.decode('ascii',errors='strict').strip())
+                    if not raw.rstrip(b'\r\n').endswith(b' '):break
+            except (OSError,UnicodeError) as exc:raise HardwareError('stage','PI serial connection failed: '+str(exc)) from exc
         if not lines:raise HardwareError('stage','PI controller did not respond; check the COM port and baud rate')
         return '\n'.join(lines)
+
+    def send(self,command):
+        '''A command without a reply (MOV, SVO, VEL, FPL, HLT). Never retried: it may already have taken effect.'''
+        with self.lock:
+            try:self.port.write((command+'\n').encode('ascii'))
+            except HardwareError:raise
+            except OSError as exc:raise HardwareError('stage','PI serial connection failed: '+str(exc)) from exc
 
     def value(self,command):
         answer=self.query(command+' '+self.axis)
@@ -289,31 +309,36 @@ class PIStage:
     def move_to(self,target,stop):
         if stop.is_set():raise AcquisitionCancelled()
         self.duration(target)
-        if not self.value('SVO?') or not self.value('FRF?'):raise HardwareError('stage','PI motor/reference state changed; reference the stage before motion')
+        if not self.value('SVO?') or not self.value('FRF?'):self.referenced=False;raise HardwareError('stage','PI motor/reference state changed; reference the stage before motion',link=False)
         failed=True
         deadline=time.monotonic()+self.travel_timeout(target-self.position_mm)
         try:
-            self.port.write(f'MOV {self.axis} {target:.12g}\n'.encode('ascii'))
-            if self.query('ERR?')!='0':raise HardwareError('stage','PI rejected the move; check controller configuration')
+            self.send(f'MOV {self.axis} {target:.12g}')
+            if self.query('ERR?')!='0':raise HardwareError('stage','PI rejected the move; check controller configuration',link=False)
             while True:
                 if stop.is_set():raise AcquisitionCancelled()
                 self.position_mm=self.value('POS?')
                 if self.value('ONT?'):
-                    if abs(self.position_mm-target)>.01:raise HardwareError('stage','PI stopped outside the requested position')
+                    # The POS? above was read while still moving; the move may have ended in the ~30 ms before ONT?.
+                    self.position_mm=self.value('POS?')
+                    if abs(self.position_mm-target)>.01:raise HardwareError('stage','PI stopped outside the requested position',link=False)
                     failed=False
                     return
-                if time.monotonic()>deadline:raise HardwareError('stage','PI move timed out')
+                if time.monotonic()>deadline:raise HardwareError('stage','PI move timed out',link=False)
                 stop.wait(.05)
+        # HardwareError is an OSError: without this, every error above was re-reported as a serial failure.
+        except HardwareError:raise
         except OSError as exc:raise HardwareError('stage','PI serial connection failed: '+str(exc)) from exc
         finally:
             if failed:
                 try:
-                    self.port.write(f'HLT {self.axis}\n'.encode('ascii'))
+                    self.send(f'HLT {self.axis}')
                     error=self.query('ERR?')
                     # C-663 reports 10 for a deliberate HLT. Consume it here so
                     # a subsequent move is not mistaken for a failed command.
-                    if error not in {'0','10'}:raise HardwareError('stage','PI stop reported error '+error)
+                    if error not in {'0','10'}:raise HardwareError('stage','PI stop reported error '+error,link=False)
                     self.position_mm=self.value('POS?')
+                except HardwareError:raise
                 except Exception as exc:raise HardwareError('stage','Could not confirm the PI stop: '+str(exc)) from exc
 
     def close(self):

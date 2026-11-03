@@ -19,6 +19,18 @@ from .storage.hdf5 import HDFWriter, choose_path, read_run, append_analysis
 from .storage.output import output_info,prepare_output
 from .storage.export import export_csv
 from .calibration_service import CalibrationWorkbench
+import os
+from pathlib import Path
+
+DEVICE_LOG=Path(os.environ.get('KERR_STATE_DIR',Path(__file__).resolve().parents[1]/'data'))/'device-errors.log'
+
+def log_device_error(device,message,link):
+    '''Timestamped record of every device error, so an unstable connection can be told apart from rejected commands.'''
+    try:
+        DEVICE_LOG.parent.mkdir(parents=True,exist_ok=True)
+        with DEVICE_LOG.open('a',encoding='utf-8') as stream:
+            stream.write(f"{datetime.now().isoformat(timespec='milliseconds')}\t{device}\t{'link' if link else 'command'}\t{message}\n")
+    except OSError:pass
 from .readout import readout_axis,readout_shape
 from .errors import CommandError,error_status
 
@@ -100,8 +112,12 @@ class Engine:
                     moving=self.preview_moving or self.busy=='move' or bool(self.busy=='scan' and run and run['step']=='moving'))
 
     def hardware_failure(self,exc):
-        self.devices.failed(exc.device,exc);self.revision+=1
-        self.emit('device.error',dict(device=exc.device,message=str(exc)))
+        # A rejected command or timeout is reported but leaves the device connected; only a lost link takes it offline.
+        link=getattr(exc,'link',True)
+        log_device_error(exc.device,str(exc),link)
+        if link:self.devices.failed(exc.device,exc)
+        self.revision+=1
+        self.emit('device.error',dict(device=exc.device,message=str(exc),link=link))
 
     def require_operation(self,name):
         needed={'configure':('camera',),'move':('stage',),'zero':('stage',),
@@ -640,7 +656,7 @@ class Engine:
             self.latest_axis=metadata['calibration']['wavelengths_nm']
             self.set_exposure(run['request']['exposure_s'])
             return self.public_run(run)
-        if name in {'get_run','records','export','save','fit','discard','analysis_close'}:
+        if name in {'get_run','records','export','save','fit','discard','run_files_removed','analysis_close'}:
             separate=bool(data.get('analysis'))
             run=(self.analysis_runs if separate else self.runs).get(data.get('run_id',self.current))
             if not run:raise CommandError('Run not found',404)
@@ -659,7 +675,8 @@ class Engine:
             if name=='save':
                 self.idle(devices=False)
                 with self.analysis_lock:
-                    if run['saved']:return self.public_run(run)
+                    # A run whose unfinished files were moved to the Recycle Bin can be written out again.
+                    if run['saved'] and not run.get('files_removed'):return self.public_run(run)
                     with prepare_output(data.get('path'),run['run_id'],run['plan']['estimated_bytes'],data.get('overwrite_token')) as path:
                         writer=HDFWriter(path,run['metadata'])
                         try:
@@ -672,7 +689,10 @@ class Engine:
                             for ack in pending:ack.result(timeout=30)
                         except Exception:
                             writer.call('close','error');raise
-                        run['path']=writer.call('close',run['status']);run['saved']=True;return self.public_run(run)
+                        run['path']=writer.call('close',run['status']);run['saved']=True;run['files_removed']=False;return self.public_run(run)
+            if name=='run_files_removed':
+                # The frames stay in memory; the run still counts as handled, so a new scan can start without a prompt.
+                run['files_removed']=True;run['path']=None;self.revision+=1;return self.public_run(run)
             if name=='discard':
                 self.idle(devices=False);self.runs={};self.current=None;self.latest=None;self.latest_version+=1;self.latest_axis=self.live_axis();return dict(discarded=True)
             if name=='fit':
@@ -717,18 +737,36 @@ class Engine:
         raise ValueError('Unknown command: '+name)
 
 
+def shutdown_engine(engine):
+    engine.stop.set();engine.pause.clear()
+    for control in engine.task_controls.values():control['cancel'].set()
+    if engine.job:engine.job.join(10)
+    engine.pool.shutdown(wait=True,cancel_futures=True)
+    if not engine.job or not engine.job.is_alive():
+        try:engine.devices.close()
+        except Exception:traceback.print_exc()
+
+
+def watch_parent(engine):
+    '''If the window process dies without sending shutdown (crash, Task Manager), stop motion, release the CCD
+    and stage, and exit, instead of lingering in commands.get() while holding the hardware.'''
+    import multiprocessing,multiprocessing.connection,os
+    parent=multiprocessing.parent_process()
+    if parent is None:return
+    def run():
+        multiprocessing.connection.wait([parent.sentinel])
+        try:shutdown_engine(engine)
+        finally:os._exit(0)
+    Thread(target=run,daemon=True,name='parent-watchdog').start()
+
+
 def worker_main(commands,responses,events):
     engine=Engine(events)
+    watch_parent(engine)
     while True:
         message=commands.get()
         if message['name']=='shutdown':
-            engine.stop.set();engine.pause.clear()
-            for control in engine.task_controls.values():control['cancel'].set()
-            if engine.job:engine.job.join(10)
-            engine.pool.shutdown(wait=True,cancel_futures=True)
-            if not engine.job or not engine.job.is_alive():
-                try:engine.devices.close()
-                except Exception:traceback.print_exc()
+            shutdown_engine(engine)
             return
         try:
             result=engine.handle(message['name'],message['data'])

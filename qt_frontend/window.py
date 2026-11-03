@@ -9,14 +9,15 @@ import uuid
 from pathlib import Path
 from typing import get_args
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QEasingCurve, QFile
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
+from .icons import icon_box, line_icon
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QInputDialog, QApplication
 from .widgets import ArrowComboBox as QComboBox,CheckBox as QCheckBox,WaveLogo,ThemeButton,NativeSpinBox as QSpinBox,NativeDoubleSpinBox as QDoubleSpinBox
 from .controller import Controller
 from .theme import apply_to_app, palette, current_mode, map_color
-from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count, StatusButton
+from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count, StatusButton, HoverReveal
 from .plots import SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt, format_duration
 from .dialogs import DeviceDialog, DetectorDialog
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
@@ -111,6 +112,8 @@ class MainWindow(QMainWindow):
         self._readout_controls_enabled = True
         self._referencing = False
         self.nudge_buttons = []
+        self._icon_buttons = []
+        self._discarded_paths = set()
         self._map_dirty = True
         self._map_key = None
         self._fit_running = False
@@ -131,6 +134,8 @@ class MainWindow(QMainWindow):
         self._closing_started = False
         self.output_dir = Path.cwd() / 'data'
         self._build_ui()
+        for scroll in (self.acquisition_scroll, self.analysis_scroll, self.calibration_scroll):
+            HoverReveal(scroll)
         # Plots that share a wavelength / pixel axis zoom together and share one undo history.
         self.spectrum_plot.sync_x_with(self.map_plot)
         self.cal_image.sync_x_with(self.cal_spectrum)
@@ -165,8 +170,8 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName('section')
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(9)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         return frame, layout
     def _heading(self, title, control=None):
         row = QWidget()
@@ -188,8 +193,54 @@ class MainWindow(QMainWindow):
             self._refresh_run_icons()
     def _refresh_run_icons(self):
         colors = palette()
-        self.run_button.setIcon(run_icon(self._run_kind, colors['bg'] if self.run_button.isEnabled() else '#ccffffff'))
-        self.stop_button.setIcon(run_icon('stop', colors['bg'] if self.stop_button.isEnabled() else colors['muted']))
+        self.run_button.setIcon(line_icon(self._run_kind + '-fill', colors['surface'], '#ccffffff', 16, 1))
+        self.stop_button.setIcon(line_icon('stop-fill', colors['surface'] if self.stop_button.isEnabled() else colors['muted'], colors['muted'], 16, 1))
+    def _set_icon(self, button, name, primary=False):
+        entry = (name, primary)
+        if getattr(button, '_line_icon', None) == entry:
+            return
+        button._line_icon = entry
+        if button not in self._icon_buttons:
+            self._icon_buttons.append(button)
+        button.setIconSize(icon_box(15))
+        self._paint_icon(button)
+    def _paint_icon(self, button):
+        name, primary = button._line_icon
+        colors = palette()
+        button.setIcon(line_icon(name, colors['surface'] if primary else colors['text'], colors['muted'], 15))
+    def _apply_icons(self):
+        for button in self._icon_buttons:
+            self._paint_icon(button)
+    def _animate_progress(self, percent):
+        # The bar counts in tenths of a percent so the 180 ms ease lands exactly on its target.
+        target = int(round(float(percent) * 10))
+        animation = getattr(self, '_progress_animation', None)
+        if animation is None:
+            animation = self._progress_animation = QPropertyAnimation(self.progress_fill, b'value', self)
+            animation.setDuration(180); animation.setEasingCurve(QEasingCurve.OutCubic)
+        running = animation.state() == QPropertyAnimation.Running
+        # Status polls repeat the same target many times a second; restarting the ease on each one kept the
+        # bar creeping behind the real progress (still moving after a pause, stuck short of 100 % at the end).
+        if (running and animation.endValue() == target) or (not running and self.progress_fill.value() == target):
+            return
+        animation.stop(); animation.setStartValue(self.progress_fill.value()); animation.setEndValue(target); animation.start()
+    def _set_run_complete(self, complete):
+        if bool(self.progress_fill.property('complete')) != complete:
+            set_prop(self.progress_fill, 'complete', complete)
+            set_prop(self.run_status, 'state', 'complete' if complete else '')
+    def _celebrate_run(self, run, completed):
+        self._set_run_complete(True)
+        flash = getattr(self, '_complete_flash', None)
+        if flash is None:
+            # A short glow on the full bar draws the eye to the finished scan.
+            glow = QGraphicsDropShadowEffect(self.progress_fill); glow.setOffset(0, 0); glow.setBlurRadius(0)
+            glow.setColor(QColor(palette()['success'])); self.progress_fill.setGraphicsEffect(glow)
+            flash = self._complete_flash = QPropertyAnimation(glow, b'blurRadius', self)
+            flash.setDuration(1400); flash.setKeyValueAt(0, 0.0); flash.setKeyValueAt(.25, 16.0); flash.setKeyValueAt(.5, 4.0); flash.setKeyValueAt(.75, 16.0); flash.setKeyValueAt(1, 0.0)
+            flash.finished.connect(lambda: glow.setEnabled(False))
+        glow = flash.targetObject(); glow.setColor(QColor(palette()['success'])); glow.setEnabled(True); flash.stop(); flash.start()
+        saved = Path(str(run.get('path'))).name if run.get('saved') and run.get('path') else ''
+        self.show_toast(f'Scan complete · {completed} points' + (f' · saved as {saved}' if saved else ''), 'success')
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -267,9 +318,11 @@ class MainWindow(QMainWindow):
         brand_layout.addWidget(brand_text)
         layout.addWidget(brand)
         run_info = QWidget()
-        run_info.setFixedHeight(29)
+        # Equal room above and below the 29 px content: the completion glow spreads around the bar without being
+        # clipped at the widget edge, and the content stays centred in the top bar.
+        run_info.setFixedHeight(29 + 2 * 12)
         info_layout = QVBoxLayout(run_info)
-        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setContentsMargins(0, 12, 0, 12)
         info_layout.setSpacing(7)
         info_row = QHBoxLayout()
         info_row.setContentsMargins(0, 0, 0, 0)
@@ -283,7 +336,7 @@ class MainWindow(QMainWindow):
         info_row.addWidget(self.remaining)
         self.progress_fill = QProgressBar()
         self.progress_fill.setObjectName('progressFill')
-        self.progress_fill.setRange(0, 100)
+        self.progress_fill.setRange(0, 1000)
         self.progress_fill.setValue(0)
         self.progress_fill.setTextVisible(False)
         info_layout.addLayout(info_row)
@@ -297,12 +350,12 @@ class MainWindow(QMainWindow):
         self.run_button.setProperty('role', 'primary')
         self.run_button.setObjectName('run')
         self.run_button.setFixedSize(96,34)
-        self.run_button.setIconSize(QSize(11,11))
+        self.run_button.setIconSize(icon_box(16, 1))
         self._run_kind = 'play'
         self.stop_button = QPushButton('Stop')
         self.stop_button.setObjectName('stop')
-        self.stop_button.setFixedSize(80,34)
-        self.stop_button.setIconSize(QSize(11,11))
+        self.stop_button.setFixedSize(96,34)
+        self.stop_button.setIconSize(icon_box(16, 1))
         self.stop_button.setEnabled(False)
         self._refresh_run_icons()
         action_layout.addWidget(self.run_button)
@@ -325,7 +378,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         self.nav_buttons = {}
         nav=QWidget();nav_layout=QHBoxLayout(nav);nav_layout.setContentsMargins(0,0,0,0);nav_layout.setSpacing(20)
-        for key, text in [('acquisition', 'Acquisition'), ('analysis', 'Analysis'), ('calibration', 'Spectral Calibration')]:
+        for key, text in [('acquisition', 'Acquisition'), ('analysis', 'Analysis'), ('calibration', 'Spectral calibration')]:
             button = QPushButton(text)
             button.setObjectName(key)
             button.setProperty('nav', True)
@@ -346,8 +399,8 @@ class MainWindow(QMainWindow):
         self.hardware_mode.setObjectName('sourceMode')
         self.hardware_mode.setProperty('ownTextColor', True)
         self.hardware_mode.setProperty('centerText', True)
-        self.hardware_mode.addItem('HARDWARE', 'hardware')
-        self.hardware_mode.addItem('SIMULATION · hardware offline', 'simulation')
+        self.hardware_mode.addItem('Hardware', 'hardware')
+        self.hardware_mode.addItem('Simulation · hardware offline', 'simulation')
         for index in range(self.hardware_mode.count()):
             self.hardware_mode.setItemData(index, Qt.AlignCenter, Qt.TextAlignmentRole)
         self.hardware_mode.setSizeAdjustPolicy(QComboBox.AdjustToContents)
@@ -380,13 +433,21 @@ class MainWindow(QMainWindow):
         self.save_path.textChanged.connect(self._sync_sample_name)
         self._reg('savePath', self.save_path, False)
         self.save_path.setFixedHeight(34)
-        layout.addWidget(self.save_path, 1)
+        self.save_path.setMinimumWidth(220)
+        self.save_path.setMaximumWidth(340)
+        layout.addWidget(self.save_path)
         self.path_button = QPushButton('Choose folder…')
         self.path_button.setObjectName('path')
         self._reg('path', self.path_button, False)
         self.path_button.clicked.connect(self._choose_output_folder)
         self.path_button.setFixedHeight(34)
+        self._set_icon(self.path_button, 'folder')
         layout.addWidget(self.path_button)
+        self.folder_label = ElidedLabel('')
+        self.folder_label.setObjectName('folderLabel')
+        self._reg('folderLabel', self.folder_label, False)
+        layout.addWidget(self.folder_label, 1)
+        self._show_output_folder()
         self.autosave = QCheckBox('Autosave')
         self.autosave.setObjectName('autosave')
         self.autosave.setChecked(True)
@@ -396,12 +457,13 @@ class MainWindow(QMainWindow):
         self.save_status.setObjectName('saveStatus')
         self._reg('saveStatus', self.save_status, False)
         layout.addWidget(self.save_status)
-        self.export_button = QPushButton('↓ Export CSV')
+        self.export_button = QPushButton('Export CSV')
         self.export_button.setObjectName('export')
         self.export_button.setProperty('role', 'accent')
         self._reg('export', self.export_button, False)
         self.export_button.clicked.connect(self.export_current_csv)
         self.export_button.setFixedHeight(34);self.export_button.setEnabled(False)
+        self._set_icon(self.export_button, 'download')
         layout.addWidget(self.export_button)
     def _build_acquisition_page(self):
         page = QWidget()
@@ -439,13 +501,12 @@ class MainWindow(QMainWindow):
         return page
     def _build_stage_section(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(14,13,14,14)
         self.stage_connection = StatusButton()
         self.stage_connection.set_parts([('off', 'Connect…')])
         self.stage_connection.setObjectName('stageConnection')
         self._reg('stageConnection', self.stage_connection, False)
         self.stage_connection.clicked.connect(self._open_stage_dialog)
-        layout.addWidget(self._heading('Delay Stage', self.stage_connection))
+        layout.addWidget(self._heading('Delay stage', self.stage_connection))
         self.stage_fields = QWidget()
         stage_layout = QVBoxLayout(self.stage_fields)
         stage_layout.setContentsMargins(0, 0, 0, 0)
@@ -485,27 +546,19 @@ class MainWindow(QMainWindow):
             nudge_layout.addWidget(button, 0, column)
             self.nudge_buttons.append(button)
         stage_layout.addWidget(nudge)
-        motion_row = QHBoxLayout()
-        motion_row.setContentsMargins(0, 0, 0, 0)
-        motion_row.setSpacing(7)
-        speed_label = QLabel('Speed')
-        speed_label.setProperty('muted', True)
-        motion_row.addWidget(speed_label)
         self.velocity_edit = number_edit('', 0, 1000, 4)
         self.velocity_edit.setObjectName('stageVelocity')
         self.velocity_edit.setToolTip('Stage velocity; press Enter to apply')
         self._reg('stageVelocity', self.velocity_edit, False)
         self.velocity_edit.textEdited.connect(lambda text: setattr(self, '_velocity_edited', True))
         self.velocity_edit.editingFinished.connect(self._apply_velocity)
-        self.velocity_field = field('', self.velocity_edit, 'mm/s')
-        motion_row.addWidget(self.velocity_field, 1)
+        self.velocity_field = field('Speed', self.velocity_edit, 'mm/s')
         self.reference_button = QPushButton('Reference')
         self.reference_button.setObjectName('stageReference')
         self.reference_button.setToolTip('Activate the motor and reference at the positive limit switch')
         self.reference_button.clicked.connect(self._reference_stage)
         self._reg('stageReference', self.reference_button, False)
-        motion_row.addWidget(self.reference_button)
-        stage_layout.addLayout(motion_row)
+        self._set_icon(self.reference_button, 'home')
         self.zero_button = QPushButton('Set zero t₀')
         self.zero_button.setObjectName('zero')
         self.zero_button.setProperty('role', 'accent')
@@ -519,11 +572,32 @@ class MainWindow(QMainWindow):
         zero_row=QHBoxLayout();zero_row.setSpacing(8);zero_row.setContentsMargins(0,0,0,0)
         self.zero_button.setFixedHeight(32);self.return_zero.setFixedHeight(32)
         zero_row.addWidget(self.zero_button,1);zero_row.addWidget(self.return_zero,1);stage_layout.addLayout(zero_row)
+        self._set_icon(self.zero_button, 'flag'); self._set_icon(self.return_zero, 'target'); self._set_icon(self.move_absolute, 'arrow-right')
+        # Speed and referencing are occasional set-up steps, so they live in a fold like Detection's.
+        self.stage_advanced = CollapsibleSection('Advanced settings')
+        motion = QWidget()
+        motion_layout = QGridLayout(motion)
+        motion_layout.setContentsMargins(0, 0, 0, 0)
+        motion_layout.setHorizontalSpacing(10)
+        motion_layout.setVerticalSpacing(8)
+        motion_layout.addWidget(self.velocity_field, 0, 0)
+        reference_box = QWidget()
+        reference_layout = QVBoxLayout(reference_box)
+        reference_layout.setContentsMargins(0, 0, 0, 0)
+        reference_layout.setSpacing(4)
+        reference_caption = QLabel('Positive limit')
+        reference_caption.setProperty('muted', True)
+        reference_layout.addWidget(reference_caption)
+        reference_layout.addWidget(self.reference_button)
+        motion_layout.addWidget(reference_box, 0, 1)
+        motion_layout.setColumnStretch(0, 1)
+        motion_layout.setColumnStretch(1, 1)
+        self.stage_advanced.add(motion)
+        stage_layout.addWidget(self.stage_advanced)
         layout.addWidget(self.stage_fields)
         parent_layout.addWidget(frame)
     def _build_detection_section(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(14,13,14,15);layout.setSpacing(11)
         self.detector_connection = StatusButton()
         self.detector_connection.set_parts([('off', 'CCD'), ('off', 'Spectrometer')])
         self.detector_connection.setObjectName('detectorConnection')
@@ -562,7 +636,7 @@ class MainWindow(QMainWindow):
         pair_layout.addWidget(field('Exposure', exposure_box), 0, 0)
         pair_layout.addWidget(field('Center wavelength', self.center_edit, 'nm'), 0, 1)
         detector_layout.addWidget(pair)
-        self.advanced = CollapsibleSection('Advanced · Grating / Slit / Readout')
+        self.advanced = CollapsibleSection('Advanced settings')
         advanced_widget = QWidget()
         advanced_layout = QVBoxLayout(advanced_widget)
         advanced_layout.setContentsMargins(0, 0, 0, 0)
@@ -628,7 +702,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(6)
-        layout.addWidget(self._subheading('Readout · ROI / binning'), 0, 0, 1, 2)
+        layout.addWidget(self._subheading('Readout and binning'), 0, 0, 1, 2)
         self.readout_mode = Segmented([('FVB', 'fvb'), ('ROI', 'roi')])
         self.readout_mode.setObjectName('readoutMode')
         self._reg('readoutMode', self.readout_mode, False)
@@ -669,6 +743,7 @@ class MainWindow(QMainWindow):
         self._reg('readoutInfo', self.readout_info, False)
         layout.addWidget(self.readout_info, 4, 0, 1, 2)
         self.readout_apply = QPushButton('Apply readout')
+        self._set_icon(self.readout_apply, 'check')
         self.readout_apply.setObjectName('readoutApply')
         self.readout_apply.setProperty('role', 'accent')
         self.readout_apply.clicked.connect(self._apply_readout)
@@ -680,13 +755,26 @@ class MainWindow(QMainWindow):
         return box
     def _build_scan_section(self, parent_layout):
         frame, layout = self._section()
-        layout.setAlignment(Qt.AlignTop);layout.setSpacing(13)
+        layout.setAlignment(Qt.AlignTop)
         self.preview_button = QPushButton('Live preview')
         self.preview_button.setObjectName('preview')
-        self.preview_button.setProperty('role','accent');self.preview_button.setFixedHeight(27)
         self._reg('preview', self.preview_button, False)
         self.preview_button.clicked.connect(self.toggle_preview)
-        layout.addWidget(self._heading('Acquisition', self.preview_button))
+        self._set_icon(self.preview_button, 'activity')
+        # Acquiring a background is an acquisition action, so it sits here rather than on the plot header.
+        self.capture_background = QPushButton('Background')
+        self.capture_background.setObjectName('captureBackground')
+        self.capture_background.setToolTip('Acquire a background spectrum with the current exposure')
+        self._reg('captureBackground', self.capture_background, False)
+        self.capture_background.clicked.connect(self._capture_background)
+        self._set_icon(self.capture_background, 'layers')
+        layout.addWidget(self._heading('Acquisition'))
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+        actions.addWidget(self.preview_button, 1)
+        actions.addWidget(self.capture_background, 1)
+        layout.addLayout(actions)
         self.mode_seg = Segmented([('Scan', 'scan'), ('Single', 'single'), ('Repeat', 'repeat')])
         self.mode_seg.set_selected('scan')
         self.mode_seg.setObjectName('mode');self.mode_seg.setFixedHeight(33);self.mode_seg.layout.setContentsMargins(3,3,3,3)
@@ -707,7 +795,8 @@ class MainWindow(QMainWindow):
         segment_title.setProperty('muted', True)
         head_layout.addWidget(segment_title)
         head_layout.addStretch(1)
-        self.add_segment = QPushButton('＋ Add')
+        self.add_segment = QPushButton('Add')
+        self._set_icon(self.add_segment, 'plus')
         self.add_segment.setObjectName('addSegment')
         self._reg('addSegment', self.add_segment, False)
         self.add_segment.clicked.connect(lambda: self._add_segment_row())
@@ -756,7 +845,7 @@ class MainWindow(QMainWindow):
         self._mode_changed('scan')
         parent_layout.addWidget(frame)
     def _build_live_spectrum_panel(self):
-        panel = Panel('Live Spectrum')
+        panel = Panel('Live spectrum')
         self._reg('liveSpectrumPanel', panel, False)
         self.saturation = QLabel('')
         self.saturation.setObjectName('saturation')
@@ -768,11 +857,6 @@ class MainWindow(QMainWindow):
         self._spectrum_legend_current = legend.add('Current').findChild(QLabel)
         legend.add('Background', dashed=True)
         panel.add_tool(legend)
-        self.capture_background = QPushButton('Acquire background')
-        self.capture_background.setObjectName('captureBackground')
-        self._reg('captureBackground', self.capture_background, False)
-        self.capture_background.clicked.connect(self._capture_background)
-        panel.add_tool(self.capture_background)
         self.spectrum_scale = Segmented([('Linear', 'linear'), ('Log Y', 'log')])
         self.spectrum_scale.set_selected('linear')
         self.spectrum_scale.changed.connect(lambda value: self._schedule_refresh())
@@ -785,7 +869,7 @@ class MainWindow(QMainWindow):
         panel.add_body(self.spectrum_plot, 1)
         return panel
     def _build_map_panel(self):
-        panel = Panel('TRPL Map & Decay')
+        panel = Panel('TRPL map & decay')
         self._reg('mapPanel', panel, False)
         color_key = QWidget()
         key_layout = QHBoxLayout(color_key)
@@ -891,7 +975,6 @@ class MainWindow(QMainWindow):
         return page
     def _build_analysis_experiment(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,17)
         self.analysis_fit_state = QLabel('No data')
         self.analysis_fit_state.setObjectName('analysisFitState')
         self._reg('analysisFitState', self.analysis_fit_state, False)
@@ -930,6 +1013,7 @@ class MainWindow(QMainWindow):
         self.open_path.setPlaceholderText('Choose an HDF5 file')
         self._reg('openPath', self.open_path, False)
         self.open_run = QPushButton('Open…')
+        self._set_icon(self.open_run, 'folder')
         self.open_run.setObjectName('openRun');self.open_run.setFixedHeight(32)
         self._reg('openRun', self.open_run, False)
         self.open_run.clicked.connect(lambda: self.open_analysis_file())
@@ -945,10 +1029,12 @@ class MainWindow(QMainWindow):
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(7)
         self.save_run = QPushButton('Save HDF5')
+        self._set_icon(self.save_run, 'save')
         self.save_run.setObjectName('saveRun');self.save_run.setFixedHeight(32)
         self._reg('saveRun', self.save_run, False)
         self.save_run.clicked.connect(self._save_analysis_run)
         self.export_fit = QPushButton('Export fit CSV')
+        self._set_icon(self.export_fit, 'download')
         self.export_fit.setObjectName('exportFit');self.export_fit.setFixedHeight(32)
         self.export_fit.setEnabled(False)
         self._reg('exportFit', self.export_fit, False)
@@ -967,7 +1053,6 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_analysis_view(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,17);layout.setSpacing(16)
         label = QLabel('View')
         label.setProperty('muted', True)
         layout.addWidget(label)
@@ -996,7 +1081,8 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout(buttons)
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(7)
-        self.analysis_add_delay = QPushButton('＋ Overlay')
+        self.analysis_add_delay = QPushButton('Overlay')
+        self._set_icon(self.analysis_add_delay, 'plus')
         self.analysis_add_delay.setObjectName('analysisAddDelay')
         self._reg('analysisAddDelay', self.analysis_add_delay, False)
         self.analysis_add_delay.clicked.connect(self._add_spectrum_overlay)
@@ -1017,7 +1103,6 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_analysis_fit_controls(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,17)
         self.analysis_fit_controls = frame
         self.analysis_fit_controls.setObjectName('analysisFitControls')
         self._reg('analysisFitControls', self.analysis_fit_controls, False)
@@ -1070,7 +1155,8 @@ class MainWindow(QMainWindow):
         range_layout.addWidget(field('Fit start', self.fit_start, 'ps'), 0, 0)
         range_layout.addWidget(field('Fit end', self.fit_end, 'ps'), 0, 1)
         layout.addWidget(range_grid)
-        self.run_fit_button = QPushButton('▶ Run fit')
+        self.run_fit_button = QPushButton('Run fit')
+        self._set_icon(self.run_fit_button, 'play-fill', primary=True)
         self.run_fit_button.setObjectName('runFit');self.run_fit_button.setFixedHeight(36)
         self.run_fit_button.setProperty('role', 'primary')
         self.run_fit_button.setEnabled(False)
@@ -1259,7 +1345,6 @@ class MainWindow(QMainWindow):
         return page
     def _build_cal_ccd(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,19)
         self.cal_source = QLabel('HARDWARE')
         self.cal_source.setObjectName('calSource')
         self.cal_source.setProperty('warning', True)
@@ -1297,6 +1382,7 @@ class MainWindow(QMainWindow):
         dim_layout.addWidget(self.cal_dimensions)
         layout.addWidget(dim_row)
         self.cal_capture = QPushButton('Acquire frame')
+        self._set_icon(self.cal_capture, 'play-fill', primary=True)
         self.cal_capture.setObjectName('calCapture')
         self.cal_capture.setProperty('role', 'primary')
         self.cal_capture.clicked.connect(self.capture_calibration)
@@ -1313,7 +1399,6 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_cal_extraction(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,20)
         layout.addWidget(self._heading('Spectrum extraction'))
         grid = QWidget()
         grid_layout = QGridLayout(grid)
@@ -1350,7 +1435,6 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_cal_reference(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,17)
         layout.addWidget(self._heading('Reference spectrum'))
         self.cal_reference_name = QLabel('Illustrative demo lines')
         self.cal_reference_name.setObjectName('calReferenceName')
@@ -1360,6 +1444,7 @@ class MainWindow(QMainWindow):
         self.cal_reference_name.setStyleSheet('font:12px Consolas;');self.cal_reference_name.setFixedHeight(18)
         layout.addWidget(self.cal_reference_name)
         self.cal_reference_file = QPushButton('Import reference CSV')
+        self._set_icon(self.cal_reference_file, 'folder')
         self.cal_reference_file.setObjectName('calReferenceFile')
         self.cal_reference_file.clicked.connect(self._import_reference_csv)
         self._reg('calReferenceFile', self.cal_reference_file, False)
@@ -1396,7 +1481,6 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(frame)
     def _build_cal_model(self, parent_layout):
         frame, layout = self._section()
-        layout.setContentsMargins(17,17,17,17)
         self.cal_fit_state = QLabel('Draft')
         self.cal_fit_state.setObjectName('calFitState')
         self._reg('calFitState', self.cal_fit_state, False)
@@ -1444,6 +1528,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(note)
         details = CollapsibleSection('Installed calibration')
         self.cal_open_file = QPushButton('Open file…')
+        self._set_icon(self.cal_open_file, 'folder')
         self.cal_open_file.setObjectName('calOpenFile')
         self.cal_open_file.clicked.connect(self._open_calibration_json)
         self._reg('calOpenFile', self.cal_open_file, False)
@@ -1525,7 +1610,8 @@ class MainWindow(QMainWindow):
         self.cal_line_count.setProperty('muted', True)
         self._reg('calLineCount', self.cal_line_count, False)
         table_panel.add_tool(self.cal_line_count)
-        self.cal_add_line = QPushButton('＋ Add')
+        self.cal_add_line = QPushButton('Add')
+        self._set_icon(self.cal_add_line, 'plus')
         self.cal_add_line.setObjectName('calAddLine')
         self.cal_add_line.clicked.connect(self._cal_add_line)
         self._reg('calAddLine', self.cal_add_line, False)
@@ -1637,9 +1723,13 @@ class MainWindow(QMainWindow):
         width = min(max(380, self.toast.sizeHint().width()), max(420, min(760, self.width() - 80)))
         self.toast.setFixedWidth(width)
         self.toast.adjustSize()
-        self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 70))
+        target = QPoint(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 70))
+        self.toast.move(target + QPoint(0, 14))
         self.toast.show()
         self.toast.raise_()
+        slide = QPropertyAnimation(self.toast, b'pos', self.toast)
+        slide.setDuration(180); slide.setStartValue(target + QPoint(0, 14)); slide.setEndValue(target); slide.setEasingCurve(QEasingCurve.OutCubic)
+        slide.start(QPropertyAnimation.DeleteWhenStopped)
         self._toast_timer.start({'error': 9000, 'warning': 7000}.get(level, 5000))
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1651,10 +1741,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'toast') and self.toast.isVisible():
             self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 70))
     def _apply_visual_geometry(self):
-        width=self.width();left=round(max(272,min(340,width*.2125)))
+        width=self.width();left=round(max(300,min(356,width*.235)))
         for name in ('acquisition_scroll','analysis_scroll','calibration_scroll'):
             scroll=getattr(self,name,None)
-            if scroll is not None:scroll.setFixedWidth(260 if name=='acquisition_scroll' and 1000<=width<=1150 else left)
+            if scroll is not None:scroll.setFixedWidth(292 if name=='acquisition_scroll' and 1000<=width<=1150 else left)
         summary=round(max(190,min(240,self.height()*.27)))
         if hasattr(self,'analysis_bottom'):self.analysis_bottom.setFixedHeight(summary)
         if hasattr(self,'cal_lower'):self.cal_lower.setFixedHeight(summary)
@@ -1813,7 +1903,7 @@ class MainWindow(QMainWindow):
             connected_count = int(stage_connected) + int(camera_connected) + int(spectrometer_controlled and bool(spectrometer.get('connected')))
             total_count = 3 if spectrometer_controlled else 2
             mode_label = source_mode.upper()
-            self.hardware_mode.setItemText(0, f'HARDWARE · {connected_count}/{total_count} connected')
+            self.hardware_mode.setItemText(0, f'Hardware · {connected_count}/{total_count} connected')
             set_prop(self.hardware_mode, 'source', source_mode)  # amber only while the data is simulated
             index = self.hardware_mode.findData(source_mode)
             if index >= 0 and index != self.hardware_mode.currentIndex():
@@ -1906,8 +1996,10 @@ class MainWindow(QMainWindow):
             if busy == 'preview':
                 self.preview_button.setEnabled(True)
                 self.preview_button.setText('Stop preview')
+                self._set_icon(self.preview_button, 'stop')
             else:
                 self.preview_button.setText('Live preview')
+                self._set_icon(self.preview_button, 'activity')
             self.capture_background.setEnabled(bool(getattr(self.controller, 'online', False) and availability.get('background') and available_background(busy)))
             self._update_header(snapshot)
             self._update_cal_controls()
@@ -1931,8 +2023,24 @@ class MainWindow(QMainWindow):
             total = plan.get('total_points')
         if run.get('completed_points') is not None:
             completed = run.get('completed_points')
+        run_id = run.get('run_id')
         if busy == 'scan':
-            if status in ('paused', 'pausing'):
+            self._scan_run_id = run_id
+        elif status == 'completed' and run_id and run_id == getattr(self, '_scan_run_id', None):
+            # Seen running and now finished normally: mark it once (a stopped or failed scan is not celebrated).
+            self._scan_run_id = None; self._completed_run_id = run_id
+            self._celebrate_run(run, completed)
+        elif status in ('stopped', 'error') and run_id and run_id == getattr(self, '_scan_run_id', None):
+            self._scan_run_id = None
+            self._discard_unfinished_files(run)
+        complete = busy != 'scan' and status == 'completed' and run_id is not None and run_id == getattr(self, '_completed_run_id', None)
+        self._set_run_complete(complete)
+        if busy == 'scan':
+            if status == 'pausing':
+                # The current point finishes before the scan halts, so the bar may still advance one step.
+                self.run_status.setText('● Pausing…')
+                self._set_run_button('play', 'Resume')
+            elif status == 'paused':
                 self.run_status.setText('● Paused')
                 self._set_run_button('play', 'Resume')
             elif status in ('stopping', 'finalizing'):
@@ -1954,17 +2062,17 @@ class MainWindow(QMainWindow):
             self.run_status.setText(f'● {str(busy).capitalize()}')
             self._set_run_button('play', 'Start')
         else:
-            self.run_status.setText(status.capitalize() if status else 'Ready' if online else 'Starting…')
+            self.run_status.setText('✓ Scan complete' if complete else status.capitalize() if status else 'Ready' if online else 'Starting…')
             self._set_run_button('play', 'Start')
         if total and completed is not None:
             total_value = int(total)
             completed_value = int(completed)
-            percent = int(round(100.0 * completed_value / total_value)) if total_value else 0
-            self.progress_fill.setValue(max(0, min(100, percent)))
+            percent = 100.0 * completed_value / total_value if total_value else 0
+            self._animate_progress(max(0, min(100, percent)))
             self.progress_text.setText(f'{completed_value} / {total_value} points · {run.get("committed_frames",0)} frames')
             self.remaining.setText(str(run.get('step') if busy=='scan' else status))
         else:
-            self.progress_fill.setValue(0)
+            self._animate_progress(0)
             if busy == 'preview':
                 self.progress_text.setText('Live preview')
             elif busy == 'calibration':
@@ -2069,17 +2177,25 @@ class MainWindow(QMainWindow):
     def _update_live_spectrum(self):
         dataset = self.controller.acquisition
         snapshot = self._snapshot or {}
-        latest = snapshot.get('latest') or dataset.latest_record
+        source = snapshot.get('source_mode')
+        latest = snapshot.get('latest')
+        if isinstance(latest, dict) and latest.get('spectrum'):
+            # Keep the frame with the axis it was taken on: the worker drops its copy whenever a device
+            # (re)connects or the readout changes, and a stopped preview should stay on screen.
+            self._live_frame = (latest, snapshot.get('live_axis'))
+        frame, frame_axis = getattr(self, '_live_frame', (None, None))
+        if frame is not None and (frame.get('source_mode') not in (None, source) or (latest is None and frame.get('record_id') is not None)):
+            # Never show a simulated frame in hardware mode (or the reverse); a scan frame goes with its run.
+            frame = frame_axis = None; self._live_frame = (None, None)
+        if frame is None:
+            record = dataset.latest_record
+            if record is not None and record.get('source_mode') in (None, source):
+                frame, frame_axis = record, dataset.axis
         current = None
         saturated = 0
-        if latest is not None:
-            current = np.asarray(latest.get('spectrum') or [], dtype=float)
-            saturated = int(latest.get('saturated_pixels') or 0)
-        else:
-            snapshot_latest = snapshot.get('latest') or {}
-            if snapshot_latest.get('spectrum'):
-                current = np.asarray(snapshot_latest.get('spectrum'), dtype=float)
-            saturated = int(snapshot_latest.get('saturated_pixels') or 0)
+        if frame is not None:
+            current = np.asarray(frame.get('spectrum') or [], dtype=float)
+            saturated = int(frame.get('saturated_pixels') or 0)
         picked = self._picked_spectrum_active()
         if picked:
             current = np.asarray(dataset.groups[self._picked_delay].raw, dtype=float)
@@ -2087,7 +2203,10 @@ class MainWindow(QMainWindow):
         legend_text = f'Δt = {fmt(self._picked_delay, 4)} ps' if picked else 'Current'
         if self._spectrum_legend_current.text() != legend_text:
             self._spectrum_legend_current.setText(legend_text)
-        axis = dataset.axis or snapshot.get('live_axis')
+        # The axis of the frame on screen: a picked run spectrum uses the run's axis, a live frame the axis it
+        # was captured with (a finished simulated run must not relabel a hardware preview).
+        candidates = (dataset.axis,) if picked else (frame_axis, snapshot.get('live_axis'), dataset.axis)
+        axis = next((a for a in candidates if a and (current is None or len(a) >= len(current))), None)
         if axis and len(axis):
             x = np.asarray(axis[:len(current)] if current is not None else axis, dtype=float)
             x_label = 'Wavelength / nm'
@@ -2197,7 +2316,7 @@ class MainWindow(QMainWindow):
             path = run.get('path') or run.get('run_id') or 'Imported experiment'
             self.analysis_source.setText(f'Imported · {path}')
         elif run:
-            self.analysis_source.setText(Path(run.get('path') or 'Current experiment').name)
+            self.analysis_source.setText('Current experiment · not saved' if run.get('files_removed') else Path(run.get('path') or 'Current experiment').name)
         else:
             self.analysis_source.setText('No experiment loaded')
         delays = dataset.delays if dataset is not None else []
@@ -2226,7 +2345,7 @@ class MainWindow(QMainWindow):
         ready = bool(dataset is not None and run is not None and dataset.records and dataset.axis)
         self.run_fit_button.setEnabled(bool(self.controller.online and ready and not self._fit_running and (imported is not None or not self._snapshot.get('busy'))))
         self.export_fit.setEnabled(fit is not None and self.analysis_view.currentData()!='spectrum')
-        self.save_run.setEnabled(bool(imported is None and run is not None and not run.get('saved')))
+        self.save_run.setEnabled(bool(imported is None and run is not None and (not run.get('saved') or run.get('files_removed'))))
         self._refresh_analysis_delay_combo(delays)
         self._refresh_spectrum_legend()
     def _refresh_analysis_delay_combo(self, delays):
@@ -2933,11 +3052,40 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, 'Save folder', str(self.output_dir))
         if folder:
             self.output_dir = Path(folder)
-            self.save_status.setText(f'Folder: {self.output_dir}')
+            self._show_output_folder()
+    def _show_output_folder(self):
+        # Last two folders are enough to recognise the destination; the tooltip keeps the full path.
+        parts = self.output_dir.parts
+        self.folder_label.setText(('…\\' if len(parts) > 2 else '') + '\\'.join(parts[-2:]))
+        self.folder_label.setToolTip(f'Save folder: {self.output_dir}')
+    def _discard_unfinished_files(self, run):
+        '''An unfinished scan leaves NAME.stopped.h5 (or .partial.h5) and NAME.events.jsonl; move them to the
+        Recycle Bin so only finished experiments stay in the data folder. The frames remain in memory and can
+        still be saved from the Analysis page.'''
+        path = run.get('path')
+        if not (run.get('saved') or run.get('status') == 'error') or not path:
+            return
+        data = Path(str(path)); stem = data.name
+        for suffix in ('.stopped.h5', '.partial.h5', '.h5'):
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]; break
+        files = [data, data.with_name(stem + '.events.jsonl')]
+        moved = [f for f in files if f.exists() and _to_trash(f)]
+        left = [f for f in files if f.exists()]
+        self._discarded_paths.add(str(path))
+        if not left:
+            self.controller.dispatch('run_files_removed', {'run_id': run.get('run_id')}, success=lambda result: self.controller.request_status(), failure=lambda payload: None)
+        if left:
+            self.show_toast(f'Unfinished scan: could not remove {", ".join(f.name for f in left)}', 'warning')
+        elif moved:
+            self.show_toast(f'Scan {run.get("status")} before completion · its files were moved to the Recycle Bin (Save HDF5 on Analysis keeps the data)', 'info')
+        self._update_output_status()
     def _update_output_status(self):
         snapshot = self._snapshot or {}
         run = snapshot.get('run') or {}
-        if run.get('saved') and run.get('path'):
+        if run.get('files_removed') or (run.get('path') and str(run.get('path')) in self._discarded_paths):
+            self.save_status.setText('Unfinished scan · files removed, data kept in memory')
+        elif run.get('saved') and run.get('path'):
             self.save_status.setText(f'Saved: {run.get("path")}')
         elif run:
             self.save_status.setText('Memory-only · not saved to disk')
@@ -2973,7 +3121,7 @@ class MainWindow(QMainWindow):
             if not path:
                 return
         self.open_path.setText(str(path))
-        self.fit_status.setText('Loading Analysis file…')
+        self.fit_status.setText('Loading analysis file…')
         def success(run):
             self.fit_status.setText('Analysis file loaded')
             self.show_page('analysis')
@@ -3032,6 +3180,7 @@ class MainWindow(QMainWindow):
         mode = 'dark' if current_mode() == 'light' else 'light'
         apply_to_app(mode)
         self._refresh_run_icons()
+        self._apply_icons()
         for plot in (self.spectrum_plot, self.map_plot, self.decay_plot, self.analysis_curve, self.analysis_residual, self.cal_image, self.cal_spectrum, self.cal_mapping, self.cal_residual):
             plot.update_theme()
         self._map_dirty = True
@@ -3139,7 +3288,7 @@ class MainWindow(QMainWindow):
         source = frame.get('source') or frame.get('source_mode') or 'unknown'
         measured = str(source).lower() == 'measured'
         self.cal_frame_state.setText('● '+('Measured frame' if measured else 'Simulated frame')+' 1')
-        self.cal_source.setText(str(frame.get('source_mode') or 'HARDWARE').upper())
+        self.cal_source.setText(str(frame.get('source_mode') or 'hardware').capitalize())
         self.cal_roi_label.hide()
         self.cal_feedback.setText('Frame acquired. Extracting spectrum…')
         self._update_cal_controls()
@@ -3644,7 +3793,7 @@ class MainWindow(QMainWindow):
             self.calibration_state.setText('No installed wavelength calibration')
         if warning:
             self.calibration_state.setText(str(warning))
-        self.cal_source.setText(str(snapshot.get('source_mode') or 'HARDWARE').upper())
+        self.cal_source.setText(str(snapshot.get('source_mode') or 'hardware').capitalize())
     def _clear_calibration_frame(self, clear_pixels=False):
         self._cal_frame = None
         self._cal_profile = None
@@ -3716,6 +3865,10 @@ def validate_filename(name):
         raise ValueError('File name is a reserved Windows device name')
 
 
+def _to_trash(path):
+    # PySide6 returns a bool here (C++ also hands back the new path, which is not needed).
+    result = QFile.moveToTrash(str(path))
+    return bool(result[0] if isinstance(result, tuple) else result)
 def _nice_ceiling(value):
     # Round an axis maximum up to 1/1.2/1.5/2/2.5/3/4/5/6/7/8 × 10ⁿ so the end label reads like a tick.
     if value <= 0:

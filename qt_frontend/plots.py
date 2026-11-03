@@ -116,6 +116,14 @@ def format_reading(value, label):
     prefix, unit = label_parts(label)
     return f'{prefix} {fmt(value, 5)} {unit}'.strip()
 
+def pick_reading(value, label):
+    '''One coordinate of a picked point, keeping the axis name: "Delay / ps" -> "Delay 1.25 ps".'''
+    label = (label or '').strip()
+    name, unit = label.split(' / ', 1) if ' / ' in label else (label, '')
+    if name.strip().lower().startswith('count'):
+        return f'{fmt(value, 5)} {label.replace(" ", "")}'
+    return f'{name.strip()} {fmt(value, 5)} {unit.strip()}'.strip()
+
 class ZoomGroup:
     '''Shared zoom history for plots whose axes are linked or synchronised.
 
@@ -258,6 +266,8 @@ class ZoomViewBox(pg.ViewBox):
             ev.accept()
             self.owner.reset_view()
             return
+        if self.owner is not None and ev.button() == Qt.LeftButton and getattr(self.owner, '_pickables', None):
+            self.owner.pick_at(ev.scenePos())
         super().mouseClickEvent(ev)
 
 AXIS_TEXT_OFFSET=4
@@ -380,6 +390,7 @@ class InlineAxis(pg.AxisItem):
         super().mouseClickEvent(ev)
 
 class EditablePlot(pg.PlotWidget):
+    pointPicked = Signal(float, float)
     def __init__(self, parent=None, grid=True, invert_y=False, **kwargs):
         self._grid = bool(grid)
         self._invert_y = bool(invert_y)
@@ -431,6 +442,7 @@ class EditablePlot(pg.PlotWidget):
         self._build_zoom_overlays()
         self.setFocusPolicy(Qt.ClickFocus)
         self.plotItem.vb.sigResized.connect(self._place_overlays)
+        self.plotItem.vb.sigResized.connect(self._place_pick_label);self.plotItem.vb.sigRangeChanged.connect(self._place_pick_label)
         self.scene().sigMouseMoved.connect(self._hover_moved)
     def _build_zoom_overlays(self):
         # Floating controls inside the plot frame: readout top-left, Back / Full view top-right.
@@ -470,11 +482,12 @@ class EditablePlot(pg.PlotWidget):
         self.plotItem.layout.setContentsMargins(0,0,0,0);self.plotItem.layout.setHorizontalSpacing(0);self.plotItem.layout.setVerticalSpacing(0)
         self.left_axis.setWidth(left);self.bottom_axis.setHeight(bottom)
         for name,size in [('top',top),('right',right)]:
-            self.plotItem.showAxis(name);axis=self.plotItem.getAxis(name);axis.setStyle(showValues=False,tickLength=0);axis.setGrid(False);axis.setPen(pg.mkPen(None));axis.setTickPen(pg.mkPen(None));axis.setHeight(size) if name=='top' else axis.setWidth(size)
+            self.plotItem.showAxis(name);axis=self.plotItem.getAxis(name);axis.setStyle(showValues=False,tickLength=0);axis.setGrid(False);axis.setTicks([[],[]]);axis.setPen(pg.mkPen(None));axis.setTickPen(pg.mkPen(None));axis.setHeight(size) if name=='top' else axis.setWidth(size)
     def _place_frame(self,*args):
         rect=self.plotItem.vb.rect();dpr=self.devicePixelRatioF() or 1.0;half=.5/dpr
         self._frame.setRect(rect.adjusted(half,half,-half,-half))
     def set_empty(self,text):
+        if text:self.clear_pick()
         self._empty.setText(text,color=palette()['muted']);self._empty.setVisible(bool(text));self._position_empty()
         self._show_grid()
     def _position_empty(self,*args):
@@ -484,11 +497,15 @@ class EditablePlot(pg.PlotWidget):
         # Axis grid lines draw above view-box items, so an empty plot drops its grid instead of striking through the message.
         grid=self._grid and not (hasattr(self,'_empty') and self._empty.isVisible())
         self.plotItem.showGrid(x=grid,y=grid,alpha=1.0 if grid else 0.0)
+        # Without grid lines the zero-length ticks would show as dots beside the labels; paint them in the card colour.
+        colors=palette()
+        for axis in (self.bottom_axis,self.left_axis):axis.setTickPen(pg.mkPen(colors['chart_grid'] if grid else colors['surface']))
     def _apply_style(self):
         colors = palette()
         self.setBackground(colors['surface'])
         self.plotItem.vb.setBackgroundColor(colors['plot'])
-        frame_pen=pg.mkPen(colors['plot_border']);frame_pen.setCosmetic(True);self._frame.setPen(frame_pen)
+        # No frame: the plot sits flat on its card and the light grid marks the data area.
+        self._frame.setPen(pg.mkPen(None))
         for axis in (self.bottom_axis, self.left_axis):
             axis.setPen(pg.mkPen(None))
             axis.setTextPen(pg.mkPen(colors['muted']))
@@ -508,6 +525,7 @@ class EditablePlot(pg.PlotWidget):
         self._apply_style()
         if hasattr(self,'_empty'):self._empty.setColor(palette()['muted'])
         self._style_cursor_lines()
+        if getattr(self,'_pick',None):self._restore_pick()
     def _style_cursor_lines(self):
         # Draggable cursors: blue on hover (pyqtgraph defaults to red) and readable value tags.
         colors=palette();hover=pg.mkPen(colors['blue'],width=1.5)
@@ -525,6 +543,8 @@ class EditablePlot(pg.PlotWidget):
     def set_y_label(self, text):
         self.left_axis.setLabel(text, color=palette()['muted'], **self.AXIS_LABEL_STYLE)
     def set_axis_bounds(self, axis, low, high, manual=False):
+        # Every redraw sets bounds after replacing its series, so a selection on a removed series is dropped here.
+        self._validate_pick()
         source=self._linked_axes.get(axis)
         if source is not None:
             return source.set_axis_bounds(axis,low,high,manual=True) if manual else True
@@ -669,6 +689,8 @@ class EditablePlot(pg.PlotWidget):
         if visible:
             self._place_overlays();self._zoom_bar.raise_()
     def keyPressEvent(self,event):
+        if event.key()==Qt.Key_Escape and getattr(self,'_pick',None):
+            self.clear_pick();event.accept();return
         if event.key()==Qt.Key_Backspace and self.zoom_group.undo():
             event.accept();return
         if event.key()==Qt.Key_Home:
@@ -694,8 +716,145 @@ class EditablePlot(pg.PlotWidget):
             prefix,unit=label_parts(self.readout_units.get(axis,(self.bottom_axis if axis=='x' else self.left_axis).labelText))
             parts.append(f'{prefix} {fmt(low,5)} – {fmt(high,5)} {unit}'.strip())
         return '  ×  '.join(parts)
+    # ---- point picking ----
+    PICK_RADIUS = 9
+    def make_pickable(self, item, x_label=None, y_label=None, key='x'):
+        '''Let a scatter series be clicked: the nearest point is ringed and labelled with its coordinates.
+
+        key names the coordinate that identifies a point across data refreshes, so a selection survives the
+        series being redrawn (the decay plot draws delay on y).'''
+        # A direct hit is taken (and consumed) by the scatter itself; near misses reach the view box. Both pick.
+        item.sigPointsClicked.connect(lambda _item, _points, event: self.pick_at(event.scenePos()))
+        self._pickables = [entry for entry in getattr(self, '_pickables', []) if entry[0].scene() is not None]
+        self._pickables.append((item, x_label, y_label, key))
+        self._restore_pick()
+    def _pick_points(self, entry):
+        xs, ys = entry[0].getOriginalDataset()
+        if xs is None or ys is None:
+            return None
+        xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dx = np.log10(xs) if self._log_mode('x') else xs
+            dy = np.log10(ys) if self._log_mode('y') else ys
+        return xs, ys, dx, dy
+    def _nearest_pick(self, scene_pos):
+        view = self.plotItem.vb
+        if not view.sceneBoundingRect().contains(scene_pos):
+            return None
+        point = view.mapSceneToView(scene_pos); width, height = view.viewPixelSize()
+        best = None
+        for entry in getattr(self, '_pickables', []):
+            if entry[0].scene() is None or not entry[0].isVisible():
+                continue
+            data = self._pick_points(entry)
+            if data is None or not len(data[0]):
+                continue
+            xs, ys, dx, dy = data
+            with np.errstate(invalid='ignore'):
+                distance = np.hypot((dx - point.x()) / width, (dy - point.y()) / height)
+            if not np.isfinite(distance).any():
+                continue
+            index = int(np.nanargmin(distance))
+            if distance[index] <= self.PICK_RADIUS and (best is None or distance[index] < best[0]):
+                best = (float(distance[index]), entry, index, xs, ys, dx, dy)
+        return best
+    def pick_at(self, scene_pos):
+        '''Select the point under a click; a click away from every point clears the selection.'''
+        found = self._nearest_pick(scene_pos)
+        if found is None:
+            self.clear_pick()
+            return False
+        _, entry, index, xs, ys, _, _ = found
+        self._show_pick(entry, index)
+        self.pointPicked.emit(float(xs[index]), float(ys[index]))
+        return True
+    def _show_pick(self, entry, index):
+        item, x_label, y_label, key = entry
+        xs, ys, dx, dy = self._pick_points(entry)
+        x, y = float(xs[index]), float(ys[index]); px, py = float(dx[index]), float(dy[index])
+        if not (math.isfinite(px) and math.isfinite(py)):
+            self.clear_pick(); return
+        self._pick = {'entry': entry, 'key': key, 'value': x if key == 'x' else y}
+        colors = palette()
+        if getattr(self, '_pick_ring', None) is None:
+            self._pick_ring = pg.ScatterPlotItem(size=12); self._pick_ring.setZValue(1e6)
+            self._pick_label = pg.TextItem('', anchor=(0, 1)); self._pick_label.setZValue(1e6 + 1)
+            font = QFont('Segoe UI'); font.setPixelSize(12); self._pick_label.setFont(font)
+            self.plotItem.addItem(self._pick_ring, ignoreBounds=True); self.plotItem.addItem(self._pick_label, ignoreBounds=True)
+        # The selected point is redrawn larger in the accent colour with a card-coloured rim, apart from the data colour.
+        self._pick_ring.setData([px], [py], brush=pg.mkBrush(colors['blue']), pen=pg.mkPen(colors['surface'], width=2))
+        self._readout.hide()
+        back = QColor(colors['surface']); back.setAlpha(240)
+        self._pick_label.fill = pg.mkBrush(back); self._pick_label.border = pg.mkPen(colors['line'])
+        self._pick_label.setColor(colors['text'])
+        x_text = pick_reading(x, x_label if x_label is not None else self.bottom_axis.labelText)
+        y_text = pick_reading(y, y_label if y_label is not None else self.left_axis.labelText)
+        self._pick_label.setText(f'{x_text}\n{y_text}')
+        self._pick_view_pos = (px, py)
+        self._pick_ring.show(); self._pick_label.show()
+        self._place_pick_label()
+    def _place_pick_label(self, *args):
+        '''Put the label beside the selected point on whichever side has room, then clamp it inside the plot
+        frame, so it stays readable next to an edge or in a short plot. Re-run on zoom, pan and resize.'''
+        label = getattr(self, '_pick_label', None)
+        if not getattr(self, '_pick', None) or label is None:
+            return
+        view = self.plotItem.vb; frame = view.sceneBoundingRect()
+        point = view.mapViewToScene(QPointF(*self._pick_view_pos))
+        # Zoomed or panned away from the point: no label floating without its point.
+        label.setVisible(frame.contains(point))
+        if not label.isVisible():
+            return
+        size = label.textItem.boundingRect(); width, height = size.width(), size.height(); gap = 8; edge = 3
+        x = point.x() + gap if point.x() + gap + width <= frame.right() - edge else point.x() - gap - width
+        y = point.y() - gap - height if point.y() - gap - height >= frame.top() + edge else point.y() + gap
+        x = min(max(x, frame.left() + edge), frame.right() - edge - width)
+        y = min(max(y, frame.top() + edge), frame.bottom() - edge - height)
+        label.setAnchor((0, 0)); label.setPos(view.mapSceneToView(QPointF(x, y)))
+    def clear_pick(self):
+        self._pick = None
+        for mark in (getattr(self, '_pick_ring', None), getattr(self, '_pick_label', None)):
+            if mark is not None:
+                mark.hide()
+    def _restore_pick(self):
+        # After a redraw, follow the selected point into the new series by its identifying coordinate.
+        pick = getattr(self, '_pick', None)
+        if not pick:
+            return
+        if pick['entry'][0].scene() is not None:
+            index = self._pick_index(pick['entry'], pick['key'], pick['value'])
+            self.clear_pick() if index is None else self._show_pick(pick['entry'], index)
+            return
+        self._pickables = [entry for entry in self._pickables if entry[0].scene() is not None]
+        for entry in self._pickables:
+            if entry[3] != pick['key']:
+                continue
+            index = self._pick_index(entry, pick['key'], pick['value'])
+            if index is not None:
+                self._show_pick(entry, index); return
+        self.clear_pick()
+    def _pick_index(self, entry, key, value):
+        data = self._pick_points(entry)
+        if data is None or not len(data[0]):
+            return None
+        values = data[0] if key == 'x' else data[1]
+        with np.errstate(invalid='ignore'):
+            matches = np.flatnonzero(np.abs(values - value) <= 1e-9 * max(1.0, abs(value)))
+        return int(matches[0]) if matches.size else None
+    def _validate_pick(self):
+        pick = getattr(self, '_pick', None)
+        if pick and pick['entry'][0].scene() is None:
+            self._restore_pick()
     def _hover_moved(self,pos):
         view=self.plotItem.vb
+        self._validate_pick()
+        # A pointing hand over a pickable point says it can be clicked.
+        hand=bool(getattr(self,'_pickables',None)) and self._nearest_pick(pos) is not None
+        if hand!=getattr(self,'_pick_hover',False):
+            self._pick_hover=hand;view.setCursor(Qt.PointingHandCursor if hand else Qt.CrossCursor)
+        if getattr(self,'_pick',None):
+            # A selected point keeps its coordinates on screen; the readout under the mouse would compete with it.
+            self._readout.hide();return
         if self._empty.isVisible() or not view.sceneBoundingRect().contains(pos):
             self._readout.hide();return
         point=view.mapSceneToView(pos)
@@ -1126,6 +1285,7 @@ class DecayPlot(EditablePlot):
         xs = np.asarray([item[0] for item in pairs], dtype=float)
         ys = np.asarray([item[1] for item in pairs], dtype=float)
         item = self.plotItem.plot(xs, ys, antialias=True,pen=pg.mkPen(colors['data'], width=1.4), symbol='o', symbolSize=6, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+        self.make_pickable(item, None, 'Delay / ps', key='y')
         self._items.append(item)
         self.set_axis_bounds('y', min(ys), max(ys))
         try:
@@ -1162,6 +1322,8 @@ class AnalysisCurvePlot(EditablePlot):
         self.plotItem.addItem(self.marker)
         self.plotItem.addItem(self.point)
         self.marker.sigPositionChanged.connect(self._moved)
+        # Clicking an observed point also moves the delay cursor to it.
+        self.pointPicked.connect(lambda x, y: self.delayPicked.emit(x) if self._mode == 'decay' else None)
         self.set_x_label('Delay / ps')
         self.set_y_label('Counts per second')
         self.update_theme()
@@ -1198,7 +1360,7 @@ class AnalysisCurvePlot(EditablePlot):
             if scale == 'log':
                 ys = np.where(ys > 0, ys, np.nan)
             item = self.plotItem.plot(xs, ys, antialias=True,pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
-            item.sigPointsClicked.connect(lambda item,points,event:self.delayPicked.emit(float(points[0].pos().x())) if points else None)
+            self.make_pickable(item)
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
         else:
@@ -1320,6 +1482,8 @@ class ResidualPlot(EditablePlot):
             xs = np.asarray([item[0] for item in data], dtype=float)
             ys = np.asarray([item[1] for item in data], dtype=float)
             item = self.plotItem.plot(xs, ys, antialias=True,pen=None, symbol='o', symbolSize=6, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['amber']))
+            # The x title is hidden under the shared decay plot, so name the coordinates here.
+            self.make_pickable(item, 'Delay / ps', 'Residual')
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
         else:
@@ -1541,6 +1705,7 @@ class CalibrationMappingPlot(EditablePlot):
             wavelengths.append(float(wavelength))
         if pixels:
             item = self.plotItem.plot(np.asarray(pixels), np.asarray(wavelengths), antialias=True,pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+            self.make_pickable(item, 'CCD pixel', 'λ / nm')
             self._items.append(item)
         if solution and solution.get('wavelengths_nm'):
             axis = np.asarray(solution.get('wavelengths_nm'), dtype=float)
@@ -1609,6 +1774,7 @@ class CalibrationResidualPlot(EditablePlot):
         colors = palette()
         if xs:
             item = self.plotItem.plot(np.asarray(xs), np.asarray(ys), antialias=True,pen=None, symbol='o', symbolSize=5, symbolBrush=pg.mkBrush(colors['amber']), symbolPen=pg.mkPen(colors['amber']))
+            self.make_pickable(item, 'CCD pixel', 'Δ / nm')
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
             span = max(.002, max(abs(value) for value in ys) * 1.4)
