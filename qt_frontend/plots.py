@@ -476,9 +476,14 @@ class EditablePlot(pg.PlotWidget):
         self._frame.setRect(rect.adjusted(half,half,-half,-half))
     def set_empty(self,text):
         self._empty.setText(text,color=palette()['muted']);self._empty.setVisible(bool(text));self._position_empty()
+        self._show_grid()
     def _position_empty(self,*args):
         if hasattr(self,'_empty'):
             x,y=self.viewRange();self._empty.setPos((x[0]+x[1])/2,(y[0]+y[1])/2)
+    def _show_grid(self):
+        # Axis grid lines draw above view-box items, so an empty plot drops its grid instead of striking through the message.
+        grid=self._grid and not (hasattr(self,'_empty') and self._empty.isVisible())
+        self.plotItem.showGrid(x=grid,y=grid,alpha=1.0 if grid else 0.0)
     def _apply_style(self):
         colors = palette()
         self.setBackground(colors['surface'])
@@ -495,7 +500,7 @@ class EditablePlot(pg.PlotWidget):
             except Exception:
                 pass
         try:
-            self.plotItem.showGrid(x=self._grid, y=self._grid, alpha=1.0 if self._grid else 0.0)
+            self._show_grid()
             for name in ('top','right'):self.plotItem.getAxis(name).setGrid(False)
         except Exception:
             pass
@@ -514,10 +519,11 @@ class EditablePlot(pg.PlotWidget):
                 label=getattr(line,'label',None)
                 if label is not None:
                     label.setColor(colors['text']);label.fill=pg.mkBrush(tag)
+    AXIS_LABEL_STYLE = {'font-family': 'Segoe UI', 'font-size': '12px'}
     def set_x_label(self, text):
-        self.bottom_axis.setLabel(text, color=palette()['muted'])
+        self.bottom_axis.setLabel(text, color=palette()['muted'], **self.AXIS_LABEL_STYLE)
     def set_y_label(self, text):
-        self.left_axis.setLabel(text, color=palette()['muted'])
+        self.left_axis.setLabel(text, color=palette()['muted'], **self.AXIS_LABEL_STYLE)
     def set_axis_bounds(self, axis, low, high, manual=False):
         source=self._linked_axes.get(axis)
         if source is not None:
@@ -1559,7 +1565,7 @@ class CalibrationResidualPlot(EditablePlot):
         self.zero = pg.InfiniteLine(pos=0, angle=0, movable=False, pen=pg.mkPen(colors['plot_border'], width=1))
         self.plotItem.addItem(self.zero)
         self.set_x_label('CCD pixel')
-        self.set_y_label('Δ nm')
+        self.set_y_label('Δ / nm')
         self.update_theme()
     def update_theme(self):
         super().update_theme()

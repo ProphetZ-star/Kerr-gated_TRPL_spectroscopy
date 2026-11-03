@@ -407,10 +407,14 @@ class MetricsOverlay(QFrame):
         self.values['rms'].setText(rms or '—'); self.values['max'].setText(max_error or '—'); self.values['range'].setText(coverage or '—')
         for child in self.findChildren(QWidget,options=Qt.FindDirectChildrenOnly):
             if child.layout() is not None:child.layout().invalidate();child.layout().activate()
-        self.layout().invalidate();self.layout().activate();self.setFixedSize(self.layout().sizeHint());self.place()
+        # +2 px leaves room for the 1 px stylesheet border, which the layout's size hint does not include.
+        self.layout().invalidate();self.layout().activate();hint=self.layout().sizeHint();self.setFixedSize(hint.width()+2,hint.height()+2);self.place()
     def place(self):
         parent=self.parentWidget()
-        if parent is not None and not self._moved: self.move(max(8,parent.width()-self.sizeHint().width()-24),16)
+        if parent is None or self._moved:return
+        # Top-left of the plot area: a rising pixel→wavelength mapping leaves that corner empty.
+        rect=parent._view_rect() if hasattr(parent,'_view_rect') else None
+        self.move(int(rect.left())+8,int(rect.top())+8) if rect is not None else self.move(max(8,parent.width()-self.sizeHint().width()-24),16)
     def mousePressEvent(self,event):
         if event.button()==Qt.LeftButton:
             self._drag=event.globalPosition().toPoint()-self.pos(); self.setCursor(Qt.ClosedHandCursor)

@@ -1137,7 +1137,7 @@ class MainWindow(QMainWindow):
         self.analysis_curve.delayPicked.connect(self._analysis_delay_picked)
         panel.add_body(self.analysis_curve, 1)
         self.analysis_residual_wrap = QWidget()
-        self.analysis_residual_wrap.setFixedHeight(90)
+        self.analysis_residual_wrap.setFixedHeight(124)
         self.analysis_residual_wrap.setObjectName('analysisResidualWrap')
         residual_layout = QVBoxLayout(self.analysis_residual_wrap)
         residual_layout.setContentsMargins(0, 0, 0, 0)
@@ -1541,7 +1541,7 @@ class MainWindow(QMainWindow):
         self.cal_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         for column,size in ((0,30),(4,36)):
             self.cal_table.horizontalHeader().setSectionResizeMode(column,QHeaderView.Fixed);self.cal_table.setColumnWidth(column,size)
-        self.cal_table.horizontalHeader().setMinimumSectionSize(20);self.cal_table.horizontalHeader().setFixedHeight(34);self.cal_table.verticalHeader().setDefaultSectionSize(37)
+        self.cal_table.horizontalHeader().setMinimumSectionSize(20);self.cal_table.horizontalHeader().setFixedHeight(34);self.cal_table.verticalHeader().setDefaultSectionSize(32)
         self.cal_table.itemSelectionChanged.connect(self._cal_selection_changed)
         self.cal_table.cellClicked.connect(lambda row, column: self.cal_table.selectRow(row))
         self._reg('calPairs', self.cal_table, False)
@@ -1568,7 +1568,7 @@ class MainWindow(QMainWindow):
         self.cal_residual.bottom_axis.setStyle(showValues=False)
         self.cal_residual.setObjectName('calResidual')
         self._reg('calResidual', self.cal_residual, False)
-        self.cal_residual.setFixedHeight(57)
+        self.cal_residual.setFixedHeight(84)  # room for the rotated Δ / nm title between the ±end labels
         holder_layout.addWidget(self.cal_residual)
         mapping_panel.add_body(self.cal_mapping_holder, 1)
         layout.addWidget(mapping_panel, 21)
@@ -1726,6 +1726,11 @@ class MainWindow(QMainWindow):
         self._on_connecting_changed()
         self._auto_connect_next(pending)
     def _auto_connect_next(self, pending):
+        if self._selected_source != 'hardware':
+            # The user switched source mid-sequence; scan errors from the simulated devices are not news.
+            self._auto_connecting = set()
+            self._on_connecting_changed()
+            return
         if not pending:
             self.controller.request_status()
             if self._auto_connect_results:
@@ -1809,6 +1814,7 @@ class MainWindow(QMainWindow):
             total_count = 3 if spectrometer_controlled else 2
             mode_label = source_mode.upper()
             self.hardware_mode.setItemText(0, f'HARDWARE · {connected_count}/{total_count} connected')
+            set_prop(self.hardware_mode, 'source', source_mode)  # amber only while the data is simulated
             index = self.hardware_mode.findData(source_mode)
             if index >= 0 and index != self.hardware_mode.currentIndex():
                 self.hardware_mode.setCurrentIndex(index)
@@ -2008,13 +2014,13 @@ class MainWindow(QMainWindow):
                         if key!=self._plan_display_key or self.controller.acquisition.run:return
                         if not plan.get('delays_ps'):return
                         self._last_plan=plan
-                        self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scans")
+                        self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scan{'s' if plan['rounds'] != 1 else ''}")
                         duration="Estimated "+format_duration(plan['estimated_seconds'])
                         self.remaining.setText(duration+f" / ×{request['speedup']:g} simulation" if self._selected_source=='simulation' else duration)
                     self.controller.dispatch('plan',request,success=planned,failure=lambda error:None)
                 elif hasattr(self,'_last_plan'):
                     plan=self._last_plan
-                    self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scans")
+                    self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scan{'s' if plan['rounds'] != 1 else ''}")
                     duration="Estimated "+format_duration(plan['estimated_seconds'])
                     self.remaining.setText(duration+f" / ×{request['speedup']:g} simulation" if self._selected_source=='simulation' else duration)
         except Exception:
@@ -2048,6 +2054,7 @@ class MainWindow(QMainWindow):
         planned=(dataset.run or {}).get('plan',{}).get('delays_ps',[-2,20])
         vmin, vmax = self.map_plot.set_map(dataset.axis, spectra, scale, planned, saturated, self._map_levels)
         self.map_saturated_key.setVisible(bool(saturated))
+        self.map_color_key.setVisible(bool(spectra))  # a 1–1 colour key before any data is noise
         self.color_min.set_value_text(_format_map_value(vmin))
         self.color_max.set_value_text(_format_map_value(vmax))
         self._apply_visual_geometry()  # key width follows the value texts; keep its right edge on the map edge
@@ -2093,7 +2100,7 @@ class MainWindow(QMainWindow):
         self.spectrum_plot.set_spectrum(x, current, bg_array, x_label, self.spectrum_scale.current())
         self.spectrum_plot.set_axis_bounds('x',float(np.min(x)),float(np.max(x)))
         full_scale=float(snapshot.get('camera',{}).get('full_scale',65535));logarithmic=self.spectrum_scale.current()=='log'
-        self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else full_scale*1.05)
+        self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
         self.spectrum_plot.set_y_label('CCD / counts')  # log axes label decades in counts
         self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(axis) and current is not None)
         if saturated > 0:
@@ -3709,6 +3716,12 @@ def validate_filename(name):
         raise ValueError('File name is a reserved Windows device name')
 
 
+def _nice_ceiling(value):
+    # Round an axis maximum up to 1/1.2/1.5/2/2.5/3/4/5/6/7/8 × 10ⁿ so the end label reads like a tick.
+    if value <= 0:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(value))
+    return next(step * magnitude for step in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10) if step * magnitude >= value)
 def _format_map_value(value):
     try:
         value = float(value)
