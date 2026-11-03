@@ -18,12 +18,13 @@ class Controller(QObject):
     fitStarted=Signal(str)
     fitCancelled=Signal(str)
     closingFinished=Signal()
+    connectingChanged=Signal()
     data=Signal(); state=Signal()
     def __init__(self,bridge=None,parent=None):
         super().__init__(parent)
         self.bridge=bridge or BackendBridge(self)
         self.snapshot={}; self.acquisition=Dataset(); self.analysis_imported=None
-        self.online=False; self._callbacks={}; self._started=False
+        self.online=False; self._callbacks={}; self._started=False; self._connecting={}
         self._records_inflight=None; self._record_failed=None
         self._analysis_generation=0
         self._fit_jobs={}; self._fit_generations={}; self._fit_timer=QTimer(self); self._fit_timer.setInterval(300); self._fit_timer.timeout.connect(self._poll_fits)
@@ -71,12 +72,22 @@ class Controller(QObject):
             QTimer.singleShot(0,run_immediate)
             return token
         self._callbacks[token]=(success,failure,command)
+        family=(data or {}).get('device') if command=='device_connect' else None
+        if family:
+            self._connecting[token]=family; self.connectingChanged.emit()
         return token
+    @property
+    def connecting(self):
+        return set(self._connecting.values())
+    def _finish_connecting(self,token):
+        if self._connecting.pop(token,None) is not None:
+            self.connectingChanged.emit()
     def _on_done(self,token,result):
         callback=self._callbacks.pop(token,None)
         if callback and callback[0] is not None:
             try: callback[0](result)
             except Exception as error: self.error.emit(str(error))
+        self._finish_connecting(token)
     def _on_failed(self,token,payload):
         callback=self._callbacks.pop(token,None)
         message=payload.get('message') if isinstance(payload,dict) else str(payload)
@@ -85,6 +96,7 @@ class Controller(QObject):
             except Exception as error: self.error.emit(str(error))
         else:
             self.error.emit(message)
+        self._finish_connecting(token)
     def _on_ready(self,ready):
         self.online=bool(ready)
         self.ready.emit(bool(ready)); self.readyChanged.emit(bool(ready))

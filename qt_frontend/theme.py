@@ -34,6 +34,7 @@ QPushButton#stop:enabled{background:%(danger)s;color:%(bg)s;font-weight:600;}
 QPushButton#run,QPushButton#footExport,QPushButton#calExport,QPushButton#calApply{font-weight:600;}
 QPushButton[role=accent]{background:%(accent)s;color:%(chip_text)s;font-weight:600;}QPushButton[role=accent]:hover,QPushButton[role=accent]:pressed{background:%(accent_hover)s;}
 QPushButton[role=dangerText]{color:%(danger)s;background:transparent;}
+QPushButton[role=danger]{background:%(danger)s;color:%(bg)s;font-weight:600;}
 QPushButton#connectionButton{height:26px;min-height:26px;padding:0 7px;background:transparent;color:%(muted)s;}QPushButton#connectionButton:hover{background:%(btn)s;color:%(text)s;}
 QPushButton#connectionButton[state=connected]{color:%(data)s;}QPushButton#connectionButton[state=partial]{color:%(warning)s;}QPushButton#connectionButton[state=simulated]{color:%(warning)s;}
 QComboBox#sourceMode{background:%(amber)s;color:%(bg)s;font-weight:600;font-size:11px;min-height:27px;padding:0 24px;}QPushButton#theme{min-height:27px;min-width:32px;}
@@ -63,7 +64,7 @@ QToolTip{background:%(surface)s;color:%(text)s;border:1px solid %(line)s;padding
 QDialog{background:%(surface)s;color:%(text)s;}QMessageBox{background:%(surface)s;}
 QFrame#calMetrics{background:%(surface)s;border:0;border-radius:4px;}QFrame#calMetrics QLabel{font-size:11px;color:%(muted)s;}QFrame#calMetrics QLabel[value=true]{font-family:Consolas;font-size:11px;color:%(text)s;}
 QWidget#startupOverlay{background:rgba(6,11,20,110);}QFrame#startupCard{background:%(surface)s;border:1px solid %(line)s;border-radius:8px;}QLabel#startupTitle{font-size:17px;font-weight:600;}QLabel#startupMessage{color:%(muted)s;}
-QLabel#toast{background:%(toast)s;border:1px solid %(border_hover)s;border-radius:5px;padding:8px 16px;color:%(text)s;}
+QLabel#toast{background:%(toast)s;border:1px solid %(border_hover)s;border-left:6px solid %(blue)s;border-radius:8px;padding:14px 22px;color:%(text)s;font-size:15px;font-weight:600;}
 QLabel[error=true]{color:%(danger)s;}
 QFrame#dialogDivider{background:%(line)s;border:0;}
 QLabel#deviceState{font-size:12px;font-weight:600;padding:3px 10px;border-radius:10px;background:%(btn)s;color:%(muted)s;}
@@ -116,7 +117,7 @@ QPushButton[nav=true][active=true]{border-bottom:2px solid %(blue)s;}
 QPushButton#theme{min-width:27px;max-width:27px;min-height:27px;max-height:27px;padding:0;}
 QHeaderView::section{font-size:12px;}
 QTableWidget{font-size:13px;}
-QLabel#advancedInfo{font-size:11px;color:%(muted)s;}
+QLabel#advancedInfo{font-size:11px;color:%(muted)s;}QLabel#advancedHeading{font-size:11px;font-weight:600;color:%(text)s;padding-top:4px;border-top:1px solid %(line)s;}QLabel#coolingStatus{font-size:12px;color:%(text)s;}
 QPushButton#plotChip{font-size:11px;min-height:22px;max-height:22px;padding:0 9px;border-radius:4px;background:%(btn)s;color:%(text)s;font-weight:400;}QPushButton#plotChip:hover{background:%(btn_hover)s;}
 QLabel#plotReadout{font:11px Consolas;color:%(text)s;background:%(overlay)s;border-radius:4px;padding:3px 7px;}
 QLineEdit#axisEndpointEdit{font:12px 'Segoe UI';min-height:0;padding:0 3px;border:0;border-bottom:1px solid %(blue)s;border-radius:0;background:%(surface)s;color:%(text)s;}
@@ -140,6 +141,10 @@ def qss(mode=None):
         a,b=QColor(fg),QColor(bg);return QColor(*[round(x*amount+y*(1-amount)) for x,y in zip(a.getRgb()[:3],b.getRgb()[:3])]).name()
     style+='QPushButton:disabled{background:'+blend(colors['btn'],colors['surface'],.55)+';color:'+blend(colors['text'],colors['surface'])+';}'
     style+='QPushButton[role=primary]:disabled{background:'+blend(colors['blue'],colors['surface'])+';color:'+blend('#ffffff',colors['surface'])+';}'
+    for level,key in (('info','blue'),('success','success'),('warning','warning'),('error','danger')):
+        style+=f"QLabel#toast[level={level}]{{border-color:{blend(colors[key],colors['toast'],.45)};border-left:6px solid {colors[key]};background:{blend(colors[key],colors['toast'],.12)};}}"
+    style+='QPushButton[role=danger]:hover,QPushButton[role=danger]:pressed{background:'+blend(colors['danger'],colors['text'],.85)+';}'
+    style+='QPushButton[role=danger]:disabled{background:'+blend(colors['danger'],colors['surface'])+';color:'+blend('#ffffff',colors['surface'])+';}'
     return style
 def apply_theme(app,mode):
     global _CURRENT

@@ -1,13 +1,13 @@
 '''Validation facade for native backend commands.'''
 import math
-from backend.models import RunRequest,MoveRequest,CameraConfig,BackgroundRequest,SpectrographConfig,CalibrationRequest,FitRequest
+from backend.models import RunRequest,MoveRequest,CameraConfig,ReadoutRequest,CoolingRequest,VelocityRequest,BackgroundRequest,SpectrographConfig,CalibrationRequest,FitRequest
 from backend.calibration_models import CaptureRequest,ExtractRequest,MappingRequest,ApplyRequest
 from backend.contracts import ConnectBody,DeviceBody,SDKBody,PIUSBBody,DeviceNameBody
 
 class ValidationError(ValueError):
     pass
 
-COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard export analysis_open analysis_close fit task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
+COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard export analysis_open analysis_close fit task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
 
 def _pydantic_text(name,error):
     try:
@@ -83,7 +83,7 @@ def validate_command(name,data=None):
         if 'latest_version' in data:
             out['latest_version']=_int(data,'latest_version',name,minimum=0)
         return out
-    if name in {'zero','stage_stop','preview_start','preview_stop','background_stop','calibration_frame','calibration_stop','device_ports','device_drivers'}:
+    if name in {'zero','stage_reference','stage_stop','preview_start','preview_stop','background_stop','calibration_frame','calibration_stop','device_ports','device_drivers'}:
         return {}
     if name=='connect':
         return _model(name,ConnectBody,data)
@@ -97,6 +97,12 @@ def validate_command(name,data=None):
         return _model(name,PIUSBBody,data)
     if name=='configure':
         return _model(name,CameraConfig,data)
+    if name=='camera_readout':
+        return _model(name,ReadoutRequest,data)
+    if name=='camera_cooling':
+        return _model(name,CoolingRequest,data)
+    if name=='stage_velocity':
+        return _model(name,VelocityRequest,data)
     if name=='move':
         return _model(name,MoveRequest,data)
     if name=='spectrograph':

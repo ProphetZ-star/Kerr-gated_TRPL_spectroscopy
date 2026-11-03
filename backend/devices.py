@@ -2,6 +2,7 @@
 from copy import deepcopy
 import re
 from .drivers.sim import SimCamera, SimStage
+from .readout import default_readout
 from .errors import CommandError
 from .drivers.registry import default_registry,SPECTRAL_CONTROLS
 from .models import SpectrographConfig
@@ -16,9 +17,11 @@ class OfflineCamera:
     exposure_s=1.0
     temperature_c=None
 
+    readout=default_readout(256)
+
     def capabilities(self):
-        return dict(model='Andor Newton DU920P',shape=[255,1024],pixels=1024,full_scale=65535,
-                    read_modes=['fvb','full_image'],source_mode='hardware',temperature_c=None)
+        return dict(model='Andor Newton DU920P',shape=[255,1024],pixels=1024,chip_pixels=1024,detector_rows=256,full_scale=65535,
+                    read_modes=['fvb','full_image'],source_mode='hardware',temperature_c=None,cooler_on=None,readout=dict(self.readout))
 
 
 class OfflineStage:

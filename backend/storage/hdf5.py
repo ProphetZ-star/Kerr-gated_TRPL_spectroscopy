@@ -24,13 +24,13 @@ def parse_json(value):
     return json.loads(value,parse_constant=nonfinite)
 
 
-def validate_record(record):
+def validate_record(record,pixels=1024):
     from .export import finite_number
     if not isinstance(record,dict) or not {'spectrum','record_id','round_index','point_index','frame_index','delay_ps','exposure_s'}<=record.keys():
         raise ValueError('Experiment record is missing required fields')
     spectrum=np.asarray(record['spectrum'])
-    if spectrum.shape!=(1024,) or spectrum.dtype.kind not in 'iu' or np.any(spectrum<np.iinfo(np.int32).min) or np.any(spectrum>np.iinfo(np.int32).max):
-        raise ValueError('Raw spectrum must contain exactly 1024 int32-compatible integer counts')
+    if spectrum.shape!=(pixels,) or spectrum.dtype.kind not in 'iu' or np.any(spectrum<np.iinfo(np.int32).min) or np.any(spectrum>np.iinfo(np.int32).max):
+        raise ValueError(f'Raw spectrum must contain exactly {pixels} int32-compatible integer counts')
     for key in ('record_id','round_index','point_index','frame_index'):
         if isinstance(record[key],(bool,np.bool_)) or not isinstance(record[key],(int,np.integer)) or record[key]<0:
             raise ValueError(f'{key} must be a nonnegative integer')
@@ -85,6 +85,8 @@ class HDFWriter:
 
     def _loop(self,metadata):
         file=log=None;created=initialized=created_log=False;active=[]
+        # Spectrum width follows the run's CCD readout (cropped/binned); older metadata implies the full chip.
+        pixels=int(((metadata.get('config') or {}).get('applied') or {}).get('pixels') or 1024)
         def flush():
             file.flush();self.stats['flushes']+=1
         def fail(future,exc):
@@ -96,7 +98,7 @@ class HDFWriter:
             file.create_group('derived');analysis=file.create_group('analysis')
             for task_id,result in metadata.get('analysis',{}).items():analysis.create_dataset(task_id,data=strict_json(result),dtype=text)
             raw=file.create_group('raw')
-            spectra=raw.create_dataset('spectra',(0,1024),maxshape=(None,1024),dtype='i4',chunks=(32,1024),compression='lzf',shuffle=True)
+            spectra=raw.create_dataset('spectra',(0,pixels),maxshape=(None,pixels),dtype='i4',chunks=(32,pixels),compression='lzf',shuffle=True)
             record_meta=raw.create_dataset('record_meta',(0,),maxshape=(None,),dtype=text)
             indices=raw.create_dataset('record_index',(0,4),maxshape=(None,4),dtype='i8')
             committed=raw.create_dataset('committed',(0,),maxshape=(None,),dtype='?')
@@ -119,7 +121,7 @@ class HDFWriter:
                             _,record,ack=active[end];end+=1
                             if self.failure:fail(ack,RuntimeError(self.failure));continue
                             try:
-                                validate_record(record)
+                                validate_record(record,pixels)
                                 if record.get('inject_write_failure'):raise OSError('Injected disk write failure')
                                 encoded.append(strict_json({k:v for k,v in record.items() if k not in {'spectrum','inject_write_failure'}}))
                                 batch.append((record,ack))
@@ -193,8 +195,9 @@ def _read_run(path):
     with h5py.File(path, 'r') as f:
         if 'raw/spectra' not in f or 'raw/committed' not in f:
             raise ValueError('Unsupported experiment file')
-        if f['raw/spectra'].ndim!=2 or f['raw/spectra'].shape[1]!=1024:
-            raise ValueError('This release reads 1024-pixel FVB files only')
+        if f['raw/spectra'].ndim!=2 or not 1<=f['raw/spectra'].shape[1]<=1024:
+            raise ValueError('Raw spectra must be a 2-D array of at most 1024 pixels')
+        pixels=int(f['raw/spectra'].shape[1])
         if f['raw/spectra'].dtype.kind not in 'iu':raise ValueError('Raw spectra must have an integer dtype')
         if f['raw/committed'].ndim!=1 or f['raw/record_meta'].ndim!=1:raise ValueError('Invalid raw record dimensions')
         valid = np.flatnonzero(f['raw/committed'][:])
@@ -208,7 +211,7 @@ def _read_run(path):
             spectra_batch=f['raw/spectra'][selection];metadata_batch=f['raw/record_meta'][selection]
             for counts,encoded in zip(spectra_batch,metadata_batch):
                 meta=parse_json(encoded);meta['spectrum']=counts
-                validate_record(meta);records.append(meta)
+                validate_record(meta,pixels);records.append(meta)
         metadata={k:parse_json(f[k].attrs['json']) for k in ['meta','config','devices','coordinates','calibration','background','simulation']}
         if any(not isinstance(metadata[k],dict) for k in ['meta','config','devices','coordinates','calibration','simulation']):raise ValueError('Invalid experiment metadata shape')
         from ..models import RunRequest

@@ -86,6 +86,32 @@ class CameraConfig(_StrictModel):
     exposure_s: float = Field(ge=0.001, le=3600.0)
 
 
+class ReadoutRequest(_StrictModel):
+    mode: Literal["fvb", "roi"] = "fvb"
+    x0: int = Field(default=0, ge=0, le=1023)
+    x1: int = Field(default=1023, ge=0, le=1023)
+    y0: int = Field(default=0, ge=0, le=511)
+    y1: int = Field(default=255, ge=0, le=511)
+    hbin: Literal[1, 2, 4, 8, 16] = 1
+    vbin: Literal["full"] | int = "full"
+
+    @field_validator("vbin")
+    @classmethod
+    def _positive_vbin(cls, value):
+        if value != "full" and not 1 <= value <= 512:
+            raise ValueError("vbin must be 'full' or 1–512")
+        return value
+
+
+class CoolingRequest(_StrictModel):
+    enabled: bool
+    target_c: float = Field(ge=-150.0, le=30.0)
+
+
+class VelocityRequest(_StrictModel):
+    velocity_mm_s: float = Field(gt=0.0, le=1000.0)
+
+
 class BackgroundRequest(_StrictModel):
     kind: Literal["dark", "optical_background"]
     condition: str = Field(min_length=1, max_length=500)

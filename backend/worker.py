@@ -19,6 +19,7 @@ from .storage.hdf5 import HDFWriter, choose_path, read_run, append_analysis
 from .storage.output import output_info,prepare_output
 from .storage.export import export_csv
 from .calibration_service import CalibrationWorkbench
+from .readout import readout_axis,readout_shape
 from .errors import CommandError,error_status
 
 
@@ -54,14 +55,14 @@ class Engine:
         self.devices=DeviceConnections(device_factories);self.zero=150.0;self.zero_version=1
         self.revision=0;self.busy=None;self.latest=None;self.background=None
         self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
-        self.latest_axis=self.calibration['wavelengths_nm']
+        self.latest_axis=None
         self.spectrograph=dict(center_nm=600.0,grating=300,slit_um=200.0)
         self.calibration_workbench=CalibrationWorkbench()
         recorded=self.calibration_workbench.recorded_spectrograph()
         if recorded is not None:self.spectrograph=recorded
         restored=self.calibration_workbench.restore(self.spectrograph)
         if restored is not None and restored.get('source')=='measured':self.calibration=restored
-        self.latest_axis=self.calibration['wavelengths_nm']
+        self.latest_axis=self.live_axis()
         self.analysis_lock=RLock()
         self.current=None;self.runs={};self.stop=Event();self.pause=Event();self.job=None
         self.commands={};self.tasks={};self.pool=ThreadPoolExecutor(max_workers=1);self.last_preview=0
@@ -80,9 +81,18 @@ class Engine:
     @property
     def connected(self):return all(link['connected'] for link in self.devices.links.values())
 
+    def live_axis(self):
+        # The installed calibration covers the full chip; live spectra use the current ROI/binning.
+        readout=getattr(self.camera,'readout',None)
+        axis=self.calibration['wavelengths_nm']
+        return copy.deepcopy(axis) if readout is None else readout_axis(axis,readout)
+
     def stage_state(self,run=None):
         connected=self.devices.connected('stage');simulated=self.devices.mode=='simulation'
-        return dict(controller_reported_mm=self.stage.position_mm if connected else None,
+        return dict(velocity_mm_s=getattr(self.stage,'velocity_mm_s',None) if connected else None,
+                    max_velocity_mm_s=getattr(self.stage,'max_velocity_mm_s',None) if connected else None,
+                    referenced=bool(getattr(self.stage,'referenced',True)) if connected else None,
+                    controller_reported_mm=self.stage.position_mm if connected else None,
                     position_source='simulated_controller' if simulated else getattr(self.stage,'position_source','controller') if connected else 'unavailable',
                     position_sensor=bool(getattr(self.stage,'position_sensor',False)),
                     delay_ps=mm_to_delay(self.stage.position_mm,self.zero) if connected else None,
@@ -96,14 +106,16 @@ class Engine:
     def require_operation(self,name):
         needed={'configure':('camera',),'move':('stage',),'zero':('stage',),
                 'preview_start':('camera',),'background':('camera',),
-                'calibration_capture':('camera',),'run':('stage','camera')}.get(name,())
+                'calibration_capture':('camera',),'run':('stage','camera'),'camera_readout':('camera',),'camera_cooling':('camera',),
+                'stage_velocity':('stage',),'stage_reference':('stage',)}.get(name,())
         self.devices.require(*needed)
+        if name in ('move','run') and not getattr(self.stage,'referenced',True):
+            raise CommandError('Reference the delay stage before moving it')
 
     def acquire_counts(self,delay,seed,index,exposure,center,fault='none',**options):
         if self.devices.mode=='simulation':return self.camera.acquire(delay,seed,index,exposure,center,fault,**options)
-        try:image=self.camera.capture(exposure,'fvb',self.stop)
+        try:return self.camera.capture_spectrum(exposure,self.stop)
         except AcquisitionCancelled:raise Cancelled()
-        return image[0],int(np.count_nonzero(image>=self.camera.full_scale))
 
     def make_scan_plan(self,request):
         limits=(self.stage.lower,self.stage.upper) if self.devices.mode=='hardware' and self.devices.connected('stage') else (0.,300.)
@@ -114,7 +126,7 @@ class Engine:
 
     def source_changed(self):
         self.latest=None;self.latest_version+=1;self.background=None
-        self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm'])
+        self.latest_axis=self.live_axis()
         self.calibration_workbench.invalidate();self.capture_tasks={};self.commands.clear();self.revision+=1;self.device_generation+=1
         self.emit('device.status',dict(source_mode=self.devices.mode,devices=self.devices.status()))
 
@@ -238,13 +250,22 @@ class Engine:
         with self.lock:self.stage.position_mm=target
         self.emit('stage.position',dict(moving=False,controller_reported_mm=target,delay_ps=mm_to_delay(target,self.zero)))
 
+    def run_calibration(self):
+        # Runs store the axis of their own binned pixels; the chip axis is kept for provenance.
+        calibration=copy.deepcopy(self.calibration)
+        if getattr(self.camera,'readout',None) is not None and calibration.get('wavelengths_nm') is not None:
+            calibration['chip_wavelengths_nm']=calibration['wavelengths_nm'];calibration['wavelengths_nm']=self.live_axis()
+        return calibration
+
     def metadata(self,request,plan,run_id):
+        readout=copy.deepcopy(getattr(self.camera,'readout',None))
         return dict(meta=dict(schema_version=1,software_version='0.1.1',source_mode=self.devices.mode,run_id=run_id,created_utc=now()),
-                    config=dict(request=request,plan=plan,applied=dict(read_mode='fvb',exposure_s=self.camera.exposure_s,hbin=1)),
+                    config=dict(request=request,plan=plan,applied=dict(read_mode=readout['mode'] if readout else 'fvb',exposure_s=self.camera.exposure_s,hbin=readout['hbin'] if readout else 1,
+                                                                readout=readout,pixels=readout_shape(readout)[1] if readout else 1024)),
                     devices=dict(camera=self.camera.capabilities(),stage=dict(model='PI M-414.32S',controller_model=getattr(self.stage,'controller_model',None),
                         controller_identity=self.devices.links['stage']['identity'],**self.stage_state()),spectrometer=self.devices.status()['spectrometer']),
                     coordinates=dict(zero_mm=self.zero,zero_version=self.zero_version,path_multiplier=2,delay_sign=1),
-                    calibration=copy.deepcopy(self.calibration),background=serial(self.background),
+                    calibration=self.run_calibration(),background=serial(self.background),
                     simulation=dict(seed=request['seed'],speedup=request['speedup'],fault=request['fault'],
                                     tau_ps=[.42,3.8],irf_fwhm_ps=.25,gain_e_per_count=2.5) if self.devices.mode=='simulation' else {} )
 
@@ -351,7 +372,7 @@ class Engine:
             counts,saturated=self.acquire_counts(mm_to_delay(self.stage.position_mm,self.zero),101,index,self.camera.exposure_s,self.spectrograph['center_nm'])
             with self.lock:
                 self.latest=dict(spectrum=counts,saturated_pixels=saturated,delay_ps=self.stage_state()['delay_ps'],exposure_s=self.camera.exposure_s,source_mode=self.devices.mode)
-                self.latest_axis=self.calibration['wavelengths_nm'];self.latest_version+=1
+                self.latest_axis=self.live_axis();self.latest_version+=1
             self.emit('spectrum.preview',self.latest);index+=1
             self.wait(.2,1)
 
@@ -376,13 +397,23 @@ class Engine:
         finally:
             if not self.busy:self.launch('preview',self.preview)
 
+    def reference_stage(self):
+        if self.devices.mode=='hardware':
+            try:self.stage.reference(self.stop)
+            except AcquisitionCancelled:raise Cancelled()
+        else:
+            self.wait(4,1)
+            with self.lock:self.stage.referenced=True
+        with self.lock:self.revision+=1
+        self.emit('stage.position',self.stage_state())
+
     def acquire_background(self,data):
         exposure=self.camera.exposure_s
         if self.devices.mode=='simulation':self.wait(exposure,50)
         counts,_=self.acquire_counts(0,849,0,exposure,self.spectrograph['center_nm'],dark=data['kind']=='dark',optical_background=data['kind']=='optical_background')
         with self.lock:
             self.background=dict(spectrum=counts,exposure_s=exposure,kind=data['kind'],condition=data['condition'],source_mode=self.devices.mode,
-                                 revision=self.revision,temperature_c=self.camera.capabilities().get('temperature_c'),read_mode='fvb',timestamp_utc=now())
+                                 revision=self.revision,temperature_c=self.camera.capabilities().get('temperature_c'),read_mode=getattr(self.camera,'readout',{}).get('mode','fvb'),timestamp_utc=now())
         self.emit('background.ready',self.background)
 
     def handle(self,name,data):
@@ -408,7 +439,7 @@ class Engine:
             if old!=data:raise ValueError('request_id was already used with different parameters')
             return result
         self.require_operation(name)
-        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph'} else self._handle(name,data)
+        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph','camera_readout','stage_velocity'} else self._handle(name,data)
         except HardwareError as exc:self.hardware_failure(exc);raise
         if request_id:
             self.commands[key]=(copy.deepcopy(data),result)
@@ -465,6 +496,19 @@ class Engine:
         if name=='configure':
             self.idle();self.set_exposure(data['exposure_s'])
             return dict(exposure_s=self.camera.exposure_s)
+        if name=='camera_readout':
+            self.idle()
+            readout,notes=self.camera.set_readout(data)
+            with self.lock:
+                self.latest=None;self.latest_version+=1;self.background=None;self.latest_axis=self.live_axis();self.revision+=1
+            return dict(readout=readout,notes=notes,pixels=readout_shape(readout)[1])
+        if name=='camera_cooling':
+            return self.camera.set_cooling(data['enabled'],data['target_c'])
+        if name=='stage_velocity':
+            self.idle()
+            return self.stage.set_velocity(data['velocity_mm_s'])
+        if name=='stage_reference':
+            self.launch('move',self.reference_stage);return dict(accepted=True)
         if name=='move':
             current=mm_to_delay(self.stage.position_mm,self.zero)
             target=delay_to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'],self.zero)
@@ -489,7 +533,7 @@ class Engine:
             self.idle(devices=False)
             if self.devices.mode=='hardware' and data.get('source')!='measured':raise ValueError('Hardware mode requires a measured wavelength calibration')
             self.calibration_workbench.persist(data,self.spectrograph)
-            self.calibration=data;self.latest_axis=copy.deepcopy(data['wavelengths_nm']);self.revision+=1;return self.status()
+            self.calibration=data;self.latest_axis=self.live_axis();self.revision+=1;return self.status()
         if name=='calibration_frame':
             return self.calibration_workbench.current_frame()
         if name=='calibration_capture':
@@ -519,7 +563,7 @@ class Engine:
         if name=='calibration_apply':
             self.idle()
             self.calibration=self.calibration_workbench.installation(data['solution_id'],self.spectrograph)
-            self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm'])
+            self.latest_axis=self.live_axis()
             self.revision+=1
             self.emit('calibration.applied',dict(calibration_id=self.calibration['calibration_id']))
             return self.status()
@@ -630,7 +674,7 @@ class Engine:
                             writer.call('close','error');raise
                         run['path']=writer.call('close',run['status']);run['saved']=True;return self.public_run(run)
             if name=='discard':
-                self.idle(devices=False);self.runs={};self.current=None;self.latest=None;self.latest_version+=1;self.latest_axis=copy.deepcopy(self.calibration['wavelengths_nm']);return dict(discarded=True)
+                self.idle(devices=False);self.runs={};self.current=None;self.latest=None;self.latest_version+=1;self.latest_axis=self.live_axis();return dict(discarded=True)
             if name=='fit':
                 if not separate:self.idle(devices=False)
                 self.prune_tasks()

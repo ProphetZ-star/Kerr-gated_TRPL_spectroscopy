@@ -1,5 +1,6 @@
 '''Native Kerr Studio main window with Acquisition, Analysis and Calibration pages.'''
 import csv
+import html
 import io
 import json
 import math
@@ -9,13 +10,16 @@ from pathlib import Path
 from typing import get_args
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QGraphicsDropShadowEffect
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QInputDialog, QApplication
 from .widgets import ArrowComboBox as QComboBox,CheckBox as QCheckBox,WaveLogo,ThemeButton,NativeSpinBox as QSpinBox,NativeDoubleSpinBox as QDoubleSpinBox
 from .controller import Controller
 from .theme import apply_to_app, palette, current_mode, map_color
-from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count
+from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count, StatusButton
 from .plots import SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt, format_duration
 from .dialogs import DeviceDialog, DetectorDialog
+from backend.readout import normalize_readout, readout_shape, describe as describe_readout
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 
@@ -97,6 +101,16 @@ class MainWindow(QMainWindow):
         self._picked_delay = None
         self._current_page = 'acquisition'
         self._updating_controls = False
+        self._auto_connect_started = False
+        self._auto_connecting = set()
+        self._connecting_shown = set()
+        self._delay_edited = False
+        self._exposure_unit = 's'
+        self._velocity_edited = False
+        self._readout_edited = False
+        self._readout_controls_enabled = True
+        self._referencing = False
+        self.nudge_buttons = []
         self._map_dirty = True
         self._map_key = None
         self._fit_running = False
@@ -208,6 +222,13 @@ class MainWindow(QMainWindow):
         self.toast = QLabel('', self)
         self.toast.setObjectName('toast')
         self.toast.setWordWrap(True)
+        self.toast.setTextFormat(Qt.RichText)
+        self.toast.setCursor(Qt.PointingHandCursor)
+        self.toast.setToolTip('Click to dismiss')
+        self.toast.mousePressEvent = lambda event: self.toast.hide()
+        shadow = QGraphicsDropShadowEffect(self.toast)
+        shadow.setBlurRadius(28); shadow.setOffset(0, 6); shadow.setColor(QColor(0, 0, 0, 90))
+        self.toast.setGraphicsEffect(shadow)
         self.toast.hide()
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
@@ -419,7 +440,8 @@ class MainWindow(QMainWindow):
     def _build_stage_section(self, parent_layout):
         frame, layout = self._section()
         layout.setContentsMargins(14,13,14,14)
-        self.stage_connection = QPushButton('○ Connect…')
+        self.stage_connection = StatusButton()
+        self.stage_connection.set_parts([('off', 'Connect…')])
         self.stage_connection.setObjectName('stageConnection')
         self._reg('stageConnection', self.stage_connection, False)
         self.stage_connection.clicked.connect(self._open_stage_dialog)
@@ -434,6 +456,9 @@ class MainWindow(QMainWindow):
         self.delay_edit = number_edit('0.350')
         self.delay_edit.setObjectName('delay')
         self._reg('delay', self.delay_edit, False)
+        self.delay_edit.setToolTip('Target delay; press Enter or Move to go there')
+        self.delay_edit.textEdited.connect(self._on_delay_edited)
+        self.delay_edit.returnPressed.connect(self._move_absolute)
         delay_row.addWidget(self.delay_edit, 1)
         unit = QLabel('ps')
         unit.setProperty('muted', True)
@@ -458,7 +483,29 @@ class MainWindow(QMainWindow):
             button.setToolTip(f'Move the delay by {text} ps')
             button.clicked.connect(lambda checked=False, step=value: self.move_stage(step, relative=True))
             nudge_layout.addWidget(button, 0, column)
+            self.nudge_buttons.append(button)
         stage_layout.addWidget(nudge)
+        motion_row = QHBoxLayout()
+        motion_row.setContentsMargins(0, 0, 0, 0)
+        motion_row.setSpacing(7)
+        speed_label = QLabel('Speed')
+        speed_label.setProperty('muted', True)
+        motion_row.addWidget(speed_label)
+        self.velocity_edit = number_edit('', 0, 1000, 4)
+        self.velocity_edit.setObjectName('stageVelocity')
+        self.velocity_edit.setToolTip('Stage velocity; press Enter to apply')
+        self._reg('stageVelocity', self.velocity_edit, False)
+        self.velocity_edit.textEdited.connect(lambda text: setattr(self, '_velocity_edited', True))
+        self.velocity_edit.editingFinished.connect(self._apply_velocity)
+        self.velocity_field = field('', self.velocity_edit, 'mm/s')
+        motion_row.addWidget(self.velocity_field, 1)
+        self.reference_button = QPushButton('Reference')
+        self.reference_button.setObjectName('stageReference')
+        self.reference_button.setToolTip('Activate the motor and reference at the positive limit switch')
+        self.reference_button.clicked.connect(self._reference_stage)
+        self._reg('stageReference', self.reference_button, False)
+        motion_row.addWidget(self.reference_button)
+        stage_layout.addLayout(motion_row)
         self.zero_button = QPushButton('Set zero t₀')
         self.zero_button.setObjectName('zero')
         self.zero_button.setProperty('role', 'accent')
@@ -477,7 +524,8 @@ class MainWindow(QMainWindow):
     def _build_detection_section(self, parent_layout):
         frame, layout = self._section()
         layout.setContentsMargins(14,13,14,15);layout.setSpacing(11)
-        self.detector_connection = QPushButton('CCD off · Manual ▾')
+        self.detector_connection = StatusButton()
+        self.detector_connection.set_parts([('off', 'CCD'), ('off', 'Spectrometer')])
         self.detector_connection.setObjectName('detectorConnection')
         self._reg('detectorConnection', self.detector_connection, False)
         self.detector_connection.clicked.connect(self._open_detector_dialog)
@@ -499,7 +547,19 @@ class MainWindow(QMainWindow):
         self.center_edit.setObjectName('center')
         self._reg('center', self.center_edit, False)
         self.center_edit.editingFinished.connect(self._apply_spectrograph)
-        pair_layout.addWidget(field('Exposure', self.exposure_edit, 's'), 0, 0)
+        self.exposure_unit = Segmented([('ms', 'ms'), ('s', 's')])
+        self.exposure_unit.setObjectName('exposureUnit')
+        self.exposure_unit.set_selected(self._exposure_unit)
+        self.exposure_unit.setToolTip('Exposure time unit')
+        self._reg('exposureUnit', self.exposure_unit, False)
+        self.exposure_unit.changed.connect(self._on_exposure_unit_changed)
+        exposure_box = QWidget()
+        exposure_row = QHBoxLayout(exposure_box)
+        exposure_row.setContentsMargins(0, 0, 0, 0)
+        exposure_row.setSpacing(6)
+        exposure_row.addWidget(self.exposure_edit, 1)
+        exposure_row.addWidget(self.exposure_unit)
+        pair_layout.addWidget(field('Exposure', exposure_box), 0, 0)
         pair_layout.addWidget(field('Center wavelength', self.center_edit, 'nm'), 0, 1)
         detector_layout.addWidget(pair)
         self.advanced = CollapsibleSection('Advanced · Grating / Slit / Readout')
@@ -526,15 +586,98 @@ class MainWindow(QMainWindow):
         spectro_grid.setColumnStretch(0, 1)
         spectro_grid.setColumnStretch(1, 1)
         advanced_layout.addWidget(spectro_pair)
-        # Scans always read the CCD in full vertical binning; show the fixed geometry instead of dead inputs.
-        readout_info = QLabel('Readout  FVB · H bin 1\nROI  X 0–1024 · Y 0–255 (full chip)')
-        readout_info.setObjectName('advancedInfo')
-        readout_info.setToolTip('Scan acquisition uses full vertical binning over the whole chip.\nRow selection is available on the Spectral Calibration page.')
-        advanced_layout.addWidget(readout_info)
+        advanced_layout.addWidget(self._build_cooling_controls())
+        advanced_layout.addWidget(self._build_readout_controls())
         self.advanced.add(advanced_widget)
         detector_layout.addWidget(self.advanced)
         layout.addWidget(self.detector_fields)
         parent_layout.addWidget(frame)
+    def _subheading(self, text):
+        label = QLabel(text)
+        label.setObjectName('advancedHeading')
+        return label
+    def _build_cooling_controls(self):
+        box = QWidget()
+        layout = QGridLayout(box)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(6)
+        layout.addWidget(self._subheading('CCD cooling'), 0, 0, 1, 2)
+        self.cooler_toggle = Segmented([('Off', 'off'), ('On', 'on')])
+        self.cooler_toggle.setObjectName('coolerToggle')
+        self._reg('coolerToggle', self.cooler_toggle, False)
+        self.cooler_toggle.changed.connect(lambda value: self._apply_cooling())
+        self.cooling_target = number_edit('-60', -150, 30, 1)
+        self.cooling_target.setObjectName('coolingTarget')
+        self.cooling_target.setToolTip('Target temperature; press Enter to apply')
+        self._reg('coolingTarget', self.cooling_target, False)
+        self.cooling_target.editingFinished.connect(self._apply_cooling)
+        layout.addWidget(field('Cooler', self.cooler_toggle), 1, 0)
+        layout.addWidget(field('Target', self.cooling_target, '°C'), 1, 1)
+        self.cooling_status = QLabel('Temperature —')
+        self.cooling_status.setObjectName('coolingStatus')
+        self.cooling_status.setToolTip('The cooler keeps regulating after a disconnect. Switch it off and let the CCD warm above −20 °C before powering the camera down.')
+        self._reg('coolingStatus', self.cooling_status, False)
+        layout.addWidget(self.cooling_status, 2, 0, 1, 2)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        return box
+    def _build_readout_controls(self):
+        box = QWidget()
+        layout = QGridLayout(box)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(6)
+        layout.addWidget(self._subheading('Readout · ROI / binning'), 0, 0, 1, 2)
+        self.readout_mode = Segmented([('FVB', 'fvb'), ('ROI', 'roi')])
+        self.readout_mode.setObjectName('readoutMode')
+        self._reg('readoutMode', self.readout_mode, False)
+        self.readout_mode.changed.connect(self._on_readout_edited)
+        layout.addWidget(self.readout_mode, 1, 0, 1, 2)
+        def pair(start, end):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            dash = QLabel('–')
+            dash.setProperty('muted', True)
+            row_layout.addWidget(start, 1); row_layout.addWidget(dash); row_layout.addWidget(end, 1)
+            return row
+        self.roi_x0 = QSpinBox(); self.roi_x0.setRange(0, 1023); self.roi_x0.setValue(0)
+        self.roi_x1 = QSpinBox(); self.roi_x1.setRange(0, 1023); self.roi_x1.setValue(1023)
+        self.roi_y0 = QSpinBox(); self.roi_y0.setRange(0, 255); self.roi_y0.setValue(0)
+        self.roi_y1 = QSpinBox(); self.roi_y1.setRange(0, 255); self.roi_y1.setValue(255)
+        for name, box_ in (('roiX0', self.roi_x0), ('roiX1', self.roi_x1), ('roiY0', self.roi_y0), ('roiY1', self.roi_y1)):
+            box_.setObjectName(name); box_.setButtonSymbols(QSpinBox.NoButtons); self._reg(name, box_, False)
+            box_.valueChanged.connect(self._on_readout_edited)
+        layout.addWidget(field('ROI X / px', pair(self.roi_x0, self.roi_x1)), 2, 0)
+        layout.addWidget(field('ROI Y / row', pair(self.roi_y0, self.roi_y1)), 2, 1)
+        self.hbin_combo = QComboBox()
+        for value in (1, 2, 4, 8, 16):
+            self.hbin_combo.addItem(str(value), value)
+        self.vbin_combo = QComboBox()
+        for text, value in (('Full', 'full'), ('1', 1), ('2', 2), ('4', 4), ('8', 8), ('16', 16)):
+            self.vbin_combo.addItem(text, value)
+        for name, combo in (('hbin', self.hbin_combo), ('vbin', self.vbin_combo)):
+            combo.setObjectName(name); self._reg(name, combo, False)
+            combo.activated.connect(self._on_readout_edited)
+        layout.addWidget(field('H bin', self.hbin_combo), 3, 0)
+        layout.addWidget(field('V bin', self.vbin_combo), 3, 1)
+        self.readout_info = QLabel('')
+        self.readout_info.setObjectName('advancedInfo')
+        self.readout_info.setWordWrap(True)
+        self._reg('readoutInfo', self.readout_info, False)
+        layout.addWidget(self.readout_info, 4, 0, 1, 2)
+        self.readout_apply = QPushButton('Apply readout')
+        self.readout_apply.setObjectName('readoutApply')
+        self.readout_apply.setProperty('role', 'accent')
+        self.readout_apply.clicked.connect(self._apply_readout)
+        self._reg('readoutApply', self.readout_apply, False)
+        layout.addWidget(self.readout_apply, 5, 0, 1, 2)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        self._sync_readout_inputs()
+        return box
     def _build_scan_section(self, parent_layout):
         frame, layout = self._section()
         layout.setAlignment(Qt.AlignTop);layout.setSpacing(13)
@@ -1442,6 +1585,8 @@ class MainWindow(QMainWindow):
         self.controller.analysisChanged.connect(self._on_analysis)
         self.controller.error.connect(self._on_error)
         self.controller.readyChanged.connect(self._on_ready)
+        if hasattr(self.controller, 'connectingChanged'):
+            self.controller.connectingChanged.connect(self._on_connecting_changed)
         if hasattr(self.controller, 'fitReady'):
             self.controller.fitReady.connect(self._on_fit_ready)
         if hasattr(self.controller, 'fitFailed'):
@@ -1475,16 +1620,27 @@ class MainWindow(QMainWindow):
             self.startup.show_message(str(message), True)
     def _on_closing_finished(self):
         self._allow_close = True
-    def show_toast(self, message):
-        self.toast.setText(str(message))
-        self.toast.adjustSize()
-        width = min(max(260, self.toast.width()), max(320, self.width() - 80))
+    # U+FE0E asks for the text (not emoji) glyph so the icon takes the level colour.
+    TOAST_ICONS = {'info': 'ℹ︎', 'success': '✓', 'warning': '⚠︎', 'error': '✕'}
+    def show_toast(self, message, level=None):
+        message = str(message)
+        if level not in self.TOAST_ICONS:
+            # Most callers pass backend error text; classify it so failures never look like routine notices.
+            lowered = message.lower()
+            level = ('error' if any(word in lowered for word in ('fail', 'error', 'cannot', 'could not', 'invalid', 'refused', 'timed out', 'not available'))
+                     else 'warning' if any(word in lowered for word in ('must', 'exceed', 'busy', 'outside', 'required', 'connect ', 'before', 'not '))
+                     else 'info')
+        set_prop(self.toast, 'level', level)
+        color = palette()[{'info': 'blue', 'success': 'success', 'warning': 'warning', 'error': 'danger'}[level]]
+        self.toast.setText(f'<span style="color:{color};font-size:18px">{self.TOAST_ICONS[level]}</span>&nbsp;&nbsp;{html.escape(message)}')
+        self.toast.setFixedWidth(16777215); self.toast.setMinimumWidth(0); self.toast.adjustSize()
+        width = min(max(380, self.toast.sizeHint().width()), max(420, min(760, self.width() - 80)))
         self.toast.setFixedWidth(width)
         self.toast.adjustSize()
-        self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 24))
+        self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 70))
         self.toast.show()
         self.toast.raise_()
-        self._toast_timer.start(4200)
+        self._toast_timer.start({'error': 9000, 'warning': 7000}.get(level, 5000))
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_visual_geometry()
@@ -1493,7 +1649,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'cal_metrics'):
             self.cal_metrics.place()
         if hasattr(self, 'toast') and self.toast.isVisible():
-            self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 24))
+            self.toast.move(max(10, (self.width() - self.toast.width()) // 2), max(10, self.height() - self.toast.height() - 70))
     def _apply_visual_geometry(self):
         width=self.width();left=round(max(272,min(340,width*.2125)))
         for name in ('acquisition_scroll','analysis_scroll','calibration_scroll'):
@@ -1520,6 +1676,88 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(bool(self.controller.acquisition.records))
         self._update_from_snapshot()
         self._schedule_refresh()
+        if not self._auto_connect_started and snapshot.get('devices') and getattr(self.controller, 'online', False):
+            self._auto_connect_hardware()
+    def _connecting_now(self):
+        return set(getattr(self.controller, 'connecting', set())) | self._auto_connecting
+    def _on_connecting_changed(self):
+        now = self._connecting_now()
+        if now - self._connecting_shown:
+            self._connecting_shown |= now
+            self._refresh_connection_buttons()
+        elif self._connecting_shown - now:
+            # Keep "connecting" until the status that reports the outcome arrives, so the dot never drops back to off first.
+            self.controller.request_status()
+    def _refresh_connection_buttons(self):
+        snapshot = self._snapshot or {}
+        devices = snapshot.get('devices') or {}
+        def state(name):
+            link = devices.get(name) or {}
+            if name in self._connecting_shown:
+                return 'connecting'
+            if link.get('connected'):
+                return 'connected'
+            return 'error' if link.get('state') == 'error' else 'off'
+        if str(snapshot.get('source_mode') or 'hardware') == 'simulation':
+            self.stage_connection.set_parts([('simulated', 'Simulated')])
+            self.detector_connection.set_parts([('simulated', 'Simulated')])
+            return
+        stage = state('stage')
+        self.stage_connection.set_parts([(stage, {'connecting': 'Connecting…', 'connected': 'C-663.12'}.get(stage, 'Connect…'))])
+        self.stage_connection.setToolTip((devices.get('stage') or {}).get('error') or 'Delay stage connection')
+        spectrometer = devices.get('spectrometer') or {}
+        manual = spectrometer.get('state') == 'manual'
+        # Only a spectrometer with a connected controller is green; a manual one is a filled grey dot.
+        spectro_state = 'manual' if manual and 'spectrometer' not in self._connecting_shown else state('spectrometer')
+        self.detector_connection.set_parts([(state('camera'), 'CCD'), (spectro_state, 'Manual spectrometer' if manual else 'Spectrometer')])
+        tips = [f"CCD: {(devices.get('camera') or {}).get('error') or state('camera')}", f"Spectrometer: {spectrometer.get('identity') or spectro_state}"]
+        self.detector_connection.setToolTip('\n'.join(tips))
+    def _auto_connect_hardware(self):
+        # One attempt per launch with the default USB instruments; anything that fails stays in its dialog.
+        self._auto_connect_started = True
+        snapshot = self._snapshot or {}
+        if str(snapshot.get('source_mode') or 'hardware') != 'hardware' or snapshot.get('busy'):
+            return
+        devices = snapshot.get('devices') or {}
+        self._auto_connect_results = []
+        pending = [name for name in ('stage', 'camera') if not (devices.get(name) or {}).get('connected')]
+        # Both headings show "connecting" from the USB scan onwards, not only during device_connect.
+        self._auto_connecting = set(pending)
+        self._on_connecting_changed()
+        self._auto_connect_next(pending)
+    def _auto_connect_next(self, pending):
+        if not pending:
+            self.controller.request_status()
+            if self._auto_connect_results:
+                failed = any(not result.endswith(' connected') for result in self._auto_connect_results)
+                self.show_toast('Hardware: ' + ' · '.join(self._auto_connect_results), 'warning' if failed else 'success')
+            return
+        family, rest = pending[0], pending[1:]
+        name = {'stage': 'Delay stage', 'camera': 'CCD'}[family]
+        def done(message):
+            self._auto_connect_results.append(f'{name} {message}')
+            self._auto_connecting.discard(family)
+            self._on_connecting_changed()
+            self._auto_connect_next(rest)
+        failed = lambda payload: done('not connected (' + payload_message(payload) + ')')
+        connected = lambda result: done('connected')
+        if family == 'stage':
+            def found(result):
+                items = result.get('devices', []) if isinstance(result, dict) else (result or [])
+                if not items:
+                    return done('not found')
+                first = items[0]
+                usb_device = (first.get('serial') or first.get('id')) if isinstance(first, dict) else first
+                self.controller.dispatch('device_connect', {'device': 'stage', 'driver': 'pi_c66312', 'transport': 'usb', 'usb_device': str(usb_device), 'pi_dll': '', 'axis': '1'}, success=connected, failure=failed)
+            self.controller.dispatch('device_pi_usb', {'pi_dll': ''}, success=found, failure=failed)
+        else:
+            def found(result):
+                items = result.get('cameras', []) if isinstance(result, dict) else (result or [])
+                if not items:
+                    return done('not found')
+                index = int(items[0].get('index', 0)) if isinstance(items[0], dict) else 0
+                self.controller.dispatch('device_connect', {'device': 'camera', 'driver': 'andor_sdk2', 'transport': 'usb', 'dll_directory': '', 'camera_index': index}, success=connected, failure=failed)
+            self.controller.dispatch('device_cameras', {'dll_directory': ''}, success=found, failure=failed)
     def _on_state(self):
         self._update_from_snapshot()
         self._schedule_refresh()
@@ -1564,24 +1802,44 @@ class MainWindow(QMainWindow):
             devices = snapshot.get('devices') or {}
             stage_connected = bool((devices.get('stage') or {}).get('connected'))
             camera_connected = bool((devices.get('camera') or {}).get('connected'))
-            connected_count = int(stage_connected) + int(camera_connected)
+            spectrometer = devices.get('spectrometer') or {}
+            # A manually adjusted spectrometer is not a connected instrument, so it only counts when it has a controller.
+            spectrometer_controlled = spectrometer.get('state') != 'manual' and not (spectrometer.get('capabilities') or {}).get('manual', True)
+            connected_count = int(stage_connected) + int(camera_connected) + int(spectrometer_controlled and bool(spectrometer.get('connected')))
+            total_count = 3 if spectrometer_controlled else 2
             mode_label = source_mode.upper()
-            self.hardware_mode.setItemText(0, f'HARDWARE · {connected_count}/2 connected')
+            self.hardware_mode.setItemText(0, f'HARDWARE · {connected_count}/{total_count} connected')
             index = self.hardware_mode.findData(source_mode)
             if index >= 0 and index != self.hardware_mode.currentIndex():
                 self.hardware_mode.setCurrentIndex(index)
-            self.stage_connection.setText('● Simulated ▾' if source_mode=='simulation' else '● C-663.12 ▾' if stage_connected else '○ Connect…')
-            detector_text = '● Simulated ▾' if source_mode=='simulation' else 'CCD on · Manual ▾' if camera_connected else 'CCD off · Manual ▾'
-            self.detector_connection.setText(detector_text)
+            self._connecting_shown = self._connecting_now()
+            self._refresh_connection_buttons()
             stage = snapshot.get('stage') or {}
             delay = stage.get('delay_ps')
             if delay is None:
                 delay = stage.get('controller_reported_delay_ps')
-            if delay is not None and not self.delay_edit.hasFocus():
+            # A typed target stays until it is sent; status polls must not replace it with the current position.
+            if delay is not None and not self.delay_edit.hasFocus() and not self._delay_edited:
                 self.delay_edit.setText(f'{float(delay):.3f}')
             moving = bool(stage.get('moving'))
-            if moving:
+            if self._referencing and snapshot.get('busy') != 'move':
+                self._referencing = False
+                if stage.get('referenced'):
+                    self.show_toast('Delay stage referenced', 'success')
+                else:
+                    self.show_toast('Reference did not complete; the stage is not referenced', 'error')
+            if stage.get('velocity_mm_s') is not None and not self.velocity_edit.hasFocus() and not self._velocity_edited:
+                self.velocity_edit.setText(f"{float(stage['velocity_mm_s']):g}")
+            if stage.get('max_velocity_mm_s') is not None:
+                self.velocity_edit.setToolTip(f"Stage velocity (max {float(stage['max_velocity_mm_s']):g} mm/s); press Enter to apply")
+            if moving and self._referencing:
+                self.stage_status.setText('● Referencing…')
+                self.stage_status.setStyleSheet('color:'+palette()['warning']+';')
+            elif moving:
                 self.stage_status.setText('● Moving…')
+                self.stage_status.setStyleSheet('color:'+palette()['warning']+';')
+            elif stage_connected and stage.get('referenced') is False:
+                self.stage_status.setText('○ Not referenced · press Reference before moving')
                 self.stage_status.setStyleSheet('color:'+palette()['warning']+';')
             elif stage_connected:
                 self.stage_status.setText('<span style="color:'+palette()['success']+'">●</span> In position')
@@ -1592,7 +1850,8 @@ class MainWindow(QMainWindow):
             camera = snapshot.get('camera') or {}
             exposure = camera.get('exposure_s')
             if exposure is not None and not self.exposure_edit.hasFocus():
-                self.exposure_edit.setText(f'{float(exposure):g}')
+                self.exposure_edit.setText(self._exposure_text(float(exposure)))
+            self._sync_camera_settings(camera, camera_connected and source_mode == 'hardware' or source_mode == 'simulation')
             spectrograph = snapshot.get('spectrograph') or {}
             if spectrograph.get('center_nm') is not None and not self.center_edit.hasFocus():
                 self.center_edit.setText(f'{float(spectrograph.get("center_nm")):.6g}')
@@ -1620,6 +1879,15 @@ class MainWindow(QMainWindow):
             self.stage_fields.setEnabled(bool(getattr(self.controller, 'online', False) and (stage_connected or availability.get('stage'))) and busy not in ('scan', 'move', 'calibration'))
             camera_ready = bool(getattr(self.controller, 'online', False) and (camera_connected or availability.get('camera')))
             self.exposure_edit.setEnabled(camera_ready and busy in (None, 'preview'))
+            self._readout_controls_enabled = camera_ready and busy in (None, 'preview')
+            for widget in (self.readout_mode, self.roi_x0, self.roi_x1, self.hbin_combo, self.readout_apply):
+                widget.setEnabled(self._readout_controls_enabled)
+            self._sync_readout_inputs()
+            for widget in (self.cooler_toggle, self.cooling_target):
+                widget.setEnabled(camera_ready)
+            referenced = (snapshot.get('stage') or {}).get('referenced') is not False
+            for widget in self.nudge_buttons + [self.move_absolute, self.delay_edit, self.zero_button, self.return_zero]:
+                widget.setEnabled(referenced)
             spectrograph_ready = bool(getattr(self.controller, 'online', False) and (availability.get('spectrograph') or (devices.get('spectrometer') or {}).get('connected')))
             controls = availability.get('spectralControls') or []
             self.center_edit.setEnabled(spectrograph_ready and (not controls or 'center_nm' in controls) and busy in (None, 'preview'))
@@ -2389,7 +2657,7 @@ class MainWindow(QMainWindow):
             filename = name + '.h5'
         return str(self.output_dir / filename)
     def collect_run_request(self):
-        exposure = number_value(self.exposure_edit)
+        exposure = self._exposure_seconds()
         if exposure is None or exposure <= 0:
             raise ValueError('Exposure must be a positive finite number')
         if self._mode == 'scan' or self._mode == 'repeat':
@@ -2505,7 +2773,10 @@ class MainWindow(QMainWindow):
         if not math.isfinite(value):
             self.show_toast('Delay must be finite')
             return
+        self._delay_edited = False
         self.controller.dispatch('move', {'delay_ps': value, 'relative': bool(relative), 'request_id': uuid.uuid4().hex}, failure=lambda payload: self.show_toast(payload_message(payload)))
+    def _on_delay_edited(self, text):
+        self._delay_edited = True
     def _move_absolute(self):
         value = number_value(self.delay_edit)
         if value is None:
@@ -2514,10 +2785,124 @@ class MainWindow(QMainWindow):
         self.move_stage(value, relative=False)
     def set_zero(self):
         self.controller.dispatch('zero', {}, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
+    def _exposure_text(self, seconds):
+        return f'{seconds * 1000:.6g}' if self._exposure_unit == 'ms' else f'{seconds:.6g}'
+    def _exposure_seconds(self):
+        # The backend always takes seconds; the unit buttons only change how the field is read and shown.
+        value = number_value(self.exposure_edit)
+        return None if value is None else value / 1000 if self._exposure_unit == 'ms' else value
+    def _on_exposure_unit_changed(self, unit):
+        seconds = self._exposure_seconds()
+        self._exposure_unit = unit
+        if seconds is not None:
+            self.exposure_edit.setText(self._exposure_text(seconds))
+    def _apply_velocity(self):
+        if self._updating_controls or not self._velocity_edited:
+            return
+        value = number_value(self.velocity_edit)
+        if value is None or value <= 0:
+            self.show_toast('Stage speed must be a positive number', 'warning')
+            return
+        self._velocity_edited = False
+        def done(result):
+            self.velocity_edit.setText(f"{float(result['velocity_mm_s']):g}")
+            if result.get('clamped'):
+                self.show_toast(f"{float(result['requested_mm_s']):g} mm/s exceeds the stage maximum — speed set to {float(result['max_velocity_mm_s']):g} mm/s", 'warning')
+            else:
+                self.show_toast(f"Stage speed set to {float(result['velocity_mm_s']):g} mm/s", 'success')
+            self.controller.request_status()
+        self.controller.dispatch('stage_velocity', {'velocity_mm_s': float(value)}, success=done, failure=lambda payload: self.show_toast(payload_message(payload), 'error'))
+    def _reference_stage(self):
+        def accepted(result):
+            self._referencing = True
+            self.show_toast('Referencing the delay stage…')
+            self.controller.request_status()
+        self.controller.dispatch('stage_reference', {}, success=accepted, failure=lambda payload: self.show_toast(payload_message(payload), 'error'))
+    def _sync_camera_settings(self, camera, live):
+        readout = camera.get('readout')
+        rows = int(camera.get('detector_rows') or 256)
+        self.roi_y0.setMaximum(rows - 1); self.roi_y1.setMaximum(rows - 1)
+        if readout and not self._readout_edited:
+            self.readout_mode.set_selected(readout.get('mode', 'fvb'))
+            for box, key in ((self.roi_x0, 'x0'), (self.roi_x1, 'x1'), (self.roi_y0, 'y0'), (self.roi_y1, 'y1')):
+                if not box.hasFocus():
+                    box.setValue(int(readout.get(key, box.value())))
+            for combo, key in ((self.hbin_combo, 'hbin'), (self.vbin_combo, 'vbin')):
+                index = combo.findData(readout.get(key))
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+        if camera.get('cooler_on') is not None:
+            self.cooler_toggle.set_selected('on' if camera.get('cooler_on') else 'off')
+        if camera.get('target_temperature_c') is not None and not self.cooling_target.hasFocus():
+            self.cooling_target.setText(f"{float(camera['target_temperature_c']):g}")
+        temperature = camera.get('temperature_c')
+        state = str(camera.get('temperature_state') or '')
+        if not live or temperature is None:
+            text, color = 'Temperature — (CCD not connected)', 'muted'
+        else:
+            label = {'stabilized': 'stabilized', 'not_reached': 'cooling', 'not_stabilized': 'stabilizing', 'drift': 'drifting', 'off': 'cooler off'}.get(state, state)
+            color = {'stabilized': 'success', 'not_reached': 'warning', 'not_stabilized': 'warning', 'drift': 'danger'}.get(state, 'muted')
+            text = f'<span style="color:{palette()[color]}">●</span> Now {float(temperature):.1f} °C · {label}'
+        self.cooling_status.setText(text)
+    def _readout_request(self):
+        return {'mode': self.readout_mode.current() or 'fvb', 'x0': self.roi_x0.value(), 'x1': self.roi_x1.value(),
+                'y0': self.roi_y0.value(), 'y1': self.roi_y1.value(), 'hbin': int(self.hbin_combo.currentData()), 'vbin': self.vbin_combo.currentData()}
+    def _on_readout_edited(self, *args):
+        if self._updating_controls:
+            return
+        self._readout_edited = True
+        self._sync_readout_inputs()
+    def _sync_readout_inputs(self):
+        roi = self.readout_mode.current() == 'roi'
+        for widget in (self.roi_y0, self.roi_y1, self.vbin_combo):
+            widget.setEnabled(roi and self._readout_controls_enabled)
+        camera = (self._snapshot or {}).get('camera') or {}
+        applied = camera.get('readout')
+        lines = []
+        if applied:
+            mode, geometry = describe_readout(applied)
+            lines.append(f'Applied  {mode}\n{geometry}')
+        if self._readout_edited:
+            try:
+                pending, notes = normalize_readout(self._readout_request(), int(camera.get('detector_rows') or 256))
+                lines.append('Pending  ' + describe_readout(pending)[1] + (' (trimmed)' if notes else '') + ' — press Apply')
+            except ValueError as error:
+                lines.append('⚠ ' + str(error))
+        self.readout_info.setText('\n'.join(lines))
+        self.readout_apply.setText('Apply readout' + (' *' if self._readout_edited else ''))
+    def _apply_readout(self):
+        def done(result):
+            self._readout_edited = False
+            notes = result.get('notes') or []
+            if notes:
+                self.show_toast('Readout applied with changes: ' + '; '.join(notes), 'warning')
+            else:
+                self.show_toast(f"Readout applied · {result.get('pixels')} px per spectrum", 'success')
+            self.controller.request_status()
+        self.controller.dispatch('camera_readout', self._readout_request(), success=done, failure=lambda payload: self.show_toast(payload_message(payload), 'error'))
+    def _apply_cooling(self):
+        if self._updating_controls:
+            return
+        target = number_value(self.cooling_target)
+        if target is None:
+            self.show_toast('Enter a target temperature', 'warning')
+            return
+        enabled = self.cooler_toggle.current() == 'on'
+        camera = (self._snapshot or {}).get('camera') or {}
+        if camera.get('cooler_on') == enabled and camera.get('target_temperature_c') is not None and float(camera['target_temperature_c']) == round(target):
+            return
+        def done(result):
+            low, high = result.get('range_c') or (None, None)
+            if result.get('clamped'):
+                self.show_toast(f"{float(result['requested_c']):g} °C is outside the CCD range {low}…{high} °C — target set to {result['target_c']} °C", 'warning')
+            else:
+                self.show_toast(f"Cooler {'on' if result.get('enabled') else 'off'} · target {result['target_c']} °C", 'success')
+            self.controller.request_status()
+        self.controller.dispatch('camera_cooling', {'enabled': enabled, 'target_c': float(target)}, success=done, failure=lambda payload: self.show_toast(payload_message(payload), 'error'))
     def _on_exposure_changed(self):
         if self._updating_controls:
             return
-        value = number_value(self.exposure_edit)
+        value = self._exposure_seconds()
         if value is None or value <= 0:
             self.show_toast('Exposure must be positive')
             return

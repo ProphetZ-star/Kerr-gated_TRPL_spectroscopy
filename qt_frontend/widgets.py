@@ -427,6 +427,48 @@ def fmt_value(value,digits=4):
     if value!=0 and (abs(value)>=100000 or abs(value)<0.001): return f'{value:.2e}'
     text=f'{value:.{digits}g}'
     return text
+class StatusButton(QPushButton):
+    '''Heading button that draws one status dot per device: off, connecting (blinking), connected, error or simulated.'''
+    DOT={'connected':'success','connecting':'warning','simulated':'warning','error':'danger','off':'muted','manual':'muted'}
+    def __init__(self,parent=None):
+        super().__init__('',parent); self._parts=[]; self._blink_on=True
+        self._blink=QTimer(self); self._blink.setInterval(450); self._blink.timeout.connect(self._toggle_blink)
+    def set_parts(self,parts):
+        parts=[(str(state),str(text)) for state,text in parts]
+        if parts==self._parts: return
+        self._parts=parts; self.setAccessibleName(' · '.join(f'{text} {state}' for state,text in parts))
+        if any(state=='connecting' for state,_ in parts):
+            if not self._blink.isActive(): self._blink_on=True; self._blink.start()
+        else: self._blink.stop(); self._blink_on=True
+        self.updateGeometry(); self.update()
+    def parts(self): return list(self._parts)
+    def _toggle_blink(self): self._blink_on=not self._blink_on; self.update()
+    def _layout(self):
+        metrics=self.fontMetrics(); dot=7; gap=5; between=10; items=[]; x=0
+        for state,text in self._parts:
+            items.append((x,state,text)); x+=dot+gap+metrics.horizontalAdvance(text)+between
+        return items,max(0,x-between)+metrics.horizontalAdvance(' ▾'),dot,gap
+    def sizeHint(self):
+        _,width,_,_=self._layout(); base=super().sizeHint()
+        return QSize(width+16,base.height())
+    def minimumSizeHint(self): return self.sizeHint()
+    def paintEvent(self,event):
+        super().paintEvent(event)
+        from .theme import palette
+        colors=palette(); items,width,dot,gap=self._layout()
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setFont(self.font()); metrics=self.fontMetrics()
+        left=(self.width()-width)/2; middle=self.height()/2; baseline=middle+(metrics.ascent()-metrics.descent())/2
+        text_color=QColor(colors['text'] if self.underMouse() and self.isEnabled() else colors['muted'])
+        for x,state,text in items:
+            color=QColor(colors[self.DOT.get(state,'muted')])
+            if state=='connecting' and not self._blink_on: color.setAlphaF(.25)
+            rect=QRectF(left+x+.5,middle-dot/2,dot-1,dot-1)
+            if state=='off': p.setPen(QPen(color,1.2)); p.setBrush(Qt.NoBrush)
+            else: p.setPen(Qt.NoPen); p.setBrush(color)
+            p.drawEllipse(rect)
+            p.setPen(text_color); p.drawText(QPointF(left+x+dot+gap,baseline),text)
+        p.setPen(text_color); p.drawText(QPointF(left+width-metrics.horizontalAdvance(' ▾'),baseline),' ▾')
+        p.end()
 def device_availability(snapshot,online):
     available=(snapshot or {}).get('available') or {}
     return {'stage':bool(online and available.get('stage')),'camera':bool(online and available.get('camera')),'spectrometer':bool(online and available.get('spectrometer')),'spectrograph':bool(online and available.get('spectrograph_config')),'spectralControls':list(available.get('spectrograph_controls') or []) if online else [],'scan':bool(online and available.get('scan')),'preview':bool(online and available.get('preview')),'background':bool(online and available.get('background')),'calibration':bool(online and available.get('calibration_capture'))}

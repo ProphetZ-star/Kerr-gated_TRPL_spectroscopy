@@ -92,7 +92,7 @@ class DeviceCard(QWidget):
         layout.addWidget(self.note)
         layout.addStretch(1)
         buttons = QHBoxLayout(); buttons.setSpacing(8)
-        self.disconnect_button = QPushButton('Disconnect'); self.disconnect_button.setProperty('role', 'dangerText')
+        self.disconnect_button = QPushButton('Disconnect'); self.disconnect_button.setProperty('role', 'danger'); self.disconnect_button.setMinimumWidth(96)
         self.connect_button = QPushButton('Connect'); self.connect_button.setProperty('role', 'primary'); self.connect_button.setMinimumWidth(96)
         buttons.addWidget(self.disconnect_button); buttons.addStretch(1); buttons.addWidget(self.connect_button)
         layout.addLayout(buttons)

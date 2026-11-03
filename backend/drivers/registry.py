@@ -85,7 +85,7 @@ def _camera(config):
 def default_registry():
     registry=DriverRegistry()
     registry.register(Driver('pi_c66312','stage','PI C-663.12 · M-414.32S',('usb','serial'),_stage,
-        defaults=dict(transport='usb',axis='1',baudrate=38400,baudrates=[9600,19200,38400,115200]),note='Requires C-663.12 configured for M-414.32S. Position is a step count, not an encoder reading. No automatic motor activation or referencing.'))
+        defaults=dict(transport='usb',axis='1',baudrate=38400,baudrates=[9600,19200,38400,115200]),note='Requires C-663.12 configured for M-414.32S. Position is a step count, not an encoder reading. Use Reference in the Delay Stage panel to activate and reference the axis.'))
     registry.register(Driver('andor_sdk2','camera','Andor Newton DU920P · SDK2',('usb',),_camera,defaults=dict(transport='usb')))
     registry.register(Driver('oriel_77400_manual','spectrometer','Oriel 77400 / MS125 · Manual',('manual',),ManualSpectrometer,
         controls=SPECTRAL_CONTROLS,manual=True,defaults=dict(transport='manual',model='Oriel 77400 / MS125'),

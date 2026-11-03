@@ -1,6 +1,7 @@
 """Synthetic optical Kerr gate and detector; all performance values are illustrative."""
 import math
 import numpy as np
+from ..readout import default_readout,normalize_readout,readout_shape,spectrum_full_scale,bin_full_spectrum
 
 
 def convolved_decay(t, tau, sigma):
@@ -24,15 +25,38 @@ class SimCamera:
     full_scale = 65535
     source_mode = 'simulation'
 
+    rows = 255
+    temperature_range = (-100, -10)
+
     def __init__(self):
         self.axis = np.linspace(500, 800, self.pixels)
         self.exposure_s = 1.0
+        self.readout = default_readout(self.rows)
+        self.cooler_on = True
+        self.target_c = -70
+
+    @property
+    def temperature_c(self):
+        return float(self.target_c) if self.cooler_on else 20.0
 
     def capabilities(self):
         return dict(model='Andor Newton DU920P (simulated)', shape=[255,1024],
-                    pixels=self.pixels, bit_depth=16, full_scale=self.full_scale,
+                    pixels=readout_shape(self.readout)[1], chip_pixels=self.pixels, detector_rows=self.rows,
+                    bit_depth=16, full_scale=spectrum_full_scale(self.readout),
                     read_modes=['fvb'], source_mode=self.source_mode,
-                    temperature_c=-70.0, position_sensor=False)
+                    temperature_c=self.temperature_c, temperature_state='stabilized' if self.cooler_on else 'off',
+                    cooler_on=self.cooler_on, target_temperature_c=self.target_c, temperature_range_c=list(self.temperature_range),
+                    readout=dict(self.readout), position_sensor=False)
+
+    def set_cooling(self, enabled, target_c):
+        low, high = self.temperature_range
+        target = int(round(max(low, min(high, target_c))))
+        self.cooler_on = bool(enabled); self.target_c = target
+        return dict(enabled=self.cooler_on, target_c=target, requested_c=target_c, clamped=target != round(target_c), range_c=[low, high])
+
+    def set_readout(self, data):
+        self.readout, notes = normalize_readout(data, self.rows)
+        return self.readout, notes
 
     def acquire(self, delay_ps, seed, record_id, exposure_s, center_nm=600,
                 fault='none', dark=False, optical_background=False):
@@ -56,14 +80,25 @@ class SimCamera:
         if fault == 'cosmic_ray':
             adu[500] += 45000
         saturated = int(np.count_nonzero(adu >= self.full_scale))
-        return np.rint(np.clip(adu,0,self.full_scale)).astype(np.int32), saturated
+        counts = bin_full_spectrum(np.rint(np.clip(adu,0,self.full_scale)), self.readout, self.rows)
+        return np.clip(counts, 0, spectrum_full_scale(self.readout)).astype(np.int32), saturated
 
 
 class SimStage:
     def __init__(self):
         self.position_mm = 150.0
         self.velocity_mm_s = 6.0
+        self.max_velocity_mm_s = 6.0
         self.acceleration_mm_s2 = 12.0
+        self.referenced = True
+        self.lower, self.upper = 0.0, 300.0
+
+    def set_velocity(self, requested):
+        if not math.isfinite(requested) or requested <= 0:
+            raise ValueError('Velocity must be a positive number')
+        self.velocity_mm_s = min(requested, self.max_velocity_mm_s)
+        return dict(velocity_mm_s=self.velocity_mm_s, requested_mm_s=requested,
+                    max_velocity_mm_s=self.max_velocity_mm_s, clamped=self.velocity_mm_s < requested)
 
     def duration(self, target):
         if not 0 <= target <= 300:
