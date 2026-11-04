@@ -4,35 +4,64 @@ from .drivers.sim import convolved_decay
 
 
 def fit_records(records, axis, options, cancel=None):
-    from scipy.optimize import least_squares
-    from .models import FitRequest
+    """Fit a list of frame dicts (delay_ps, exposure_s, spectrum); see fit_frames."""
     from .storage.export import finite_number
-    options=FitRequest(**options.model_dump())
-    if axis is None:
-        raise ValueError('A valid wavelength calibration is required')
-    wavelengths = np.asarray(axis,dtype=float)
-    if wavelengths.ndim!=1 or not len(wavelengths) or not np.isfinite(wavelengths).all() or np.any(wavelengths<=0):raise ValueError('Wavelength axis must be positive and finite')
-    mask = abs(wavelengths-options.wavelength_nm) <= options.half_window_nm
-    if not mask.any():
-        raise ValueError('No pixels in the selected wavelength window')
-    groups = {}
+    delays=[];spectra=[];exposures=[]
     for r in records:
         if not isinstance(r,dict) or not {'delay_ps','exposure_s','spectrum'}<=r.keys():raise ValueError('Fit record is missing required fields')
-        t=finite_number(r['delay_ps'],'delay_ps')
-        if options.min_delay_ps is not None and t < options.min_delay_ps:
-            continue
-        if options.max_delay_ps is not None and t > options.max_delay_ps:
-            continue
-        exposure=finite_number(r['exposure_s'],'exposure_s',True)
-        spectrum=np.asarray(r['spectrum'],dtype=float)
-        if spectrum.shape!=wavelengths.shape or not np.isfinite(spectrum).all():raise ValueError('Fit spectrum must match the axis and contain only finite counts')
-        value=float(np.mean(spectrum[mask]))/exposure
-        if not np.isfinite(value):raise ValueError('Exposure-normalized counts are non-finite')
-        groups.setdefault(t,[]).append(value)
-    t = np.array(sorted(groups))
+        delays.append(finite_number(r['delay_ps'],'delay_ps'));exposures.append(finite_number(r['exposure_s'],'exposure_s',True))
+        spectra.append(np.asarray(r['spectrum'],dtype=float))
+    if len({s.shape for s in spectra})>1:raise ValueError('Fit spectrum must match the axis and contain only finite counts')
+    return fit_frames(np.asarray(delays,dtype=float),np.asarray(spectra,dtype=float).reshape(len(spectra),-1),np.asarray(exposures,dtype=float),axis,options,cancel)
+
+
+def fit_frames(delays, spectra, exposure, axis, options, cancel=None):
+    """Fit plain frame arrays: delays (N,), spectra (N, pixels) and exposure (scalar or (N,)), without the
+    run's flags (no saturation, temperature or position checks); see fit_run for a run's frames."""
+    from .models import FitRequest
+    from .processing import kinetics
+    options=FitRequest(**options.model_dump())
+    delays=np.asarray(delays,dtype=float)
+    block=dict(spectra=np.asarray(spectra),delay_ps=delays,index=np.zeros((len(delays),3),dtype=int),exposure_s=exposure)
+    curve=kinetics(block,axis,options)
+    return _fit_curve(np.asarray(curve['delays_ps'],dtype=float),np.asarray(curve['values'],dtype=float),options,cancel)
+
+
+def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=None, cancel=None):
+    """Fit a run's frames (a FrameTable block) with the request's processing options.
+
+    With two or more rounds the fit is repeated for each round on its own; the spread of those results gives a
+    between-round standard error for every parameter (round_spread), next to the local Jacobian errors."""
+    from .models import FitRequest
+    from .processing import kinetics, processing_of
+    options=FitRequest(**options.model_dump())
+    curve=kinetics(block,axis,options,background,full_scale,targets_mm)
+    result=_fit_curve(np.asarray(curve['delays_ps'],dtype=float),np.asarray(curve['values'],dtype=float),options,cancel)
+    result.update(processing=processing_of(options),rounds_used=curve['rounds_used'],frames_used=curve['counts']['frames_used'],
+                  excluded=dict(saturated_points=curve['counts']['saturated_points'] if options.exclude_saturated else 0,
+                                unstable_frames=curve['counts']['unstable_frames'] if options.exclude_unstable else 0,
+                                off_position_frames=curve['counts']['off_position_frames']))
+    spread={};fits=[]
+    if len(curve['rounds_used'])>=2:
+        for r in curve['rounds_used']:
+            if cancel is not None and cancel.is_set():raise ValueError('Fit cancelled')
+            single=kinetics(block,axis,options,background,full_scale,targets_mm,rounds=[r])
+            try:fits.append(_fit_curve(np.asarray(single['delays_ps'],dtype=float),np.asarray(single['values'],dtype=float),options,cancel)['parameters'])
+            except ValueError as exc:
+                if 'cancelled' in str(exc):raise
+        if len(fits)>=2:
+            spread={name:float(np.std([f[name] for f in fits],ddof=1)/np.sqrt(len(fits))) for name in result['parameters']}
+    result.update(round_spread=spread or None,round_fits=len(fits))
+    if len(curve['rounds_used'])>=2 and len(fits)<2:
+        result['warnings'].append('Too few rounds could be fitted on their own to estimate a between-round error')
+    return result
+
+
+def _fit_curve(t, y, options, cancel=None):
+    """Fit the averaged decay y(t) with the request's model (single or double exponential with a Gaussian IRF)."""
+    from .numerics import least_squares
     if len(t) < (12 if options.model=='double' else 8) or len(t[t>0])<5:
         raise ValueError('Insufficient distinct delays for this model')
-    y = np.array([np.mean(groups[x]) for x in t])
     sigma = options.irf_fwhm_ps/2.354820045
     amplitude = max(float(np.ptp(y)),1)
     baseline = float(np.min(y))
@@ -55,7 +84,7 @@ def fit_records(records, axis, options, cancel=None):
     def objective(p):
         if cancel is not None and cancel.is_set():raise ValueError('Fit cancelled')
         return (predict(p)-y)/scale
-    result=least_squares(objective,initial,bounds=(lower,upper),max_nfev=3000,x_scale='jac')
+    result=least_squares(objective,initial,bounds=(lower,upper),max_nfev=3000)  # Jacobian-scaled, as x_scale='jac'
     if not result.success:
         raise ValueError('Fit did not converge: '+result.message)
     covariance=np.linalg.pinv(result.jac.T@result.jac)*np.sum(result.fun**2)/max(1,len(t)-len(initial))
@@ -75,7 +104,6 @@ def fit_records(records, axis, options, cancel=None):
     return dict(model=options.model,parameters=values,standard_errors=standard_errors,
                 uncertainty_method='local Jacobian approximation, heuristic count weights; not a confidence interval',
                 irf_source='user-specified Gaussian width; not measured IRF',irf_fwhm_ps=options.irf_fwhm_ps,
-                processing='raw counts divided by exposure; constant baseline fitted',
                 delays_ps=t.tolist(),observed=y.tolist(),predicted=predict(result.x).tolist(),
                 residuals=(y-predict(result.x)).tolist(),warnings=warnings,
                 converged=True,jacobian_condition=condition if np.isfinite(condition) else None)

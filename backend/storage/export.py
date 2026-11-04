@@ -1,7 +1,8 @@
 import csv
 import io
 import math
-from numbers import Real, Integral
+from numbers import Real
+import numpy as np
 
 
 def finite_number(value, name, positive=False):
@@ -13,18 +14,23 @@ def finite_number(value, name, positive=False):
 
 
 def export_csv(
-    records,
+    frames,
     wavelengths_nm,
     center_nm,
     half_window_nm,
     source_mode,
+    background=None,
+    full_scale=None,
+    targets_mm=None,
 ) -> str:
-    """Export raw spectra to CSV, averaging included pixels per record.
+    """Export the frames of a FrameTable to CSV: per frame, the mean count of the window's pixels.
 
-    # source_mode: <source_mode>
-    # window_definition: mean of included pixels
-    # processing: raw no background subtraction
+    The raw mean comes first; when the run has a recorded background, background_counts_per_pixel and
+    net_counts_per_pixel (raw minus background) follow, empty otherwise. The remaining columns carry what
+    Analysis can exclude a frame for: saturated pixels in the window, the CCD temperature and its state, and
+    the stage position against the plan.
     """
+    from .schema import TEMPERATURE_STATES
     if wavelengths_nm is None:
         raise ValueError("wavelength calibration is required for export")
 
@@ -51,11 +57,16 @@ def export_csv(
         )
 
     n_pixels = len(wavelengths)
+    if background is not None and len(background) != n_pixels:
+        raise ValueError("the recorded background does not match the wavelength axis")
 
     buffer = io.StringIO()
     buffer.write(f"# source_mode: {source_mode}\n")
     buffer.write("# window_definition: mean of included pixels\n")
-    buffer.write("# processing: raw no background subtraction\n")
+    buffer.write("# processing: raw counts; net = raw minus the recorded background"
+                 + ("" if background is not None else " (no background recorded: columns empty)") + "\n")
+    if full_scale is not None:
+        buffer.write(f"# full_scale_counts: {float(full_scale):g}\n")
 
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(
@@ -69,45 +80,62 @@ def export_csv(
             "half_window_nm",
             "mean_counts_per_pixel",
             "exposure_s",
+            "background_counts_per_pixel",
+            "net_counts_per_pixel",
+            "saturated_pixels_in_window",
+            "temperature_c",
+            "temperature_state",
+            "stage_reported_mm",
+            "position_error_um",
+            "t_start_s",
+            "t_end_s",
         ]
     )
 
-    for record in records:
-        required={'spectrum','record_id','round_index','point_index','frame_index','delay_ps','exposure_s'}
-        if not isinstance(record,dict) or not required<=record.keys():raise ValueError('CSV record is missing required fields')
-        for key in ('record_id','round_index','point_index','frame_index'):
-            if isinstance(record[key],bool) or not isinstance(record[key],Integral) or record[key]<0:raise ValueError(f'{key} must be a nonnegative integer')
-        spectrum = record["spectrum"]
-        if len(spectrum) != n_pixels:
-            raise ValueError(
-                f"record {record.get('record_id')!r}: spectrum length "
-                f"{len(spectrum)} does not match wavelength length {n_pixels}"
-            )
-
-        total = 0
-        for i in included:
-            value = spectrum[i]
-            total += finite_number(value,'spectrum value')
-
-        mean_counts = total / len(included)
-
-        if not math.isfinite(mean_counts):raise ValueError('Mean spectrum count is non-finite')
-        delay_ps=finite_number(record['delay_ps'],'delay_ps')
-        exposure_s=finite_number(record['exposure_s'],'exposure_s',True)
-
+    spectra = frames.spectra
+    if len(frames) and spectra.shape[1] != n_pixels:
+        raise ValueError(f"spectrum length {spectra.shape[1]} does not match wavelength length {n_pixels}")
+    # Integer counts sum exactly, so this equals adding the included pixels one by one.
+    totals = spectra[:, included].astype("int64").sum(axis=1)
+    exposure_s = finite_number(frames.exposure_s, "exposure_s", True)
+    delays = frames.delays
+    if not np.isfinite(delays).all():
+        raise ValueError("delay_ps must be finite")
+    background_mean = None if background is None else float(np.asarray(background, dtype=float)[included].sum()) / len(included)
+    saturated = (spectra[:, included] >= full_scale).sum(axis=1) if full_scale is not None else None
+    index = frames.column("index")
+    temperature = frames.column("temperature_c"); state = frames.column("temperature_state")
+    reported = frames.column("stage_reported_mm"); start = frames.column("t_start_s"); end = frames.column("t_end_s")
+    targets = None if targets_mm is None else np.asarray(targets_mm, dtype=float)
+    def optional(value, digits=None):
+        value = float(value)
+        return "" if not math.isfinite(value) else (round(value, digits) if digits is not None else value)
+    for row, total in enumerate(totals):
+        mean_counts = float(total) / len(included)
+        point = int(index[row, 1])
+        error = abs(float(reported[row]) - targets[point]) * 1000 if targets is not None and 0 <= point < len(targets) else math.nan
+        code = int(state[row])
         writer.writerow(
             [
-                record["record_id"],
-                record["round_index"],
-                record["point_index"],
-                record["frame_index"],
-                delay_ps,
+                row,
+                int(index[row, 0]),
+                point,
+                int(index[row, 2]),
+                float(delays[row]),
                 center_nm,
                 half_window_nm,
                 mean_counts,
                 exposure_s,
+                "" if background_mean is None else background_mean,
+                "" if background_mean is None else mean_counts - background_mean,
+                "" if saturated is None else int(saturated[row]),
+                optional(temperature[row], 3),
+                TEMPERATURE_STATES[code] if 0 <= code < len(TEMPERATURE_STATES) else "",
+                optional(reported[row]),
+                optional(error, 4),
+                optional(start[row], 6),
+                optional(end[row], 6),
             ]
         )
 
     return buffer.getvalue()
-

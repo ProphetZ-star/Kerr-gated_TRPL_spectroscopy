@@ -38,7 +38,7 @@ Windows 10/11 64 位，使用 Python 3.12 或更新的 64 位版本。完整解�
 & ".\Kerr studio.exe" --check        # 检查必要程序文件，不启动窗口
 ```
 
-后台进程首次启动不加载 SciPy 拟合/标定计算模块，调用相关功能时再加载；界面使用增量记录与绘图节流。开发验收脚本保留在工作区 `.publish`，不随精简软件分发。
+运行依赖只有 NumPy、h5py、pydantic、PySide6-Essentials、pyqtgraph 以及 PI 位移台所需的 PIPython/pyserial/pyusb；寿命拟合与 IRF 卷积由 `backend/numerics.py` 用 NumPy 实现，不需要 SciPy。界面使用增量记录与绘图节流。开发验收脚本保留在工作区 `.publish`，不随精简软件分发。
 
 ## 重建启动器
 

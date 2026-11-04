@@ -55,6 +55,12 @@ class _SpinEditorGeometry:
         super().resizeEvent(event);self._place_editor()
     def showEvent(self,event):
         super().showEvent(event);self._place_editor()
+    def changeEvent(self,event):
+        # Enabling, disabling and restyling re-run Qt's own layout of the edit field, which collapses it again
+        # (a disabled box showed no value); place it once Qt has finished.
+        super().changeEvent(event)
+        if event.type() in (QEvent.EnabledChange,QEvent.StyleChange,QEvent.FontChange,QEvent.PaletteChange):
+            self._place_editor();QTimer.singleShot(0,self._place_editor)
 class NativeSpinBox(_SpinEditorGeometry,QSpinBox):pass
 class NativeDoubleSpinBox(_SpinEditorGeometry,QDoubleSpinBox):
     def textFromValue(self,value):
@@ -62,6 +68,10 @@ class NativeDoubleSpinBox(_SpinEditorGeometry,QDoubleSpinBox):
         return text.rstrip('0').rstrip(decimal) if decimal in text else text
 
 class ArrowComboBox(QComboBox):
+    def wheelEvent(self,event):
+        # The wheel never changes a closed drop-down: scrolling over one scrolls the page instead. A choice is
+        # made by clicking it open (its list still scrolls with the wheel).
+        event.ignore()
     def paintEvent(self,event):
         if self.property('centerText'):
             # Frame/background from the style, then the current text centred between equal side paddings.
@@ -336,16 +346,60 @@ class Swatch(QWidget):
         super().__init__(parent); self.dashed=dashed; self.dot=dot; self.color=color; self.setFixedSize(16,10)
     def paintEvent(self,event):
         from .theme import palette
-        colors=palette(); painter=QPainter(self); color=QColor(self.color or (colors['amber'] if self.dashed else colors['data'])); pen=QPen(color,2); pen.setStyle(Qt.DashLine if self.dashed else Qt.SolidLine); painter.setPen(pen); y=5
-        if self.dot: painter.setBrush(color); painter.drawEllipse(5,1,7,7)
+        # color may be a palette key ('warning', 'muted', ...) so the swatch follows the theme; dot='hollow' draws a ring.
+        colors=palette(); painter=QPainter(self); painter.setRenderHint(QPainter.Antialiasing); color=QColor(colors.get(self.color,self.color) if self.color else (colors['amber'] if self.dashed else colors['data'])); pen=QPen(color,1.6 if self.dot=='hollow' else 2); pen.setStyle(Qt.DashLine if self.dashed else Qt.SolidLine); painter.setPen(pen); y=5
+        if self.dot=='hollow': painter.setBrush(Qt.NoBrush); painter.drawEllipse(QRectF(5,1.5,7,7))
+        elif self.dot: painter.setBrush(color); painter.drawEllipse(5,1,7,7)
         else: painter.drawLine(0,y,15,y)
+class LegendEntry(QWidget):
+    '''One legend entry. With a key it is a toggle: a click hides or shows the data it stands for.'''
+    clicked=Signal()
+    def __init__(self,key=None,parent=None):
+        super().__init__(parent); self.key=key; self.shown=True
+        if key is not None:
+            self.setCursor(Qt.PointingHandCursor); self.setToolTip('Click to hide')
+    def mouseReleaseEvent(self,event):
+        if self.key is not None and event.button()==Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(); event.accept(); return
+        super().mouseReleaseEvent(event)
+    def set_shown(self,shown):
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        self.shown=bool(shown)
+        effect=self.graphicsEffect()
+        if self.shown:
+            if effect is not None:self.setGraphicsEffect(None)
+        else:
+            if effect is None:effect=QGraphicsOpacityEffect(self);self.setGraphicsEffect(effect)
+            effect.setOpacity(.38)
+        label=self.findChild(QLabel)
+        if label is not None:
+            font=label.font();font.setStrikeOut(not self.shown);label.setFont(font)
+        if self.key is not None:
+            hint=self.property('hint') or ''
+            self.setToolTip(('Click to hide' if self.shown else 'Hidden · click to show')+(f'\n{hint}' if hint else ''))
 class Legend(QWidget):
+    '''Entries added with a key toggle their data: toggled(key, shown) is emitted on every click.'''
+    toggled=Signal(str,bool)
     def __init__(self,parent=None):
         super().__init__(parent); self.layout=QHBoxLayout(self); self.layout.setContentsMargins(0,0,0,0); self.layout.setSpacing(10)
-    def add(self,text,dashed=False,dot=False,color=None):
-        box=QWidget(); row=QHBoxLayout(box); row.setContentsMargins(0,0,0,0); row.setSpacing(5); row.addWidget(Swatch(dashed,dot,color)); item=QLabel(text); item.setProperty('muted',True)
+        self.entries={}
+    def add(self,text,dashed=False,dot=False,color=None,key=None):
+        box=LegendEntry(key); row=QHBoxLayout(box); row.setContentsMargins(0,0,0,0); row.setSpacing(5); row.addWidget(Swatch(dashed,dot,color)); item=QLabel(text); item.setProperty('muted',True)
         item.setSizePolicy(QSizePolicy.Fixed,QSizePolicy.Preferred)  # never clipped when a neighbouring entry's text grows
-        row.addWidget(item); self.layout.addWidget(box); return box
+        row.addWidget(item); self.layout.addWidget(box)
+        if key is not None:
+            self.entries[key]=box; box.clicked.connect(lambda key=key:self.set_shown(key,not self.entries[key].shown))
+        return box
+    def set_hint(self,key,text):
+        '''Extra tooltip line for an entry (what its data means).'''
+        box=self.entries.get(key)
+        if box is not None:box.setProperty('hint',text);box.set_shown(box.shown)
+    def is_shown(self,key):
+        box=self.entries.get(key);return True if box is None else box.shown
+    def set_shown(self,key,shown):
+        box=self.entries.get(key)
+        if box is None or box.shown==bool(shown):return
+        box.set_shown(shown);self.toggled.emit(key,bool(shown))
 class GradientBar(QWidget):
     def __init__(self,parent=None):
         super().__init__(parent); self.setMinimumWidth(85); self.setFixedHeight(7); self.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed)

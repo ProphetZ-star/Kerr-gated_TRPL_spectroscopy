@@ -5,7 +5,7 @@ from ..readout import default_readout,normalize_readout,readout_shape,spectrum_f
 
 
 def convolved_decay(t, tau, sigma):
-    from scipy.special import log_ndtr
+    from ..numerics import log_ndtr
     try:
         if isinstance(tau,(bool,np.bool_)) or isinstance(sigma,(bool,np.bool_)):raise ValueError()
         t=np.asarray(t,dtype=float);tau=float(tau);sigma=float(sigma)
@@ -20,6 +20,21 @@ def convolved_decay(t, tau, sigma):
     return np.exp(np.clip(logvalue, -745, 50))
 
 
+# Fluctuations of a real pump-probe setup, so repeat rounds differ from each other as they do in the lab.
+# They scale the photoluminescence only; the ambient background and the detector noise are unaffected.
+LASER_JITTER = 0.04            # rms frame-to-frame pump intensity
+LASER_DRIFT = 0.06             # amplitude of the slow pump power drift
+DRIFT_PERIODS = (173.0, 541.0) # frames per cycle of the two drift components
+TIME_JITTER_PS = 0.03          # rms time-zero jitter per frame
+
+
+def laser_drift(seed, record_id):
+    """Slow pump power factor at one frame: two incommensurate cycles with a phase set by the seed."""
+    phases = np.random.default_rng(np.random.SeedSequence([seed, 7919])).uniform(0, 2 * math.pi, 2)
+    wave = .6 * math.sin(2 * math.pi * record_id / DRIFT_PERIODS[0] + phases[0]) + .4 * math.sin(2 * math.pi * record_id / DRIFT_PERIODS[1] + phases[1])
+    return 1 + LASER_DRIFT * wave
+
+
 class SimCamera:
     pixels = 1024
     full_scale = 65535
@@ -27,6 +42,9 @@ class SimCamera:
 
     rows = 255
     temperature_range = (-100, -10)
+    # The detector model in acquire(): counts = electrons / 2.5 + 320, read noise 5 electrons rms.
+    electrons_per_count = 2.5
+    read_noise_e = 5.0
 
     def __init__(self):
         self.axis = np.linspace(500, 800, self.pixels)
@@ -46,6 +64,8 @@ class SimCamera:
                     read_modes=['fvb'], source_mode=self.source_mode,
                     temperature_c=self.temperature_c, temperature_state='stabilized' if self.cooler_on else 'off',
                     cooler_on=self.cooler_on, target_temperature_c=self.target_c, temperature_range_c=list(self.temperature_range),
+                    temperature_resolution_c=None, serial_number=None,
+                    electrons_per_count=self.electrons_per_count, read_noise_e=self.read_noise_e,
                     readout=dict(self.readout), position_sensor=False)
 
     def set_cooling(self, enabled, target_c):
@@ -65,9 +85,11 @@ class SimCamera:
         if not valid:raise ValueError('Exposure must be finite and positive')
         rng = np.random.default_rng(np.random.SeedSequence([seed, record_id]))
         sigma = 0.25 / (2 * math.sqrt(2 * math.log(2)))
-        temporal = .62*convolved_decay(delay_ps,.42,sigma)+.38*convolved_decay(delay_ps,3.8,sigma)
+        delay = delay_ps + rng.normal(0, TIME_JITTER_PS)
+        gain = max(0.0, 1 + rng.normal(0, LASER_JITTER)) * laser_drift(seed, record_id)
+        temporal = .62*convolved_decay(delay,.42,sigma)+.38*convolved_decay(delay,3.8,sigma)
         spectral = np.exp(-.5*((self.axis-center_nm)/29)**2)
-        signal_rate = 120000 * spectral * temporal
+        signal_rate = 120000 * gain * spectral * temporal
         if dark or optical_background:
             signal_rate = np.zeros_like(spectral)
         optical_rate = np.full(self.pixels, 35.0 if not dark else 0.0)
@@ -76,7 +98,7 @@ class SimCamera:
         if fault == 'saturation':
             signal_rate *= 1000
         electrons = rng.poisson(np.maximum(0,(signal_rate+optical_rate+255*.0003)*exposure_s))
-        adu = (electrons + rng.normal(0, 5, self.pixels))/2.5+320
+        adu = (electrons + rng.normal(0, self.read_noise_e, self.pixels))/self.electrons_per_count+320
         if fault == 'cosmic_ray':
             adu[500] += 45000
         saturated = int(np.count_nonzero(adu >= self.full_scale))

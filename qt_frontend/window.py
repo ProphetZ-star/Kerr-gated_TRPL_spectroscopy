@@ -5,13 +5,15 @@ import io
 import json
 import math
 import os
+import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import get_args
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QEasingCurve, QFile
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QVariantAnimation, QEasingCurve, QFile
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QGraphicsDropShadowEffect
+from PySide6.QtWidgets import QGraphicsDropShadowEffect, QMenu
 from .icons import icon_box, line_icon
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QInputDialog, QApplication
 from .widgets import ArrowComboBox as QComboBox,CheckBox as QCheckBox,WaveLogo,ThemeButton,NativeSpinBox as QSpinBox,NativeDoubleSpinBox as QDoubleSpinBox
@@ -20,7 +22,11 @@ from .theme import apply_to_app, palette, current_mode, map_color
 from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count, StatusButton, HoverReveal
 from .plots import SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt, format_duration
 from .dialogs import DeviceDialog, DetectorDialog
+from .experiment_info import ExperimentInfoDialog
+from .prescan import PrescanDialog, prescan_issues
+from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
+from backend.storage.schema import MAX_FRAMES
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 
@@ -228,17 +234,24 @@ class MainWindow(QMainWindow):
         if bool(self.progress_fill.property('complete')) != complete:
             set_prop(self.progress_fill, 'complete', complete)
             set_prop(self.run_status, 'state', 'complete' if complete else '')
+    def _build_complete_glow(self):
+        # A short glow on the full bar draws the eye to the finished scan. The effect stays installed with a fixed
+        # blur radius and only its opacity pulses: at a fractional display scale (125 %, 150 %) Qt re-rounds the
+        # bar's position whenever the radius (and so the effect's bounds) changes, or when the effect is switched
+        # on and off, which made the bar jump by a pixel while it glowed.
+        glow = self._complete_glow = QGraphicsDropShadowEffect(self.progress_fill)
+        glow.setOffset(0, 0); glow.setBlurRadius(16); glow.setColor(QColor(0, 0, 0, 0))
+        self.progress_fill.setGraphicsEffect(glow)
+        flash = self._complete_flash = QVariantAnimation(self)
+        flash.setDuration(1400); flash.setStartValue(0.0); flash.setEndValue(0.0)
+        flash.setKeyValueAt(.25, 1.0); flash.setKeyValueAt(.5, .25); flash.setKeyValueAt(.75, 1.0)
+        flash.valueChanged.connect(self._paint_complete_glow)
+    def _paint_complete_glow(self, strength):
+        color = QColor(palette()['success']); color.setAlphaF(max(0.0, min(1.0, float(strength))))
+        self._complete_glow.setColor(color)
     def _celebrate_run(self, run, completed):
         self._set_run_complete(True)
-        flash = getattr(self, '_complete_flash', None)
-        if flash is None:
-            # A short glow on the full bar draws the eye to the finished scan.
-            glow = QGraphicsDropShadowEffect(self.progress_fill); glow.setOffset(0, 0); glow.setBlurRadius(0)
-            glow.setColor(QColor(palette()['success'])); self.progress_fill.setGraphicsEffect(glow)
-            flash = self._complete_flash = QPropertyAnimation(glow, b'blurRadius', self)
-            flash.setDuration(1400); flash.setKeyValueAt(0, 0.0); flash.setKeyValueAt(.25, 16.0); flash.setKeyValueAt(.5, 4.0); flash.setKeyValueAt(.75, 16.0); flash.setKeyValueAt(1, 0.0)
-            flash.finished.connect(lambda: glow.setEnabled(False))
-        glow = flash.targetObject(); glow.setColor(QColor(palette()['success'])); glow.setEnabled(True); flash.stop(); flash.start()
+        self._complete_flash.stop(); self._complete_flash.start()
         saved = Path(str(run.get('path'))).name if run.get('saved') and run.get('path') else ''
         self.show_toast(f'Scan complete · {completed} points' + (f' · saved as {saved}' if saved else ''), 'success')
     def _build_ui(self):
@@ -332,6 +345,14 @@ class MainWindow(QMainWindow):
         self.remaining.setObjectName('remaining')
         self.progress_text.setFixedHeight(17);self.remaining.setFixedHeight(17)
         info_row.addWidget(self.progress_text)
+        info_row.addSpacing(14)
+        self.scan_temperature = QLabel('')
+        self.scan_temperature.setObjectName('scanTemperature')
+        self.scan_temperature.setFixedHeight(17)
+        self.scan_temperature.setProperty('muted', True)
+        self.scan_temperature.hide()
+        self._reg('scanTemperature', self.scan_temperature, False)
+        info_row.addWidget(self.scan_temperature)
         info_row.addStretch(1)
         info_row.addWidget(self.remaining)
         self.progress_fill = QProgressBar()
@@ -339,6 +360,7 @@ class MainWindow(QMainWindow):
         self.progress_fill.setRange(0, 1000)
         self.progress_fill.setValue(0)
         self.progress_fill.setTextVisible(False)
+        self._build_complete_glow()
         info_layout.addLayout(info_row)
         info_layout.addWidget(self.progress_fill)
         layout.addWidget(run_info, 1)
@@ -766,7 +788,7 @@ class MainWindow(QMainWindow):
         self.capture_background.setObjectName('captureBackground')
         self.capture_background.setToolTip('Acquire a background spectrum with the current exposure')
         self._reg('captureBackground', self.capture_background, False)
-        self.capture_background.clicked.connect(self._capture_background)
+        self.capture_background.clicked.connect(lambda: self._capture_background())
         self._set_icon(self.capture_background, 'layers')
         layout.addWidget(self._heading('Acquisition'))
         actions = QHBoxLayout()
@@ -775,6 +797,25 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.preview_button, 1)
         actions.addWidget(self.capture_background, 1)
         layout.addLayout(actions)
+        background_row = QWidget()
+        background_layout = QHBoxLayout(background_row)
+        background_layout.setContentsMargins(0, 0, 0, 0)
+        background_layout.setSpacing(8)
+        self.background_status = QLabel('No background recorded')
+        self.background_status.setObjectName('backgroundStatus')
+        self.background_status.setProperty('muted', True)
+        self.background_status.setWordWrap(True)
+        self._reg('backgroundStatus', self.background_status, False)
+        self.background_frames = int_spin(5, 1, 1000, 1)
+        self.background_frames.setObjectName('backgroundFrames')
+        self.background_frames.setPrefix('× ')
+        self.background_frames.setFixedSize(62, 30)
+        self.background_frames.setToolTip('Frames averaged into the next background (1–1000)')
+        self._reg('backgroundFrames', self.background_frames, False)
+        background_layout.addWidget(self.background_status, 1)
+        background_layout.addWidget(self.background_frames)
+        layout.addWidget(background_row)
+        self._skip_prescan = False; self._pending_scan = None
         self.mode_seg = Segmented([('Scan', 'scan'), ('Single', 'single'), ('Repeat', 'repeat')])
         self.mode_seg.set_selected('scan')
         self.mode_seg.setObjectName('mode');self.mode_seg.setFixedHeight(33);self.mode_seg.layout.setContentsMargins(3,3,3,3)
@@ -828,6 +869,14 @@ class MainWindow(QMainWindow):
         repeat_label.setProperty('muted', True)
         repeat_layout.addWidget(repeat_label)
         repeat_layout.addStretch(1)
+        self.repeat_forever = QCheckBox('Until stopped')
+        self.repeat_forever.setObjectName('repeatForever')
+        self.repeat_forever.setMinimumHeight(24)
+        self.repeat_forever.setToolTip(f'Repeat the scan until Stop is pressed (at most {MAX_FRAMES:,} frames). '
+                                       'Stop keeps every complete round.')
+        self.repeat_forever.toggled.connect(self._repeat_forever_changed)
+        self._reg('repeatForever', self.repeat_forever, False)
+        repeat_layout.addWidget(self.repeat_forever)
         self.repeats_input = int_spin(3, 1, 100, 1)
         self.repeats_input.setObjectName('repeats')
         self.repeats_input.setFixedSize(96, 30)
@@ -854,8 +903,12 @@ class MainWindow(QMainWindow):
         panel.title_layout.addWidget(self.saturation)
         legend = Legend()
         # Reads "Current" for the live frame, or "Δt = … ps" for a delay picked on the map after a scan.
-        self._spectrum_legend_current = legend.add('Current').findChild(QLabel)
-        legend.add('Background', dashed=True)
+        self._spectrum_legend_current = legend.add('Current', key='current').findChild(QLabel)
+        legend.add('Background', dashed=True, key='background')
+        # The noise has its own scale, labelled inside the plot's right edge; the legend names it.
+        legend.add('Noise σ (%) · right axis', color='noise', key='noise')
+        legend.add('Shot-noise limit', dashed=True, color='muted', key='shot').hide()
+        self.spectrum_legend = legend
         panel.add_tool(legend)
         self.spectrum_scale = Segmented([('Linear', 'linear'), ('Log Y', 'log')])
         self.spectrum_scale.set_selected('linear')
@@ -864,6 +917,12 @@ class MainWindow(QMainWindow):
         panel.add_tool(self.spectrum_scale)
         self.spectrum_plot = SpectrumPlot(grid=True)
         self.spectrum_plot.wavePicked.connect(self._map_wave_picked)
+        legend.toggled.connect(self.spectrum_plot.set_series_visible)
+        self.spectrum_plot.pinAddRequested.connect(self._pin_decay); self.spectrum_plot.pinRemoveRequested.connect(self._unpin_decay)
+        self.spectrum_plot.pinMoved.connect(self._pin_moved)
+        # The ideal shot-noise curve is there for comparison when wanted; it starts hidden.
+        legend.set_shown('shot', False)
+        self._live_noise = LiveNoise()
         self.spectrum_plot.setObjectName('spectrum')
         self._reg('spectrum', self.spectrum_plot, False)
         panel.add_body(self.spectrum_plot, 1)
@@ -908,6 +967,20 @@ class MainWindow(QMainWindow):
         key_layout.addWidget(self.color_max)
         color_key.setParent(panel.header);color_key.setFixedHeight(20);self.map_color_key=color_key
         self._map_levels = None  # (low, high) counts; None at either end = follow the data
+        # Decays at several wavelengths: the marked one (λ line) plus up to DECAY_PINS pinned ones, each with a
+        # dashed line on the map. Legend entries hide a decay; × removes a pin.
+        self._decay_pins = []
+        self.decay_legend = Legend(); self.decay_legend.setObjectName('decayLegend')
+        self.decay_legend_main = self.decay_legend.add('λ', color='data', key='decay_main')
+        self.decay_legend_main.setProperty('hint', self.PIN_HELP); self.decay_legend_main.set_shown(True)
+        self.decay_legend.toggled.connect(self._decay_series_toggled)
+        self.decay_normalize = QCheckBox('Normalize'); self.decay_normalize.setObjectName('decayNormalize'); self.decay_normalize.setMinimumHeight(24)
+        self.decay_normalize.setToolTip('Scale each decay to its own maximum, to compare their shapes')
+        self.decay_normalize.toggled.connect(lambda checked: (setattr(self, '_map_dirty', True), self._schedule_refresh()))
+        # The legend sits right of the title; Normalize appears once a wavelength is pinned.
+        panel.title_layout.addWidget(self.decay_legend); panel.title_layout.addWidget(self.decay_normalize)
+        self.decay_legend.hide(); self.decay_normalize.hide()
+        self._reg('decayLegend', self.decay_legend, False); self._reg('decayNormalize', self.decay_normalize, False)
         self.map_scale = Segmented([('Linear', 'linear'), ('Log', 'log')])
         self.map_scale.set_selected('log')
         self.map_scale.changed.connect(self._scale_changed)
@@ -934,6 +1007,8 @@ class MainWindow(QMainWindow):
         self.map_plot.delayPicked.connect(self._map_delay_picked)
         self.map_plot.wavePicked.connect(self._map_wave_picked)
         self.decay_plot.delayPicked.connect(self._map_delay_picked)
+        for plot in (self.map_plot,):
+            plot.pinAddRequested.connect(self._pin_decay); plot.pinRemoveRequested.connect(self._unpin_decay); plot.pinMoved.connect(self._pin_moved)
         panel.add_body(charts, 1)
         return panel
     def _build_analysis_page(self):
@@ -957,6 +1032,7 @@ class MainWindow(QMainWindow):
         controls.setSpacing(0)
         self._build_analysis_experiment(controls)
         self._build_analysis_view(controls)
+        self._build_analysis_processing(controls)
         self._build_analysis_spectrum_controls(controls)
         self._build_analysis_fit_controls(controls)
         controls.addStretch(1)
@@ -998,6 +1074,15 @@ class MainWindow(QMainWindow):
         meta_layout.addWidget(self.analysis_points)
         meta_layout.addWidget(self.analysis_frames)
         meta_layout.addStretch(1)
+        # Everything the file records about the run opens on demand instead of crowding the sidebar.
+        self.experiment_details = QPushButton('Details')
+        self._set_icon(self.experiment_details, 'info')
+        self.experiment_details.setObjectName('experimentDetails');self.experiment_details.setFixedHeight(32)
+        self.experiment_details.setToolTip('Instruments, scan settings, calibration, background and recorded conditions of this experiment')
+        self.experiment_details.setEnabled(False)
+        self.experiment_details.clicked.connect(self._show_experiment_details)
+        self._reg('experimentDetails', self.experiment_details, False)
+        meta_layout.addWidget(self.experiment_details)
         layout.addWidget(meta)
         open_label = QLabel('Open HDF5 file')
         open_label.setProperty('muted', True)
@@ -1064,6 +1149,70 @@ class MainWindow(QMainWindow):
         self._reg('analysisView', self.analysis_view, False)
         layout.addWidget(self.analysis_view)
         parent_layout.addWidget(frame)
+    def _build_analysis_processing(self, parent_layout):
+        # What is subtracted and which frames are left out; the decay plot, the fit and its stored record all use it.
+        frame, layout = self._section()
+        self.analysis_processing = frame
+        frame.setObjectName('analysisProcessing')
+        self._reg('analysisProcessing', frame, False)
+        self.processing_summary = QLabel('')
+        self.processing_summary.setObjectName('processingSummary')
+        self.processing_summary.setProperty('muted', True)
+        self._reg('processingSummary', self.processing_summary, False)
+        layout.addWidget(self._heading('Processing', self.processing_summary))
+        self._updating_processing = False
+        def option(text, name, tip, checked=False):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            box = QCheckBox(text)
+            box.setObjectName(name);box.setChecked(checked);box.setToolTip(tip);box.setMinimumHeight(26)
+            self._reg(name, box, False)
+            note = QLabel('')
+            note.setProperty('muted', True)
+            row_layout.addWidget(box, 1)
+            row_layout.addWidget(note)
+            layout.addWidget(row)
+            box.toggled.connect(lambda checked: self._processing_changed())
+            return box, note
+        self.proc_background, self.proc_background_note = option(
+            'Subtract background', 'procBackground', 'Subtract the background spectrum recorded with this experiment (same exposure and readout)')
+        self.proc_saturated, self.proc_saturated_note = option(
+            'Skip saturated points', 'procSaturated', 'Leave out every (round, delay) point with a pixel at full scale inside the wavelength window', True)
+        self.proc_unstable, self.proc_unstable_note = option(
+            'Skip unstable temperature', 'procUnstable', 'Leave out frames taken while the CCD temperature was still reaching, settling at or drifting from its target')
+        self.proc_position, self.proc_position_note = option(
+            'Skip off-position frames', 'procPosition', 'Leave out frames whose reported stage position is further from the planned position than the tolerance')
+        self.proc_tolerance = number_edit('1')
+        self.proc_tolerance.setObjectName('procTolerance')
+        self.proc_tolerance.editingFinished.connect(lambda: self.proc_position.isChecked() and self._processing_changed())
+        self._reg('procTolerance', self.proc_tolerance, False)
+        self.proc_tolerance_row = field('Position tolerance', self.proc_tolerance, 'µm')
+        self.proc_tolerance_row.hide()
+        layout.addWidget(self.proc_tolerance_row)
+        self.proc_rounds_row = QWidget()
+        rounds_layout = QHBoxLayout(self.proc_rounds_row)
+        rounds_layout.setContentsMargins(0, 4, 0, 0)
+        rounds_layout.setSpacing(8)
+        self.proc_rounds = QPushButton('All rounds')
+        self.proc_rounds.setObjectName('procRounds');self.proc_rounds.setFixedHeight(32)
+        self.proc_rounds.setToolTip('Choose the repeat rounds that go into the decay and the fit')
+        self.proc_rounds_menu = QMenu(self.proc_rounds)
+        self.proc_rounds.setMenu(self.proc_rounds_menu)
+        self._reg('procRounds', self.proc_rounds, False)
+        self.proc_show_rounds = QCheckBox('Show each round')
+        self.proc_show_rounds.setObjectName('procShowRounds');self.proc_show_rounds.setMinimumHeight(26)
+        self.proc_show_rounds.setToolTip('Draw the decay of every round behind the average')
+        self.proc_show_rounds.toggled.connect(lambda checked: self._redraw_analysis())
+        self._reg('procShowRounds', self.proc_show_rounds, False)
+        rounds_layout.addWidget(self.proc_rounds, 1)
+        rounds_layout.addWidget(self.proc_show_rounds)
+        self.proc_rounds_row.hide()
+        layout.addWidget(self.proc_rounds_row)
+        self._excluded_rounds = set(); self._rounds_available = []
+        self._kinetics = None; self._kinetics_inflight = None; self._kinetics_again = False; self._processing_dataset = None
+        parent_layout.addWidget(frame)
     def _build_analysis_spectrum_controls(self, parent_layout):
         frame, layout = self._section()
         self.analysis_spectrum_controls = frame
@@ -1107,6 +1256,20 @@ class MainWindow(QMainWindow):
         self.analysis_fit_controls.setObjectName('analysisFitControls')
         self._reg('analysisFitControls', self.analysis_fit_controls, False)
         layout.addWidget(self._heading('Fit controls'))
+        history_label = QLabel('Saved fits')
+        history_label.setProperty('muted', True)
+        layout.addWidget(history_label)
+        self.fit_history = QComboBox()
+        self.fit_history.setObjectName('fitHistory')
+        # Long fit labels are elided instead of widening the sidebar; the full label is the item tooltip.
+        self.fit_history.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.fit_history.setMinimumContentsLength(12)
+        self.fit_history.setPlaceholderText('No saved fits')
+        self.fit_history.setToolTip('Show a fit stored with this experiment; its wavelength window and settings are restored')
+        self.fit_history.activated.connect(lambda index: self._show_saved_fit(self.fit_history.itemData(index)))
+        self._reg('fitHistory', self.fit_history, False)
+        layout.addWidget(self.fit_history)
+        layout.addSpacing(4)
         grid = QWidget()
         grid_layout = QGridLayout(grid)
         grid_layout.setContentsMargins(0, 0, 0, 0)
@@ -1187,8 +1350,14 @@ class MainWindow(QMainWindow):
         self._reg('analysisPoint', self.analysis_point, False)
         panel.add_tool(self.analysis_point)
         self.analysis_legend = Legend()
-        self.analysis_legend.add('Observed', dot=True)
-        self.analysis_legend.add('Fit',color=palette()['amber'])
+        self.analysis_legend.add('Observed', dot=True, key='observed')
+        self.analysis_legend.add('Fit',color='amber', key='fit')
+        self.analysis_legend_rounds = self.analysis_legend.add('Each round', color='muted', key='rounds')
+        # With a few rounds each gets its own legend entry in its plot colour; more share "Each round".
+        self.analysis_legend_round_items = [self.analysis_legend.add(f'Round {i + 1}', color=f'round{i}', key=f'round{i}') for i in range(self.ROUND_LEGEND_MAX)]
+        for item in self.analysis_legend_round_items:item.hide()
+        self.analysis_legend_left_out = self.analysis_legend.add('Saturated · left out', dot='hollow', color='warning', key='left_out')
+        self.analysis_legend_rounds.hide(); self.analysis_legend_left_out.hide()
         self.analysis_legend.setObjectName('analysisDecayLegend')
         self._reg('analysisDecayLegend', self.analysis_legend, False)
         panel.add_tool(self.analysis_legend)
@@ -1221,6 +1390,7 @@ class MainWindow(QMainWindow):
         self.analysis_curve.setObjectName('analysisCurve')
         self._reg('analysisCurve', self.analysis_curve, False)
         self.analysis_curve.delayPicked.connect(self._analysis_delay_picked)
+        self.analysis_legend.toggled.connect(self.analysis_curve.set_series_visible)
         panel.add_body(self.analysis_curve, 1)
         self.analysis_residual_wrap = QWidget()
         self.analysis_residual_wrap.setFixedHeight(124)
@@ -1255,7 +1425,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
         table_panel = Panel('Fit parameters')
-        table_panel.add_tool(QLabel('Value ± local SE'))
+        self.fit_table_note = QLabel('Value ± local SE')
+        table_panel.add_tool(self.fit_table_note)
         self.fit_table = QTableWidget(0, 4)
         self.fit_table.setObjectName('fitParameters');self.fit_table.setShowGrid(False)
         self.fit_table.setHorizontalHeaderLabels(['Parameter', 'Value', 'Std. error', 'Unit'])
@@ -1278,10 +1449,13 @@ class MainWindow(QMainWindow):
         self.fit_rmse.setObjectName('fitRmse')
         self.fit_condition = QLabel('-')
         self.fit_condition.setObjectName('fitCondition')
+        self.fit_frames_used = QLabel('-')
+        self.fit_frames_used.setObjectName('fitFramesUsed')
+        self._reg('fitFramesUsed', self.fit_frames_used, False)
         self._reg('fitSampleCount', self.fit_sample_count, False)
         self._reg('fitRmse', self.fit_rmse, False)
         self._reg('fitCondition', self.fit_condition, False)
-        for label_text, value in [('Samples', self.fit_sample_count), ('RMSE / counts·s⁻¹', self.fit_rmse), ('Jacobian condition', self.fit_condition)]:
+        for label_text, value in [('Samples', self.fit_sample_count), ('Frames used', self.fit_frames_used), ('RMSE / counts·s⁻¹', self.fit_rmse), ('Jacobian condition', self.fit_condition)]:
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1577,8 +1751,9 @@ class MainWindow(QMainWindow):
         panel.title_layout.setSpacing(5)
         panel.title_layout.addWidget(self.cal_spectrum_axis)
         legend = Legend()
-        legend.add('CCD')
-        legend.add('Reference lines', dashed=True)
+        legend.add('CCD', key='ccd')
+        legend.add('Reference lines', dashed=True, key='references')
+        self.cal_legend = legend
         panel.add_tool(legend)
         self.cal_axis = Segmented([('Pixel', 'pixel'), ('nm', 'wavelength')])
         self.cal_axis.set_selected('pixel')
@@ -1594,6 +1769,7 @@ class MainWindow(QMainWindow):
         self.cal_spectrum.setObjectName('calSpectrum')
         self._reg('calSpectrum', self.cal_spectrum, False)
         self.cal_spectrum.pixelPicked.connect(self._cal_pixel_picked)
+        self.cal_legend.toggled.connect(self.cal_spectrum.set_series_visible)
         panel.add_body(self.cal_spectrum, 1)
         return panel
     def _build_cal_lower(self):
@@ -1754,6 +1930,27 @@ class MainWindow(QMainWindow):
             edge=self.map_plot.viewport().mapToGlobal(QPoint(self.map_plot._view_rect().right()+1,0))
             right=panel.header.mapFromGlobal(edge).x()
             self.map_color_key.move(right-self.map_color_key.width(),14)
+            self._fit_decay_legend()
+    def _fit_decay_legend(self):
+        '''Pinned-decay labels collapse to their colour swatch when the header is too narrow for them beside the
+        colour key; the wavelength stays in each entry's tooltip.'''
+        pins = getattr(self, '_decay_pins', None)
+        if not pins or not self.decay_legend.isVisible():
+            return
+        # The width the full legend would take, whatever is shown now: swatches, labels, spacing and Normalize.
+        main = self.decay_legend_main.findChild(QLabel); labels = [main] + [pin['box'].findChild(QLabel) for pin in pins]
+        texts = [main.text()] + [f"{pin['wave']:.0f} nm" for pin in pins]
+        metrics = main.fontMetrics(); check = self.decay_normalize
+        full = sum(16 + 5 + metrics.horizontalAdvance(text) for text in texts) + 10 * (len(texts) - 1) + 10 + check.fontMetrics().horizontalAdvance('Normalize') + 26
+        title_end = self.decay_legend.mapTo(self.widgets['mapPanel'].header, QPoint(0, 0)).x()
+        compact = title_end + full > self.map_color_key.geometry().left() - 12
+        for label in labels:label.setVisible(not compact)
+        self.decay_legend.layout.setSpacing(6 if compact else 10)
+        check.setText('Norm.' if compact else 'Normalize')
+        self.decay_legend_main.setProperty('hint', f'{main.text()} (marked) · {self.PIN_HELP}' if compact else self.PIN_HELP)
+        self.decay_legend_main.set_shown(self.decay_legend_main.shown)
+        for pin in pins:
+            pin['box'].setProperty('hint', f"{pin['label']} · {self.PIN_HELP}" if compact else self.PIN_HELP); pin['box'].set_shown(pin['box'].shown)
     def _schedule_refresh(self):
         if not self._map_timer.isActive():
             self._map_timer.start()
@@ -2001,6 +2198,9 @@ class MainWindow(QMainWindow):
                 self.preview_button.setText('Live preview')
                 self._set_icon(self.preview_button, 'activity')
             self.capture_background.setEnabled(bool(getattr(self.controller, 'online', False) and availability.get('background') and available_background(busy)))
+            self.background_frames.setEnabled(busy is None)
+            self._update_background_status(snapshot, busy)
+            self._check_pending_scan(snapshot, busy)
             self._update_header(snapshot)
             self._update_cal_controls()
             self._update_output_status()
@@ -2032,7 +2232,7 @@ class MainWindow(QMainWindow):
             self._celebrate_run(run, completed)
         elif status in ('stopped', 'error') and run_id and run_id == getattr(self, '_scan_run_id', None):
             self._scan_run_id = None
-            self._discard_unfinished_files(run)
+            self._finish_unfinished_run(run)
         complete = busy != 'scan' and status == 'completed' and run_id is not None and run_id == getattr(self, '_completed_run_id', None)
         self._set_run_complete(complete)
         if busy == 'scan':
@@ -2064,13 +2264,11 @@ class MainWindow(QMainWindow):
         else:
             self.run_status.setText('✓ Scan complete' if complete else status.capitalize() if status else 'Ready' if online else 'Starting…')
             self._set_run_button('play', 'Start')
-        if total and completed is not None:
-            total_value = int(total)
-            completed_value = int(completed)
-            percent = 100.0 * completed_value / total_value if total_value else 0
-            self._animate_progress(max(0, min(100, percent)))
-            self.progress_text.setText(f'{completed_value} / {total_value} points · {run.get("committed_frames",0)} frames')
-            self.remaining.setText(str(run.get('step') if busy=='scan' else status))
+        # A stopped scan cannot continue, so the bar returns to its idle state (the next scan's plan).
+        show_run = bool(total and completed is not None and not (busy != 'scan' and status == 'stopped'))
+        self._run_progress_shown = show_run
+        if show_run:
+            self._show_run_progress(run, plan, busy, status)
         else:
             self._animate_progress(0)
             if busy == 'preview':
@@ -2085,6 +2283,7 @@ class MainWindow(QMainWindow):
                 self._update_point_estimate()
             else:
                 self.remaining.setText('111 points')
+        self._update_scan_temperature(snapshot, busy)
         can_start = bool(online and not busy and (snapshot.get('available') or {}).get('scan'))
         if busy == 'scan':
             can_start = status in ('running', 'paused', 'pausing')
@@ -2111,28 +2310,54 @@ class MainWindow(QMainWindow):
                 for index in range(max(0, count)):
                     values.append(round(start + index * step, 9))
             unique = len(set(values))
-            repeats = int(self.repeats_input.value()) if self._mode == 'repeat' else 1
-            self.remaining.setText(f'{unique * repeats} points')
+            repeats = self._repeat_count()
+            self.remaining.setText(f'{unique} points / round' if repeats == 0 else f'{unique * repeats} points')
             if hasattr(self,'save_path') and self.controller.online:
                 request=self.collect_run_request();identity=dict(request);identity.pop('request_id',None)
                 key=(self._selected_source,json.dumps(identity,sort_keys=True))
                 if key!=getattr(self,'_plan_display_key',None):
                     self._plan_display_key=key
                     def planned(plan):
-                        if key!=self._plan_display_key or self.controller.acquisition.run:return
+                        if key!=self._plan_display_key or getattr(self,'_run_progress_shown',False):return
                         if not plan.get('delays_ps'):return
-                        self._last_plan=plan
-                        self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scan{'s' if plan['rounds'] != 1 else ''}")
-                        duration="Estimated "+format_duration(plan['estimated_seconds'])
-                        self.remaining.setText(duration+f" / ×{request['speedup']:g} simulation" if self._selected_source=='simulation' else duration)
+                        self._last_plan=plan;self._show_plan(plan,request)
                     self.controller.dispatch('plan',request,success=planned,failure=lambda error:None)
                 elif hasattr(self,'_last_plan'):
-                    plan=self._last_plan
-                    self.progress_text.setText(f"{len(plan['delays_ps'])} points / scan · {plan['rounds']} scan{'s' if plan['rounds'] != 1 else ''}")
-                    duration="Estimated "+format_duration(plan['estimated_seconds'])
-                    self.remaining.setText(duration+f" / ×{request['speedup']:g} simulation" if self._selected_source=='simulation' else duration)
+                    self._show_plan(self._last_plan,request)
         except Exception:
             self.remaining.setText('- points')
+    def _show_run_progress(self, run, plan, busy, status):
+        '''The bar while a scan runs (and after it completed): the round in progress and the frames recorded.'''
+        points = max(1, len(plan.get('delays_ps') or []) or 1)
+        rounds = int(plan.get('rounds') or 1)
+        until = bool(plan.get('until_stopped') or run.get('until_stopped'))
+        completed = int(run.get('completed_points') or 0)
+        done_rounds = int(run.get('completed_rounds') or 0)
+        current = run.get('current_round')
+        frames = int(run.get('committed_frames') or 0)
+        if until:
+            # No total to measure against: the bar fills once per round.
+            percent = 100.0 if busy != 'scan' and status == 'completed' else 100.0 * (completed % points) / points
+        else:
+            percent = 100.0 * completed / (points * rounds)
+        self._animate_progress(max(0, min(100, percent)))
+        if busy == 'scan' and current is not None:
+            shown = min(int(current) + 1, rounds)
+        else:
+            shown = max(done_rounds, 1 if completed else 0)
+        label = f'Round {shown}' if until else f'Round {shown} / {rounds}'
+        self.progress_text.setText(f"{label} · {frames:,} frame{'s' if frames != 1 else ''}")
+        self.remaining.setText(str(run.get('step') if busy == 'scan' else status))
+    def _show_plan(self, plan, request):
+        '''The idle progress bar: what the next scan will do.'''
+        points = len(plan['delays_ps'])
+        if plan.get('until_stopped'):
+            self.progress_text.setText(f'{points} points / round · repeats until stopped')
+            duration = 'Estimated ' + format_duration(plan.get('round_seconds') or 0) + ' / round'
+        else:
+            self.progress_text.setText(f"{points} points / round · {plan['rounds']} round{'s' if plan['rounds'] != 1 else ''}")
+            duration = 'Estimated ' + format_duration(plan['estimated_seconds'])
+        self.remaining.setText(duration + f" · ×{request['speedup']:g} simulation" if self._selected_source == 'simulation' else duration)
     def _flush_labels(self):
         if self._current_page == 'acquisition':
             self._update_live_spectrum()
@@ -2148,7 +2373,8 @@ class MainWindow(QMainWindow):
             return
         dataset = self.controller.acquisition
         scale = self.map_scale.current()
-        key = (id(dataset), dataset.revision, current_mode(), scale, dataset.wave, dataset.half_window)
+        pins = tuple((pin['key'], pin['wave']) for pin in self._decay_pins)
+        key = (id(dataset), dataset.revision, current_mode(), scale, dataset.wave, dataset.half_window, pins, self.decay_normalize.isChecked())
         if not self._map_dirty and key == self._map_key:
             return
         if getattr(self,'_map_dataset',None) is not dataset:
@@ -2169,7 +2395,14 @@ class MainWindow(QMainWindow):
         if self._selected_delay is None and dataset.delays:
             self._selected_delay = dataset.delays[0]
         delays, intensities = self._raw_decay_points(dataset)
-        self.decay_plot.set_decay(delays, intensities, 'linear')
+        extra = []
+        for pin in self._decay_pins:
+            pin_delays, pin_values = self._raw_decay_points(dataset, pin['wave'])
+            extra.append((pin['key'], pin['label'], pin['color'], pin_delays, pin_values))
+        self.decay_plot.set_decay(delays, intensities, 'linear', key='decay_main', extra=extra, normalize=self.decay_normalize.isChecked(),
+                                  label=f'{float(dataset.wave):.1f} nm' if extra else None)
+        self._sync_pins()
+        self._update_decay_legend(dataset)
         self.map_plot.set_marker(self._selected_delay, dataset.wave if dataset.records else None, show_delay=self._picked_spectrum_active())
         self.decay_plot.set_marker(self._selected_delay)
         self._map_key = key
@@ -2217,6 +2450,9 @@ class MainWindow(QMainWindow):
         bg = background.get('spectrum')
         bg_array = np.asarray(bg, dtype=float) if bg else None
         self.spectrum_plot.set_spectrum(x, current, bg_array, x_label, self.spectrum_scale.current())
+        self._sync_pins()
+        averaged = dataset.groups[self._picked_delay].count if picked else 1
+        self._update_live_noise(snapshot, frame, latest, current, x, picked, averaged)
         self.spectrum_plot.set_axis_bounds('x',float(np.min(x)),float(np.max(x)))
         full_scale=float(snapshot.get('camera',{}).get('full_scale',65535));logarithmic=self.spectrum_scale.current()=='log'
         self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
@@ -2227,9 +2463,86 @@ class MainWindow(QMainWindow):
             self.saturation.show()
         else:
             self.saturation.hide()
-    def _raw_decay_points(self, dataset):
+    def _update_live_noise(self, snapshot, frame, latest, current, x, picked, averaged=1):
+        '''Noise on the Live spectrum's right axis: the scatter of each pixel over repeated preview frames, or a
+        single-frame estimate for scan frames (each at a new delay) and picked run spectra.'''
+        if current is None or not len(current):
+            self.spectrum_plot.set_noise(None, None); return
+        repeated = not picked and frame is not None and frame.get('record_id') is None
+        if repeated and frame is latest:
+            camera = snapshot.get('camera') or {}
+            # Frames are comparable only at the same source, readout, exposure and delay.
+            key = (snapshot.get('source_mode'), snapshot.get('device_generation'), len(current), frame.get('exposure_s'),
+                   round(float(frame.get('delay_ps') or 0.0), 4), json.dumps(camera.get('readout') or {}, sort_keys=True))
+            self._live_noise.add((snapshot.get('_sync') or {}).get('latest_version'), current, key)
+        sigma, mean, description = self._live_noise.sigma(current, repeated)
+        bg = (snapshot.get('background') or {}).get('spectrum')
+        percent, signal, basis = relative_noise(sigma, mean, bg if bg and len(bg) == len(mean) else None)
+        camera = snapshot.get('camera') or {}
+        limit = shot_limit(signal, camera.get('electrons_per_count'), camera.get('read_noise_e'), averaged)
+        self.spectrum_plot.set_noise(x, percent, self.spectrum_scale.current(), limit)
+        if limit is not None:
+            read = camera.get('read_noise_e')
+            limit_text = (f"Shot-noise limit (dashed, off until its legend entry is clicked): the photon noise of an ideal "
+                          f"measurement, {float(camera['electrons_per_count']):g} e⁻/count"
+                          + (f' plus {float(read):g} e⁻ read noise' if read is not None else ' (read noise not reported)')
+                          + (f', for a mean of {averaged} frames' if averaged > 1 else ''))
+        else:
+            limit_text = 'No shot-noise limit: the camera does not report its sensitivity (electrons per count)'
+        self.spectrum_legend.entries['shot'].setVisible(limit is not None)
+        self.spectrum_legend.set_hint('noise', f'{description}\nRight-hand scale: σ as % of the signal ({basis}); '
+                                               f'not drawn below {SIGNAL_FLOOR:.0%} of the peak signal\n{limit_text}')
+    DECAY_PINS = 4
+    PIN_HELP = ('Right-click the TRPL map or the Live spectrum to add a decay at that wavelength (up to 4) · '
+                'drag its dashed line to move it · right-click the line to remove it')
+    def _pin_decay(self, wave):
+        dataset = self.controller.acquisition
+        if not (dataset.axis or (self._snapshot or {}).get('live_axis')):
+            self.show_toast('Pinned decays need a wavelength calibration'); return
+        wave = float(wave)
+        if any(abs(pin['wave'] - wave) < 0.5 for pin in self._decay_pins):
+            self.show_toast(f'{wave:.0f} nm is already pinned'); return
+        if len(self._decay_pins) >= self.DECAY_PINS:
+            self.show_toast(f'At most {self.DECAY_PINS} pinned wavelengths · right-click a line to remove one'); return
+        used = {pin['color'] for pin in self._decay_pins}
+        color = next(f'round{i}' for i in range(self.DECAY_PINS) if f'round{i}' not in used)
+        key = 'pin_' + uuid.uuid4().hex[:8]
+        pin = dict(key=key, wave=wave, color=color, label=f'{wave:.1f} nm')
+        box = self.decay_legend.add(f'{wave:.0f} nm', color=color, key=key)
+        box.setProperty('hint', self.PIN_HELP); box.set_shown(True)
+        pin['box'] = box; self._decay_pins.append(pin)
+        self._sync_pins(); self._map_dirty = True; self._schedule_refresh()
+    def _unpin_decay(self, key):
+        pin = next((pin for pin in self._decay_pins if pin['key'] == key), None)
+        if pin is None:
+            return
+        self._decay_pins.remove(pin); self.decay_legend.entries.pop(key, None)
+        for plot in (self.decay_plot, self.map_plot, self.spectrum_plot):plot.set_series_visible(key, True)
+        pin['box'].setParent(None); pin['box'].deleteLater()
+        self._sync_pins(); self._map_dirty = True; self._schedule_refresh()
+    def _pin_moved(self, key, wave, finished):
+        pin = next((pin for pin in self._decay_pins if pin['key'] == key), None)
+        if pin is None:
+            return
+        pin['wave'] = float(wave); pin['label'] = f'{wave:.1f} nm'
+        pin['box'].findChild(QLabel).setText(f'{wave:.0f} nm')
+        self._sync_pins(); self._map_dirty = True; self._schedule_refresh()
+    def _sync_pins(self):
+        '''Draw the pinned wavelengths on the map (with data) and on the Live spectrum (on a wavelength axis).'''
+        pins = [(pin['key'], pin['wave'], pin['color'], pin['label']) for pin in self._decay_pins]
+        self.map_plot.set_pins(pins if self.controller.acquisition.records else [])
+        self.spectrum_plot.set_pins(pins if self.spectrum_plot.bottom_axis.labelText == 'Wavelength / nm' else [])
+    def _decay_series_toggled(self, key, shown):
+        for plot in (self.decay_plot, self.map_plot, self.spectrum_plot):plot.set_series_visible(key, shown)
+    def _update_decay_legend(self, dataset):
+        text = f'{float(dataset.wave):.0f} nm'
+        label = self.decay_legend_main.findChild(QLabel)
+        if label.text() != text:label.setText(text)
+        visible = bool(dataset.records)
+        self.decay_legend.setVisible(visible); self.decay_normalize.setVisible(visible and bool(self._decay_pins))
+    def _raw_decay_points(self, dataset, wave=None):
         axis = dataset.axis
-        wave = dataset.wave
+        wave = dataset.wave if wave is None else wave
         half = dataset.half_window
         indices = None
         if axis:
@@ -2314,11 +2627,15 @@ class MainWindow(QMainWindow):
         run = dataset.run if dataset is not None else None
         if imported is not None and run:
             path = run.get('path') or run.get('run_id') or 'Imported experiment'
-            self.analysis_source.setText(f'Imported · {path}')
+            # The file name only: a full path has no break points and would widen the whole sidebar.
+            self.analysis_source.setText(f'Imported · {Path(str(path)).name}')
+            self.analysis_source.setToolTip(str(path))
         elif run:
             self.analysis_source.setText('Current experiment · not saved' if run.get('files_removed') else Path(run.get('path') or 'Current experiment').name)
+            self.analysis_source.setToolTip(str(run.get('path') or ''))
         else:
             self.analysis_source.setText('No experiment loaded')
+            self.analysis_source.setToolTip('')
         delays = dataset.delays if dataset is not None else []
         records = len(dataset.records) if dataset is not None else 0
         repeat = records / len(delays) if delays else 0
@@ -2348,6 +2665,110 @@ class MainWindow(QMainWindow):
         self.save_run.setEnabled(bool(imported is None and run is not None and (not run.get('saved') or run.get('files_removed'))))
         self._refresh_analysis_delay_combo(delays)
         self._refresh_spectrum_legend()
+        self.experiment_details.setEnabled(bool(run and run.get('metadata')))
+        self._update_processing_labels(dataset)
+        self._refresh_fit_history(dataset)
+    def _fit_history_items(self, dataset):
+        history = ((dataset.run or {}).get('metadata') or {}).get('analysis') or {} if dataset is not None else {}
+        return sorted(((task_id, fit) for task_id, fit in history.items() if isinstance(fit, dict) and fit.get('parameters')),
+                      key=lambda item: str(item[1].get('finished_utc') or ''), reverse=True)
+    def _fit_history_label(self, fit):
+        request = fit.get('request') or {}
+        try:
+            stamp = datetime.fromisoformat(str(fit.get('finished_utc'))).astimezone().strftime('%H:%M:%S')
+        except (TypeError, ValueError):
+            stamp = '—'
+        parameters = fit.get('parameters') or {}
+        taus = [parameters[key] for key in ('tau_ps', 'tau_1_ps', 'tau_2_ps') if parameters.get(key) is not None]
+        tau = ' / '.join(f'{value:.3g}' for value in taus)
+        model = {'double': 'Double', 'single': 'Single'}.get(fit.get('model'), str(fit.get('model') or ''))
+        # "not in file" comes right after the time so it stays visible when the label is elided.
+        return (f"{stamp}{'' if fit.get('stored') else ' (not in file)'} · {model} · "
+                f"{fmt(request.get('wavelength_nm'), 5)} ± {fmt(request.get('half_window_nm'), 3)} nm · τ {tau} ps")
+    def _refresh_fit_history(self, dataset):
+        items = self._fit_history_items(dataset)
+        current = dataset.fit if dataset is not None else None
+        current_id = current.get('task_id') if isinstance(current, dict) else None
+        key = (id(dataset), tuple((task_id, bool(fit.get('stored'))) for task_id, fit in items), current_id)
+        if getattr(self, '_fit_history_key', None) != key:
+            self._fit_history_key = key
+            with QSignalBlocker(self.fit_history):
+                self.fit_history.clear()
+                for task_id, fit in items:
+                    label = self._fit_history_label(fit)
+                    self.fit_history.addItem(label, task_id)
+                    self.fit_history.setItemData(self.fit_history.count() - 1, label, Qt.ToolTipRole)
+                index = self.fit_history.findData(current_id) if current_id else -1
+                self.fit_history.setCurrentIndex(index)
+            self.fit_history.setPlaceholderText(f'{len(items)} saved fit' + ('' if len(items) == 1 else 's') + ' · choose one to view' if items else 'No saved fits')
+        self.fit_history.setEnabled(bool(items) and not self._fit_running)
+        # A newly opened experiment shows its latest saved fit, with the window it was fitted in.
+        if dataset is not None and dataset.records and getattr(self, '_fit_history_dataset', None) is not dataset:
+            self._fit_history_dataset = dataset
+            if current is None and items and not self._fit_running:
+                self._show_saved_fit(items[0][0])
+    def _show_saved_fit(self, task_id):
+        dataset = self.controller.analysis_context
+        fit = dict(((dataset.run or {}).get('metadata') or {}).get('analysis') or {}).get(task_id) if dataset is not None else None
+        if not isinstance(fit, dict) or self._fit_running:
+            return
+        request = fit.get('request') or {}
+        wave, half = request.get('wavelength_nm'), request.get('half_window_nm')
+        if wave is None or half is None:
+            return
+        self.analysis_wave.setText(f'{float(wave):g}'); self.analysis_window.setText(f'{float(half):g}')
+        if request.get('irf_fwhm_ps') is not None:
+            self.irf_width.setText(f"{float(request['irf_fwhm_ps']):g}")
+        self.fit_start.setText('' if request.get('min_delay_ps') is None else f"{float(request['min_delay_ps']):g}")
+        self.fit_end.setText('' if request.get('max_delay_ps') is None else f"{float(request['max_delay_ps']):g}")
+        with QSignalBlocker(self.fit_model):
+            index = self.fit_model.findData(fit.get('model'))
+            if index >= 0:
+                self.fit_model.setCurrentIndex(index)
+        dataset.wave = float(wave); dataset.half_window = float(half)
+        self._request_kinetics(dataset)
+        self._set_processing(fit.get('processing') or request, request.get('rounds'))
+        dataset.fit = fit
+        self.fit_status.setText('Saved fit' + ('' if fit.get('stored') else ' · this session only, not in the file'))
+        self._map_dirty = True
+        self._update_analysis_labels(); self._redraw_analysis(); self._schedule_refresh()
+    def _show_experiment_details(self):
+        dataset = self.controller.analysis_context
+        run = dataset.run if dataset is not None else None
+        if not run or not run.get('metadata'):
+            self.show_toast('No experiment details are available')
+            return
+        ExperimentInfoDialog(run, dataset.quality, self._apply_scan_settings, self).exec()
+    def _apply_scan_settings(self, request):
+        if (self._snapshot or {}).get('busy') == 'scan':
+            self.show_toast('Wait for the current scan to finish before loading other settings', 'warning')
+            return
+        mode = request.get('mode') or 'scan'
+        segments = [segment for segment in request.get('segments') or [] if isinstance(segment, dict)]
+        self.mode_seg.set_selected(mode); self._mode_changed(mode)
+        if mode == 'single':
+            if segments:
+                self.delay_edit.setText(f"{float(segments[0]['start']):g}")
+        elif segments:
+            for record in list(self._segment_rows):
+                record['widget'].setParent(None); record['widget'].deleteLater()
+            self._segment_rows.clear()
+            for segment in segments:
+                self._add_segment_row(f"{float(segment['start']):g}", f"{float(segment['end']):g}", f"{float(segment['step']):g}")
+        if request.get('repeats') is not None and mode == 'repeat':
+            self.repeat_forever.setChecked(int(request['repeats']) == 0)
+            if int(request['repeats']) > 0:
+                self.repeats_input.setValue(int(request['repeats']))
+        note = ''
+        exposure = request.get('exposure_s')
+        current = (self._snapshot.get('camera') or {}).get('exposure_s') if self._snapshot else None
+        if exposure is not None:
+            self.exposure_edit.setText(self._exposure_text(float(exposure)))
+            if current is None or abs(float(current) - float(exposure)) > 1e-12:
+                self._on_exposure_changed(); note = f' · exposure set to {float(exposure):g} s'
+        self._update_point_estimate()
+        self.show_page('acquisition')
+        self.show_toast('Scan settings loaded' + note)
     def _refresh_analysis_delay_combo(self, delays):
         key=(id(self.controller.analysis_context),tuple(delays))
         if getattr(self,'_delay_combo_key',None)==key:return
@@ -2406,7 +2827,7 @@ class MainWindow(QMainWindow):
         self._spectrum_overlays = [delay for delay in self._spectrum_overlays if delay in delays]
         for delay in sorted(self._spectrum_overlays):
             group=dataset.groups.get(delay)
-            count=len(group.records) if hasattr(group,'records') else len([r for r in dataset.records if float(r.get('delay_ps',0))==delay])
+            count=group.count if group is not None else 0
             button = QPushButton(f'━  {delay:g} ps · {count} frames  ×');button.setFixedHeight(30)
             button.setProperty('small', True)
             color = map_color(_delay_fraction(delay, delays))
@@ -2420,6 +2841,246 @@ class MainWindow(QMainWindow):
         self._spectrum_overlays = [delay for delay in self._spectrum_overlays if delay != value]
         self._refresh_spectrum_legend()
         self._redraw_analysis()
+    def _background_available(self, dataset):
+        background = (((dataset.run or {}).get('metadata') or {}).get('background') or {}) if dataset is not None else {}
+        return bool(background.get('present') and background.get('spectrum'))
+    def _processing_options(self, dataset=None):
+        dataset = dataset if dataset is not None else self.controller.analysis_context
+        tolerance = number_value(self.proc_tolerance)
+        rounds = sorted(set(self._rounds_available) - self._excluded_rounds) if self._excluded_rounds else None
+        return dict(subtract_background=bool(self.proc_background.isChecked() and self._background_available(dataset)),
+                    exclude_saturated=bool(self.proc_saturated.isChecked()), exclude_unstable=bool(self.proc_unstable.isChecked()),
+                    position_tolerance_um=float(tolerance) if self.proc_position.isChecked() and tolerance is not None and tolerance > 0 else None,
+                    rounds=rounds or None)
+    ROUND_LEGEND_MAX = 4
+    def _show_round_legend(self, rounds):
+        '''One entry per drawn round (Round 1, Round 3, ...) when they fit; otherwise a single "Each round".'''
+        shown = [int(index) for index, _, _ in rounds or []]
+        own = 0 < len(shown) <= self.ROUND_LEGEND_MAX and max(shown) < self.ROUND_LEGEND_MAX
+        self.analysis_legend_rounds.setVisible(bool(shown) and not own)
+        for i, item in enumerate(self.analysis_legend_round_items):
+            item.setVisible(own and i in shown)
+    def _set_processing(self, processing, rounds=None):
+        self._updating_processing = True
+        try:
+            processing = processing or {}
+            self.proc_background.setChecked(bool(processing.get('subtract_background')))
+            self.proc_saturated.setChecked(bool(processing.get('exclude_saturated', True)))
+            self.proc_unstable.setChecked(bool(processing.get('exclude_unstable')))
+            tolerance = processing.get('position_tolerance_um')
+            self.proc_position.setChecked(tolerance is not None)
+            if tolerance is not None:
+                self.proc_tolerance.setText(f'{float(tolerance):g}')
+            self._excluded_rounds = set(self._rounds_available) - set(rounds) if rounds else set()
+        finally:
+            self._updating_processing = False
+        self.proc_tolerance_row.setVisible(self.proc_position.isChecked())
+        self._rebuild_rounds_menu()
+    def _processing_changed(self):
+        self.proc_tolerance_row.setVisible(self.proc_position.isChecked())
+        if self._updating_processing:
+            return
+        self.controller.invalidate_fit('analysis')
+        self._fit_running = False
+        self._update_analysis_labels(); self._redraw_analysis()
+    def _rebuild_rounds_menu(self):
+        menu = self.proc_rounds_menu; menu.clear()
+        available = self._rounds_available
+        everything = menu.addAction('Use all rounds')
+        everything.triggered.connect(lambda checked=False: self._choose_rounds(None))
+        menu.addSeparator()
+        for r in available:
+            action = menu.addAction(f'Round {r + 1}')
+            action.setCheckable(True); action.setChecked(r not in self._excluded_rounds)
+            action.triggered.connect(lambda checked=False, r=r: self._choose_rounds(r))
+        used = len(available) - len(self._excluded_rounds & set(available))
+        self.proc_rounds.setText(f'All {len(available)} rounds' if not self._excluded_rounds else f'{used} of {len(available)} rounds')
+        self.proc_rounds_row.setVisible(len(available) > 1)
+    def _choose_rounds(self, toggled):
+        if toggled is None:
+            self._excluded_rounds = set()
+        elif toggled in self._excluded_rounds:
+            self._excluded_rounds.discard(toggled)
+        elif len(set(self._rounds_available) - self._excluded_rounds) > 1:
+            self._excluded_rounds.add(toggled)
+        else:
+            self.show_toast('At least one round must stay in the analysis', 'warning')
+        self._rebuild_rounds_menu(); self._processing_changed()
+    def _kinetics_request(self, dataset):
+        candidate = dict(model='single', wavelength_nm=float(dataset.wave), half_window_nm=float(dataset.half_window), **self._processing_options(dataset))
+        options = _model_payload('backend.models', 'FitRequest', candidate)
+        return (id(dataset), json.dumps(options, sort_keys=True)), options
+    @staticmethod
+    def _rounds_recorded(run):
+        '''Rounds in a run's data: the completed rounds once it has any, else the plan (an until-stopped plan's
+        round count is only the frame-limit cap).'''
+        metadata = run.get('metadata') or {}; root = metadata.get('root') or {}; request = metadata.get('request') or run.get('request') or {}
+        done = root.get('completed_rounds') if root.get('completed_rounds') is not None else run.get('completed_rounds')
+        if done:
+            return int(done)
+        if request.get('mode') == 'repeat' and request.get('repeats') == 0:
+            return 1
+        return int((metadata.get('acquisition') or {}).get('rounds') or 1)
+    def _current_kinetics(self, dataset):
+        if dataset is None or self._kinetics is None:
+            return None
+        key, _ = self._kinetics_request(dataset)
+        stored_key, result = self._kinetics
+        return result if stored_key[:2] == key and result is not None else None
+    def _request_kinetics(self, dataset):
+        if dataset is None or dataset.run is None or not dataset.records or not dataset.axis or not getattr(self.controller, 'online', False):
+            return
+        if self._processing_dataset is not dataset:
+            # A different experiment: its own rounds, all of them in use.
+            self._processing_dataset = dataset; self._excluded_rounds = set(); self._kinetics = None
+            self._rounds_available = list(range(self._rounds_recorded(dataset.run))); self._rebuild_rounds_menu()
+        key, options = self._kinetics_request(dataset)
+        full_key = key + (len(dataset.records),)
+        if self._kinetics is not None and self._kinetics[0] == full_key:
+            return
+        if self._kinetics_inflight is not None:
+            self._kinetics_again = self._kinetics_inflight != full_key
+            return
+        self._kinetics_inflight = full_key
+        def finished(result, error=None):
+            self._kinetics_inflight = None
+            if dataset is self.controller.analysis_context:
+                self._kinetics = (full_key, result)
+                present = (result or {}).get('rounds_available')
+                if present and present != self._rounds_available:
+                    # The rounds actually in the data are the authority (a stopped or until-stopped scan has fewer than planned).
+                    self._rounds_available = list(present); self._excluded_rounds &= set(present); self._rebuild_rounds_menu()
+                if error:
+                    self.processing_summary.setText('Processing failed'); self.processing_summary.setToolTip(str(error))
+                self._update_processing_labels(dataset); self._redraw_analysis()
+            if self._kinetics_again:
+                self._kinetics_again = False; self._request_kinetics(self.controller.analysis_context)
+        self.controller.dispatch('kinetics', {'run_id': dataset.run.get('run_id'), 'analysis': dataset is self.controller.analysis_imported, 'options': options},
+                                 success=lambda result: finished(result if isinstance(result, dict) else None),
+                                 failure=lambda payload: finished(None, payload_message(payload)))
+    def _update_processing_labels(self, dataset):
+        available = self._background_available(dataset)
+        self.proc_background.setEnabled(available)
+        self.proc_background_note.setText('' if available else 'none recorded')
+        result = self._current_kinetics(dataset)
+        counts = (result or {}).get('counts') or {}
+        def plural(count, word):
+            return '' if count is None else f'{count:,} {word}' + ('' if count == 1 else 's')
+        self.proc_saturated_note.setText(plural(counts.get('saturated_points'), 'point'))
+        self.proc_unstable_note.setText(plural(counts.get('unstable_frames'), 'frame'))
+        error = counts.get('position_error_max_um')
+        if self.proc_position.isChecked():
+            self.proc_position_note.setText(plural(counts.get('off_position_frames'), 'frame'))
+        else:
+            self.proc_position_note.setText('' if error is None else f'max {error:.3g} µm')
+        for note, value in ((self.proc_saturated_note, counts.get('saturated_points')), (self.proc_unstable_note, counts.get('unstable_frames'))):
+            set_prop(note, 'warning', bool(value))
+        if counts:
+            self.processing_summary.setText(f"{counts['frames_used']:,} of {counts['frames_total']:,} frames")
+            self.processing_summary.setToolTip('Frames that go into the decay curve with the choices below')
+        elif result is None:
+            self.processing_summary.setText('')
+        spectrum = self.analysis_view.currentData() == 'spectrum'
+        for widget in (self.proc_saturated, self.proc_unstable, self.proc_position, self.proc_tolerance, self.proc_rounds, self.proc_show_rounds):
+            widget.setEnabled(not spectrum and not self._fit_running)
+        self.proc_background.setEnabled(available and not self._fit_running)
+    def _update_background_status(self, snapshot, busy):
+        background = snapshot.get('background') or {}
+        progress = snapshot.get('background_progress') or {}
+        self.capture_background.setText('Stop' if busy == 'background' else 'Background')
+        self._set_icon(self.capture_background, 'stop' if busy == 'background' else 'layers')
+        if busy == 'background':
+            text, state = f"Taking background · {progress.get('frames', 0)} / {progress.get('total', self.background_frames.value())}", 'busy'
+        elif background.get('spectrum'):
+            frames = int(background.get('frames') or 1)
+            try:
+                stamp = datetime.fromisoformat(str(background.get('timestamp_utc'))).astimezone().strftime('%H:%M')
+            except (TypeError, ValueError):
+                stamp = ''
+            exposure = background.get('exposure_s')
+            text = f"✓ Background · {frames} frame{'s' if frames != 1 else ''}" + (f' · {stamp}' if stamp else '')
+            state = 'ready'
+            detail = f"{frames} frame{'s' if frames != 1 else ''} averaged" + (f' at {float(exposure):g} s exposure' if exposure is not None else '') + '. '
+        else:
+            text, state = 'No background recorded', 'none'
+        if state != 'ready':
+            detail = ''
+        self.background_status.setText(text)
+        self.background_status.setToolTip(detail + 'The background is saved with the next scan and can be subtracted in Analysis. '
+                                          'Changing the exposure, readout or device discards it.')
+        set_prop(self.background_status, 'state', state)
+    def _capture_background(self, frames=None, success=None, failure=None):
+        if (self._snapshot or {}).get('busy') == 'background':
+            self.controller.dispatch('background_stop', {}, failure=lambda payload: self.show_toast(payload_message(payload)))
+            return
+        data = {'kind': 'optical_background', 'condition': 'manual', 'frames': int(frames or self.background_frames.value())}
+        self.controller.dispatch('background', data, success=success,
+                                 failure=failure or (lambda payload: self.show_toast(payload_message(payload))))
+    def _check_before_scan(self, request):
+        issues = [] if self._skip_prescan else prescan_issues(self._snapshot, request)
+        if not issues:
+            self._preflight_and_call('run', request.get('save_path'), request, self._run_started, self._run_failed)
+            return
+        dialog = PrescanDialog(issues, self)
+        dialog.exec()
+        # Read the answers before releasing the dialog (a dialog deleted on close is gone when exec() returns).
+        choice, skip = dialog.choice, dialog.skip_checks
+        dialog.deleteLater()
+        if skip:
+            self._skip_prescan = True
+        if choice == 'start':
+            self._preflight_and_call('run', request.get('save_path'), request, self._run_started, self._run_failed)
+        elif choice == 'background':
+            self._background_then_scan(request)
+    def _background_then_scan(self, request):
+        # The background is taken at the scan's exposure; the scan starts once a new background has arrived.
+        old = ((self._snapshot or {}).get('background') or {}).get('timestamp_utc')
+        self._pending_scan = dict(request=request, old=old, seen_busy=False, since=time.monotonic())
+        def failed(payload):
+            self._pending_scan = None; self.show_toast(payload_message(payload))
+        def acquire(*args):
+            self._capture_background(success=lambda result: None, failure=failed)
+        exposure = float(request.get('exposure_s'))
+        current = ((self._snapshot or {}).get('camera') or {}).get('exposure_s')
+        if current is None or abs(float(current) - exposure) > 1e-12:
+            self.controller.dispatch('configure', {'exposure_s': exposure}, success=acquire, failure=failed)
+        else:
+            acquire()
+        self.show_toast('Acquiring the background · the scan starts when it is done')
+    def _check_pending_scan(self, snapshot, busy):
+        pending = getattr(self, '_pending_scan', None)
+        if not pending:
+            return
+        if busy == 'background':
+            pending['seen_busy'] = True; return
+        if busy is not None:
+            return
+        background = snapshot.get('background') or {}
+        if background.get('spectrum') and background.get('timestamp_utc') != pending['old']:
+            self._pending_scan = None
+            request = dict(pending['request'], request_id=uuid.uuid4().hex)
+            self._preflight_and_call('run', request.get('save_path'), request, self._run_started, self._run_failed)
+        elif pending['seen_busy'] or time.monotonic() - pending['since'] > 15:
+            self._pending_scan = None
+            self.show_toast('No background was acquired, so the scan was not started', 'warning')
+    def _update_scan_temperature(self, snapshot, busy):
+        camera = snapshot.get('camera') or {}
+        temperature = camera.get('temperature_c'); state = str(camera.get('temperature_state') or '')
+        visible = busy == 'scan' and temperature is not None
+        self.scan_temperature.setVisible(visible)
+        if busy != 'scan':
+            self._scan_temperature_state = None
+            return
+        if not visible:
+            return
+        label = {'stabilized': 'stable', 'not_reached': 'cooling', 'not_stabilized': 'settling', 'drift': 'drifting', 'off': 'cooler off'}.get(state, state)
+        color = {'stabilized': 'success', 'not_reached': 'warning', 'not_stabilized': 'warning', 'drift': 'danger'}.get(state, 'muted')
+        self.scan_temperature.setText(f'<span style="color:{palette()[color]}">●</span> CCD {float(temperature):.1f} °C · {label}')
+        self.scan_temperature.setToolTip('CCD chip temperature during the scan; every frame records it and its state')
+        previous = getattr(self, '_scan_temperature_state', None)
+        if previous == 'stabilized' and state in ('not_reached', 'not_stabilized', 'drift'):
+            self.show_toast(f'CCD temperature is {label} ({float(temperature):.1f} °C) · these frames are marked unstable and Analysis can leave them out', 'warning')
+        self._scan_temperature_state = state
     def _redraw_analysis(self):
         dataset = self.controller.analysis_context
         if dataset is None:
@@ -2430,11 +3091,20 @@ class MainWindow(QMainWindow):
         if view == 'spectrum':
             curves = []
             axis = dataset.axis
+            options = self._processing_options(dataset)
+            background = None
+            if options['subtract_background']:
+                metadata = dataset.run.get('metadata') or {}
+                exposure = (metadata.get('acquisition') or {}).get('exposure_s')
+                if exposure:
+                    background = np.asarray(metadata['background']['spectrum'], dtype=float) / float(exposure)
             for delay in self._spectrum_overlays:
                 group = dataset.groups.get(delay)
                 if group is None:
                     continue
                 values = group.normalized
+                if background is not None and background.shape == values.shape:
+                    values = values - background
                 if axis and len(axis):
                     x = np.asarray(axis[:values.size], dtype=float)
                     x_label = 'Wavelength / nm'
@@ -2453,11 +3123,25 @@ class MainWindow(QMainWindow):
             self.analysis_spectrum_status.setText(f'{len(self._spectrum_overlays)} overlays · {len(delays)} acquired delays' if self._spectrum_overlays else 'Choose a delay and press Overlay');self.analysis_add_delay.setEnabled(self.analysis_delay.currentData() not in self._spectrum_overlays)
             return
         fit = dataset.fit
-        observed = list(zip(fit['delays_ps'],fit['observed'])) if fit else dataset.observed()
+        self._request_kinetics(dataset)
+        kinetics = self._current_kinetics(dataset)
+        options = self._processing_options(dataset)
+        defaults = not options['subtract_background'] and not options['exclude_unstable'] and options['position_tolerance_um'] is None and not options['rounds']
+        if fit:
+            observed = list(zip(fit['delays_ps'], fit['observed']))
+        elif kinetics is not None:
+            observed = list(zip(kinetics['delays_ps'], kinetics['values']))
+        else:
+            # Until the worker answers, the plain average is right only when nothing is subtracted or left out.
+            observed = dataset.observed() if defaults else []
+        rounds = [(item['round'], item['delays_ps'], item['values']) for item in kinetics['per_round']] if kinetics and self.proc_show_rounds.isChecked() and len(kinetics['per_round']) > 1 else None
+        saturated = kinetics['saturated'] if kinetics and options['exclude_saturated'] else None
+        left_out = list(zip(saturated['delays_ps'], saturated['values'])) if saturated else []
+        self._show_round_legend(rounds); self.analysis_legend_left_out.setVisible(bool(left_out))
         fit_points = self._fit_curve_points(fit)
         self.analysis_plot_title.setText('Decay & fit')
-        self.analysis_window_label.setText(f'{dataset.wave:g} ± {dataset.half_window:g} nm')
-        self.analysis_curve.set_decay(observed, fit_points, scale)
+        self.analysis_window_label.setText(f'{dataset.wave:g} ± {dataset.half_window:g} nm' + (' · background subtracted' if options['subtract_background'] else ''))
+        self.analysis_curve.set_decay(observed, fit_points, scale, rounds=rounds, left_out=left_out)
         residuals = self._fit_residual_points(fit, observed, fit_points)
         self.analysis_residual.set_points(residuals)
         self._update_fit_panel(fit, observed)
@@ -2550,17 +3234,27 @@ class MainWindow(QMainWindow):
     def _fit_parameters(self,fit):
         if not isinstance(fit,dict):return []
         names={'tau_ps':('τ','ps'),'tau_1_ps':('τ₁','ps'),'tau_2_ps':('τ₂','ps'),'amplitude':('Amplitude','counts/s'),'amplitude_1':('Amplitude 1','counts/s'),'amplitude_2':('Amplitude 2','counts/s'),'t0_ps':('t₀','ps'),'offset_counts_s':('Offset','counts/s')}
-        return [(label,fit['parameters'][key],fit.get('standard_errors',{}).get(key),unit) for key,(label,unit) in names.items() if key in fit.get('parameters',{})]
+        spread=fit.get('round_spread') or {}
+        return [(label,fit['parameters'][key],fit.get('standard_errors',{}).get(key),unit,spread.get(key)) for key,(label,unit) in names.items() if key in fit.get('parameters',{})]
     def _update_fit_panel(self, fit, observed):
         self.fit_table.clearSpans()
         self.fit_table.setRowCount(0)
         parameters = self._fit_parameters(fit)
+        between = bool(parameters) and any(item[4] is not None for item in parameters)
+        headers = ['Parameter', 'Value', 'Std. error'] + (['Between rounds'] if between else []) + ['Unit']
+        if self.fit_table.columnCount() != len(headers):
+            self.fit_table.setColumnCount(len(headers))
+        self.fit_table.setHorizontalHeaderLabels(headers)
+        self.fit_table_note.setText('Value ± local SE · SE between rounds' if between else 'Value ± local SE')
+        used = fit.get('frames_used') if isinstance(fit, dict) else None
+        rounds_used = fit.get('rounds_used') if isinstance(fit, dict) else None
+        self.fit_frames_used.setText('-' if used is None else f'{used:,}' + (f" · {len(rounds_used)} round{'s' if len(rounds_used) != 1 else ''}" if rounds_used else ''))
         if not parameters:
             self.fit_table.setRowCount(1)
             item = QTableWidgetItem('Run a fit to inspect lifetimes and parameter uncertainty.')
             item.setForeground(Qt.gray);item.setTextAlignment(Qt.AlignCenter)
             self.fit_table.setItem(0, 0, item)
-            self.fit_table.setSpan(0, 0, 1, 4)
+            self.fit_table.setSpan(0, 0, 1, self.fit_table.columnCount())
             self.fit_sample_count.setText('No fit result')
             self.fit_rmse.setText('-')
             self.fit_condition.setText('-')
@@ -2568,8 +3262,8 @@ class MainWindow(QMainWindow):
             return
         self.fit_table.setRowCount(len(parameters))
         for row, parameter in enumerate(parameters):
-            name, value, error, unit = parameter
-            for column, text in enumerate((str(name), fmt(value, 6), fmt(error, 6), str(unit or ''))):
+            name, value, error, unit, spread = parameter
+            for column, text in enumerate((str(name), fmt(value, 6), fmt(error, 6)) + ((fmt(spread, 6) if spread is not None else '—',) if between else ()) + (str(unit or ''),)):
                 cell = QTableWidgetItem(text); cell.setTextAlignment(Qt.AlignCenter)
                 self.fit_table.setItem(row, column, cell)
         samples = len(fit.get('delays_ps') or [])
@@ -2615,6 +3309,7 @@ class MainWindow(QMainWindow):
             'fit_end': end,
             'min_delay_ps': start,
             'max_delay_ps': end,
+            **self._processing_options(dataset),
         }
         options = _model_payload('backend.models', 'FitRequest', candidate)
         self.fit_status.setText('Requesting fit…')
@@ -2637,7 +3332,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         dataset = self.controller.analysis_context
-        observed = dataset.observed()
+        observed = list(zip(fit.get('delays_ps') or [], fit.get('observed') or []))
         fit_points = self._fit_curve_points(fit)
         residuals = self._fit_residual_points(fit, observed, fit_points)
         try:
@@ -2646,10 +3341,14 @@ class MainWindow(QMainWindow):
             writer.writerow(['fit_export'])
             writer.writerow(['wavelength_nm', dataset.wave])
             writer.writerow(['half_window_nm', dataset.half_window])
+            for key, value in (fit.get('processing') or {}).items():
+                writer.writerow([key, '' if value is None else value])
+            writer.writerow(['rounds_used', ' '.join(str(r + 1) for r in fit.get('rounds_used') or [])])
+            writer.writerow(['frames_used', fit.get('frames_used', '')])
             writer.writerow([])
-            writer.writerow(['parameter', 'value', 'std_error', 'unit'])
+            writer.writerow(['parameter', 'value', 'std_error', 'between_round_se', 'unit'])
             for item in self._fit_parameters(fit):
-                writer.writerow([item[0], item[1], item[2], item[3]])
+                writer.writerow([item[0], item[1], item[2], '' if item[4] is None else item[4], item[3]])
             writer.writerow([])
             writer.writerow(['delay_ps', 'observed', 'fit', 'residual'])
             fit_x = np.asarray([item[0] for item in fit_points], dtype=float) if fit_points else np.asarray([], dtype=float)
@@ -2696,6 +3395,24 @@ class MainWindow(QMainWindow):
         self.scan_params.setVisible(mode != 'single')
         self.repeat_wrap.setVisible(mode == 'repeat')
         self._update_point_estimate()
+    def _repeat_forever_changed(self, checked):
+        # Until stopped: the count box greys out and reads ∞ (its special value at 0); unticking restores the count.
+        spin = self.repeats_input; spin.blockSignals(True)
+        try:
+            if checked:
+                if spin.minimum() > 0:self._repeats_before = spin.value()
+                spin.setSpecialValueText('∞'); spin.setMinimum(0); spin.setValue(0)
+            elif spin.minimum() == 0:
+                spin.setMinimum(1); spin.setSpecialValueText(''); spin.setValue(getattr(self, '_repeats_before', 3) or 3)
+        finally:
+            spin.blockSignals(False)
+        spin.setEnabled(not checked)
+        self._update_point_estimate()
+    def _repeat_count(self):
+        '''Rounds requested: 1 outside Repeat mode, 0 for "until stopped".'''
+        if self._mode != 'repeat':
+            return 1
+        return 0 if self.repeat_forever.isChecked() else int(self.repeats_input.value())
     _SEGMENT_REMOVE_WIDTH = 32
     def _segment_cells(self, host, cells, trailing, dividers):
         # Shared column geometry for the Start / End / Step header and every joined segment row:
@@ -2793,7 +3510,7 @@ class MainWindow(QMainWindow):
             if delay is None:
                 delay = 0.0
             segments = [{'start': float(delay), 'end': float(delay)+1.0, 'step': 1.0}]
-        repeats = int(self.repeats_input.value()) if self._mode == 'repeat' else 1
+        repeats = self._repeat_count()
         path = self._full_save_path()
         candidate = {
             'request_id': uuid.uuid4().hex,
@@ -2836,7 +3553,7 @@ class MainWindow(QMainWindow):
             self.show_toast(str(error))
             return
         self.validation.setText('')
-        self._preflight_and_call('run', request.get('save_path'), request, self._run_started, self._run_failed)
+        self._check_before_scan(request)
     def _preflight_and_call(self, command, path, data, success, failure):
         autosave = bool(data.get('autosave')) if command == 'run' else True
         if not autosave:
@@ -3046,8 +3763,6 @@ class MainWindow(QMainWindow):
             self.show_toast('Center wavelength and slit must be positive')
             return
         self.controller.dispatch('spectrograph', {'center_nm': float(center), 'grating': grating, 'slit_um': float(slit)}, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
-    def _capture_background(self):
-        self.controller.dispatch('background', {'kind': 'optical_background', 'condition': 'manual'}, failure=lambda payload: self.show_toast(payload_message(payload)))
     def _choose_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Save folder', str(self.output_dir))
         if folder:
@@ -3058,18 +3773,31 @@ class MainWindow(QMainWindow):
         parts = self.output_dir.parts
         self.folder_label.setText(('…\\' if len(parts) > 2 else '') + '\\'.join(parts[-2:]))
         self.folder_label.setToolTip(f'Save folder: {self.output_dir}')
+    def _finish_unfinished_run(self, run):
+        '''A stopped scan keeps its complete rounds (the worker already dropped the round in progress); one
+        stopped before any round finished, or a failed scan, leaves an unfinished file that is removed.'''
+        rounds = int(run.get('completed_rounds') or 0)
+        if run.get('status') == 'stopped' and rounds > 0:
+            dropped = int(run.get('dropped_frames') or 0)
+            kept = f"{rounds} complete round{'s' if rounds != 1 else ''} kept"
+            if dropped:
+                kept += f' · round {rounds + 1} discarded'
+            where = f' · saved to {Path(str(run["path"])).name}' if run.get('saved') and run.get('path') else ' · in memory (Save HDF5 on Analysis writes it)'
+            self.show_toast(f'Scan stopped · {kept}{where}', 'info')
+            self._update_output_status()
+            return
+        if run.get('status') == 'stopped' and not run.get('saved'):
+            self.show_toast('Scan stopped before the first round finished · nothing was kept', 'info')
+            return
+        self._discard_unfinished_files(run)
     def _discard_unfinished_files(self, run):
-        '''An unfinished scan leaves NAME.stopped.h5 (or .partial.h5) and NAME.events.jsonl; move them to the
-        Recycle Bin so only finished experiments stay in the data folder. The frames remain in memory and can
-        still be saved from the Analysis page.'''
+        '''A failed scan leaves NAME.partial.h5, and one stopped before its first round finished leaves
+        NAME.stopped.h5; move it to the Recycle Bin so only usable experiments stay in the data folder. The
+        frames of a failed scan remain in memory and can still be saved from the Analysis page.'''
         path = run.get('path')
         if not (run.get('saved') or run.get('status') == 'error') or not path:
             return
-        data = Path(str(path)); stem = data.name
-        for suffix in ('.stopped.h5', '.partial.h5', '.h5'):
-            if stem.endswith(suffix):
-                stem = stem[:-len(suffix)]; break
-        files = [data, data.with_name(stem + '.events.jsonl')]
+        files = [Path(str(path))]
         moved = [f for f in files if f.exists() and _to_trash(f)]
         left = [f for f in files if f.exists()]
         self._discarded_paths.add(str(path))
@@ -3077,6 +3805,8 @@ class MainWindow(QMainWindow):
             self.controller.dispatch('run_files_removed', {'run_id': run.get('run_id')}, success=lambda result: self.controller.request_status(), failure=lambda payload: None)
         if left:
             self.show_toast(f'Unfinished scan: could not remove {", ".join(f.name for f in left)}', 'warning')
+        elif moved and run.get('status') == 'stopped':
+            self.show_toast('Scan stopped before the first round finished · its file was moved to the Recycle Bin', 'info')
         elif moved:
             self.show_toast(f'Scan {run.get("status")} before completion · its files were moved to the Recycle Bin (Save HDF5 on Analysis keeps the data)', 'info')
         self._update_output_status()
@@ -3087,6 +3817,9 @@ class MainWindow(QMainWindow):
             self.save_status.setText('Unfinished scan · files removed, data kept in memory')
         elif run.get('saved') and run.get('path'):
             self.save_status.setText(f'Saved: {run.get("path")}')
+        elif run.get('path') and run.get('status') in ('preparing', 'running', 'pausing', 'paused', 'stopping', 'finalizing'):
+            # An autosaved scan writes to its file from the first frame; it is "saved" once the file is closed.
+            self.save_status.setText(f'Recording to: {run.get("path")}')
         elif run:
             self.save_status.setText('Memory-only · not saved to disk')
         else:

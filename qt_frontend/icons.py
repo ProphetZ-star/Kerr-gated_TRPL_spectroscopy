@@ -56,6 +56,8 @@ def _shape(name):
         _poly(s, (12, 3.5), (21, 8.5), (12, 13.5), (3, 8.5), close=True); _poly(s, (3, 13.5), (12, 18.5), (21, 13.5))
     elif name == 'plus':
         _poly(s, (12, 5), (12, 19)); _poly(s, (5, 12), (19, 12))
+    elif name == 'info':
+        s.addEllipse(QPointF(12, 12), 9, 9); _poly(s, (12, 11), (12, 16.5)); s.addEllipse(QPointF(12, 7.6), .45, .45)
     elif name == 'check':
         _poly(s, (4.5, 12.5), (9.5, 17.5), (19.5, 6.5))
     elif name == 'arrow-right':

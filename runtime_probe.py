@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import importlib
 import importlib.metadata as metadata
-import importlib.util
 import struct
 import sys
 from pathlib import Path
@@ -45,28 +44,18 @@ def check_marker(requirements: str | None, marker: str | None) -> int:
         return fail('Requirements changed; setup must run again.', 4)
     return 0
 
-def check_scipy_without_import() -> int:
-    if importlib.util.find_spec('scipy') is None:
-        return fail('scipy is not installed.', 3)
-    try:
-        metadata.version('scipy')
-    except metadata.PackageNotFoundError:
-        return fail('scipy metadata is missing.', 3)
-    return 0
-
 def check_imports(full: bool) -> int:
+    # Every runtime dependency is imported; `full` is kept for older setup scripts.
     for module, distribution in MODULES:
         try:
             importlib.import_module(module)
         except Exception as error:
             return fail(f'Import failed: {module} ({distribution}): {error}', 3)
-    if full:
         try:
-            importlib.import_module('scipy')
-        except Exception as error:
-            return fail(f'Import failed: scipy: {error}', 3)
-        return 0
-    return check_scipy_without_import()
+            metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            return fail(f'Package metadata is missing: {distribution}', 3)
+    return 0
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Headless TRPL Qt dependency probe')

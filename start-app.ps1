@@ -14,8 +14,8 @@ try {
     if ($Probe) {
         $python = Join-Path $root '.venv/Scripts/python.exe'
         if (-not (Test-Path -LiteralPath $python)) { throw 'The local environment is not installed. Run setup first.' }
-        $probe = Join-Path $root 'runtime_probe.py'
-        & $python -u $probe --probe --requirements $requirements --marker $marker
+        $probeScript = Join-Path $root 'runtime_probe.py'  # not $probe: PowerShell names are case-insensitive and would collide with -Probe
+        & $python -u $probeScript --probe --requirements $requirements --marker $marker
         exit $LASTEXITCODE
     }
     $appPython = Initialize-KerrEnvironment -Root $root -Requirements 'requirements.txt'

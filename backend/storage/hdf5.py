@@ -1,246 +1,374 @@
-"""All HDF5 access for a live run occurs in one bounded writer thread."""
+"""Experiment files. The layout is defined in schema.py; all HDF5 access for a live run occurs in one
+bounded writer thread. Rows below frame/@committed_frames are valid; the counter advances only after the
+rows it covers are flushed to disk."""
 from concurrent.futures import Future
 from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread, Lock, Event
+import math
 import time
-import json
-import shutil
 import heapq
 import h5py
 import numpy as np
+from . import schema
+from .schema import (SCHEMA_VERSION, MAX_FRAMES, ROOT, INSTRUMENT, REQUEST, SEGMENT_COLUMNS, COORDINATES, PLAN_ARRAYS, ACQUISITION,
+                     CALIBRATION, BACKGROUND, COLUMNS, TEMPERATURE_CODES, FILE_STATUS, RUN_STATUS, FIT_ARRAYS, FIT_SETTINGS, FIT_SUMMARY,
+                     FIT_PROCESSING, FIT_EXCLUDED)
+from .frames import FrameTable, frame_row, validate_record
+
+TEXT = h5py.string_dtype('utf-8')
 
 
-def strict_json(value):
-    def numpy_value(item):
-        if isinstance(item,np.generic):return item.item()
-        if isinstance(item,np.ndarray):return item.tolist()
-        raise TypeError(f'Unsupported metadata type: {type(item).__name__}')
-    return json.dumps(value,ensure_ascii=False,allow_nan=False,default=numpy_value)
+def _number(value):
+    return math.nan if value is None else float(value)
 
 
-def parse_json(value):
-    def nonfinite(token):raise ValueError(f'Non-finite JSON value: {token}')
-    return json.loads(value,parse_constant=nonfinite)
+def _put(node, values, fields):
+    for name, kind in fields:
+        value = (values or {}).get(name)
+        if kind == 's':node.attrs.create(name, '' if value is None else str(value), dtype=TEXT)
+        elif kind == 'f':node.attrs[name] = np.float64(_number(value))
+        elif kind == 'ia':node.attrs[name] = np.asarray([] if value is None else value, dtype='i8')
+        elif value is None:node.attrs[name] = h5py.Empty('i1')
+        else:node.attrs[name] = np.bool_(value) if kind == 'b' else np.int64(value)
 
 
-def validate_record(record,pixels=1024):
-    from .export import finite_number
-    if not isinstance(record,dict) or not {'spectrum','record_id','round_index','point_index','frame_index','delay_ps','exposure_s'}<=record.keys():
-        raise ValueError('Experiment record is missing required fields')
-    spectrum=np.asarray(record['spectrum'])
-    if spectrum.shape!=(pixels,) or spectrum.dtype.kind not in 'iu' or np.any(spectrum<np.iinfo(np.int32).min) or np.any(spectrum>np.iinfo(np.int32).max):
-        raise ValueError(f'Raw spectrum must contain exactly {pixels} int32-compatible integer counts')
-    for key in ('record_id','round_index','point_index','frame_index'):
-        if isinstance(record[key],(bool,np.bool_)) or not isinstance(record[key],(int,np.integer)) or record[key]<0:
-            raise ValueError(f'{key} must be a nonnegative integer')
-    finite_number(record['delay_ps'],'delay_ps');finite_number(record['exposure_s'],'exposure_s',True)
+def _get(node, fields):
+    out = {}
+    for name, kind in fields:
+        value = node.attrs.get(name)
+        if value is None or isinstance(value, h5py.Empty):out[name] = None
+        elif kind == 's':out[name] = (value.decode() if isinstance(value, bytes) else str(value)) or None
+        elif kind == 'f':out[name] = None if not np.isfinite(value) else float(value)
+        elif kind == 'ia':out[name] = np.asarray(value).tolist()
+        elif kind == 'b':out[name] = bool(value)
+        else:out[name] = int(value)
+    return out
 
 
-def choose_path(path, run_id, estimate=0):
-    target = Path(path).expanduser() if path else Path(__file__).resolve().parents[2]/'data'/f'{run_id}.h5'
-    if target.suffix.lower() != '.h5':
-        raise ValueError('Output filename must end in .h5')
-    target = target.resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if any(p.exists() for p in [target,target.with_suffix('.partial.h5'),target.with_suffix('.stopped.h5'),target.with_suffix('.events.jsonl')]):
-        raise ValueError('Output file already exists; choose a new filename')
-    if shutil.disk_usage(target.parent).free < estimate + 20*1024**2:
-        raise ValueError('Insufficient free disk space')
-    return target
+def _group(parent, name):
+    return parent.create_group(name, track_order=True)
+
+
+def _array(node, name, values, columns=0):
+    data = np.asarray([] if values is None else values, dtype='f8').reshape((-1, columns) if columns else (-1,))
+    return node.create_dataset(name, data=data, dtype='f8')
+
+
+def _texts(values):
+    return np.asarray([str(v) for v in values or []], dtype=object)
+
+
+def write_analysis(parent, task_id, result):
+    """One lifetime fit as a group: fitted kinetics as arrays, every scalar as an attribute."""
+    group = _group(parent, task_id)
+    for name in FIT_ARRAYS:
+        group.create_dataset(name, data=np.asarray([_number(v) for v in result.get(name) or []], dtype='f8'))
+    group.attrs.create('model', str(result.get('model') or ''), dtype=TEXT)
+    names = list((result.get('parameters') or {}).keys())
+    group.attrs.create('parameter_names', _texts(names), dtype=TEXT)
+    spread = result.get('round_spread') or {}
+    for name in names:
+        group.attrs[name] = np.float64(_number(result['parameters'][name]))
+        group.attrs[name + '_stderr'] = np.float64(_number((result.get('standard_errors') or {}).get(name)))
+        group.attrs[name + '_round_se'] = np.float64(_number(spread.get(name)))
+    settings = dict(result.get('request') or {})
+    settings.setdefault('irf_fwhm_ps', result.get('irf_fwhm_ps'))
+    _put(group, settings, FIT_SETTINGS)
+    _put(group, result.get('processing') or settings, FIT_PROCESSING)
+    group.attrs['rounds_requested'] = np.asarray(settings.get('rounds') or [], dtype='i8')
+    group.attrs['rounds_used'] = np.asarray(result.get('rounds_used') or [], dtype='i8')
+    _put(group, {'excluded_' + k: v for k, v in (result.get('excluded') or {}).items()}, tuple(('excluded_' + n, k) for n, k in FIT_EXCLUDED))
+    _put(group, result, FIT_SUMMARY)
+    group.attrs.create('warnings', _texts(result.get('warnings')), dtype=TEXT)
+
+
+def read_analysis(group, run_id):
+    names = [str(n) for n in group.attrs.get('parameter_names', [])]
+    value = lambda key: None if not np.isfinite(group.attrs[key]) else float(group.attrs[key])
+    optional = lambda key: value(key) if key in group.attrs else None
+    result = dict(model=str(group.attrs.get('model', '')) or None,
+                  parameters={n: value(n) for n in names}, standard_errors={n: value(n + '_stderr') for n in names})
+    spread = {n: optional(n + '_round_se') for n in names}
+    result['round_spread'] = spread if any(v is not None for v in spread.values()) else None
+    request = _get(group, FIT_SETTINGS)
+    processing = _get(group, FIT_PROCESSING)
+    if processing['exclude_saturated'] is None:processing['exclude_saturated'] = False
+    for key in ('subtract_background', 'exclude_unstable'):processing[key] = bool(processing[key])
+    rounds = [int(r) for r in group.attrs.get('rounds_requested', [])]
+    result['irf_fwhm_ps'] = request['irf_fwhm_ps']
+    result['processing'] = processing
+    result['request'] = dict(model=result['model'], **request, **processing, rounds=rounds or None)
+    result['rounds_used'] = [int(r) for r in group.attrs.get('rounds_used', [])]
+    result['excluded'] = {n: v for (n, _), v in zip(FIT_EXCLUDED, _get(group, tuple(('excluded_' + n, k) for n, k in FIT_EXCLUDED)).values())}
+    for name in FIT_ARRAYS:
+        result[name] = [None if not np.isfinite(v) else float(v) for v in group[name][:]]
+    result.update(_get(group, FIT_SUMMARY))
+    result['warnings'] = [str(w) for w in group.attrs.get('warnings', [])]
+    result.update(run_id=run_id, task_id=group.name.rsplit('/', 1)[-1], stored=True)
+    return result
+
+
+def write_metadata(file, metadata):
+    # completed_rounds is updated in place at close, which an empty attribute does not allow.
+    _put(file, dict(metadata['root'], completed_rounds=metadata['root'].get('completed_rounds') or 0), ROOT)
+    instrument = _group(file, 'instrument')
+    for name, fields in INSTRUMENT.items():_put(_group(instrument, name), metadata['instrument'].get(name), fields)
+    request = _group(file, 'request')
+    segments = [[segment[key] for key in SEGMENT_COLUMNS] for segment in metadata['request'].get('segments') or []]
+    _array(request, 'segments', segments, columns=3).attrs.create('columns', 'start_ps, end_ps, step_ps', dtype=TEXT)
+    _put(request, metadata['request'], REQUEST)
+    _put(_group(file, 'coordinates'), metadata['coordinates'], COORDINATES)
+    acquisition = _group(file, 'acquisition')
+    for name in PLAN_ARRAYS:_array(acquisition, name, metadata['acquisition'][name])
+    _put(acquisition, metadata['acquisition'], ACQUISITION)
+    calibration = _group(file, 'calibration'); values = metadata['calibration']
+    _array(calibration, 'wavelengths_nm', values.get('wavelengths_nm'))
+    _array(calibration, 'coefficients', values.get('coefficients'))
+    _array(calibration, 'line_pairs', values.get('line_pairs'), columns=2).attrs.create('columns', 'pixel, wavelength_nm', dtype=TEXT)
+    if values.get('chip_wavelengths_nm') is not None:_array(calibration, 'chip_wavelengths_nm', values['chip_wavelengths_nm'])
+    _put(calibration, values, CALIBRATION)
+    background = _group(file, 'background'); values = metadata['background']
+    if values.get('present'):background.create_dataset('spectrum', data=np.asarray(values['spectrum'], dtype='f8'))
+    _put(background, values, BACKGROUND)
+
+
+def read_metadata(file):
+    request = _get(file['request'], REQUEST)
+    request['segments'] = [dict(zip(SEGMENT_COLUMNS, map(float, row))) for row in file['request/segments'][:]]
+    acquisition = _get(file['acquisition'], ACQUISITION)
+    for name in PLAN_ARRAYS:acquisition[name] = file['acquisition'][name][:].tolist()
+    calibration = _get(file['calibration'], CALIBRATION)
+    for name in schema.CALIBRATION_ARRAYS:
+        calibration[name] = (file['calibration'][name][:].tolist() if name in file['calibration'] else []) or None
+    background = _get(file['background'], BACKGROUND)
+    background['spectrum'] = file['background/spectrum'][:].tolist() if 'spectrum' in file['background'] else None
+    return dict(root=_get(file, ROOT), instrument={name: _get(file['instrument'][name], fields) for name, fields in INSTRUMENT.items()},
+                request=request, coordinates=_get(file['coordinates'], COORDINATES), acquisition=acquisition,
+                calibration=calibration, background=background)
+
+
+def rows_of_records(records):
+    """Column arrays for acquired frame dicts (the live scan path)."""
+    rows = [frame_row(record) for record in records]
+    block = {name: np.asarray([row[name] for row in rows], dtype=dtype) for name, dtype, _ in COLUMNS}
+    block['spectra'] = np.stack([np.asarray(record['spectrum']) for record in records])
+    return block
 
 
 class HDFWriter:
-    """Bounded asynchronous FIFO; futures acknowledge only flushed commit markers."""
-    capacity=128
-    batch_size=32
-    batch_latency=.010
+    """Bounded asynchronous FIFO; futures acknowledge only flushed commit markers.
 
-    def __init__(self,path,metadata):
-        strict_json(metadata)
-        self.path=Path(path);self.partial=self.path.with_suffix('.partial.h5')
-        self.tasks=Queue(maxsize=self.capacity);self.ready=Future();self.submit_lock=Lock()
-        self.closed=False;self.failure=None;self.finished=Event()
-        self.stats=dict(frames=0,batches=0,flushes=0,event_batches=0,max_queue=0,backpressure=0)
-        self.thread=Thread(target=self._loop,args=(metadata,),daemon=True,name='hdf-writer')
+    Operations: 'record' (one acquired frame dict), 'rows' (a FrameTable.block of frames already in memory,
+    used when a memory-only run is saved), 'truncate' (keep the first N frames), 'event' (a state change)
+    and 'close'."""
+    capacity = 128
+    batch_size = 32
+    batch_latency = .010
+
+    def __init__(self, path, metadata):
+        self.path = Path(path); self.partial = self.path.with_suffix('.partial.h5')
+        self.tasks = Queue(maxsize=self.capacity); self.ready = Future(); self.submit_lock = Lock()
+        self.closed = False; self.failure = None; self.finished = Event()
+        self.stats = dict(frames=0, batches=0, flushes=0, events=0, max_queue=0, backpressure=0)
+        self.thread = Thread(target=self._loop, args=(metadata,), daemon=True, name='hdf-writer')
         self.thread.start()
         try:self.ready.result(timeout=15)
-        except Exception:self.thread.join(2);raise
+        except Exception:self.thread.join(2); raise
 
-    def submit(self,operation,value=None):
-        future=Future()
+    def submit(self, operation, value=None):
+        future = Future()
         with self.submit_lock:
             if self.closed or self.finished.is_set() or not self.thread.is_alive():raise RuntimeError('Experiment writer is closed')
-            if operation=='record' and self.failure:
-                future.set_exception(RuntimeError(self.failure));return future
-            if self.tasks.full():self.stats['backpressure']+=1
-            self.tasks.put((operation,value,future),timeout=10)
-            if operation=='close':self.closed=True
+            if operation in ('record', 'rows') and self.failure:
+                future.set_exception(RuntimeError(self.failure)); return future
+            if self.tasks.full():self.stats['backpressure'] += 1
+            self.tasks.put((operation, value, future), timeout=10)
+            if operation == 'close':self.closed = True
             if self.finished.is_set() and not future.done():future.set_exception(RuntimeError(self.failure or 'Writer closed'))
-            self.stats['max_queue']=max(self.stats['max_queue'],self.tasks.qsize())
+            self.stats['max_queue'] = max(self.stats['max_queue'], self.tasks.qsize())
         return future
 
-    def call(self,operation,value=None):
-        return self.submit(operation,value).result(timeout=30)
+    def call(self, operation, value=None):
+        return self.submit(operation, value).result(timeout=30)
 
-    def _loop(self,metadata):
-        file=log=None;created=initialized=created_log=False;active=[]
-        # Spectrum width follows the run's CCD readout (cropped/binned); older metadata implies the full chip.
-        pixels=int(((metadata.get('config') or {}).get('applied') or {}).get('pixels') or 1024)
+    def _loop(self, metadata):
+        file = None; created = initialized = False; active = []
+        pixels = int(metadata['acquisition'].get('pixels') or 1024)
         def flush():
-            file.flush();self.stats['flushes']+=1
-        def fail(future,exc):
+            file.flush(); self.stats['flushes'] += 1
+        def fail(future, exc):
             if not future.done():future.set_exception(exc)
         try:
-            file=h5py.File(self.partial,'x');created=True;text=h5py.string_dtype('utf-8')
-            for key in ['meta','config','devices','coordinates','calibration','background','simulation']:
-                file.create_group(key).attrs['json']=strict_json(metadata.get(key,{}))
-            file.create_group('derived');analysis=file.create_group('analysis')
-            for task_id,result in metadata.get('analysis',{}).items():analysis.create_dataset(task_id,data=strict_json(result),dtype=text)
-            raw=file.create_group('raw')
-            spectra=raw.create_dataset('spectra',(0,pixels),maxshape=(None,pixels),dtype='i4',chunks=(32,pixels),compression='lzf',shuffle=True)
-            record_meta=raw.create_dataset('record_meta',(0,),maxshape=(None,),dtype=text)
-            indices=raw.create_dataset('record_index',(0,4),maxshape=(None,4),dtype='i8')
-            committed=raw.create_dataset('committed',(0,),maxshape=(None,),dtype='?')
-            events=file.create_dataset('events',(0,),maxshape=(None,),dtype=text)
-            log=self.path.with_suffix('.events.jsonl').open('x',encoding='utf-8');created_log=True
-            flush();initialized=True;self.ready.set_result(True)
-            done=False
+            file = h5py.File(self.partial, 'x', track_order=True); created = True
+            write_metadata(file, metadata)
+            frame = _group(file, 'frame')
+            spectra = frame.create_dataset('spectra', (0, pixels), maxshape=(None, pixels), dtype='i4', chunks=(32, pixels), compression='lzf', shuffle=True)
+            columns = {}
+            for name, dtype, width in COLUMNS:
+                shape = (0, width) if width else (0,)
+                columns[name] = frame.create_dataset(name, shape, maxshape=(None,) + shape[1:], dtype=dtype, chunks=(256,) + shape[1:], compression='lzf')
+            columns['index'].attrs.create('columns', 'round, point, frame', dtype=TEXT)
+            columns['temperature_state'].attrs.create('codes', TEMPERATURE_CODES, dtype=TEXT)
+            frame.attrs['committed_frames'] = np.int64(0)
+            events = _group(file, 'events')
+            log = dict(t_s=events.create_dataset('t_s', (0,), maxshape=(None,), dtype='f8', chunks=(64,)),
+                       status=events.create_dataset('status', (0,), maxshape=(None,), dtype=TEXT, chunks=(64,)),
+                       message=events.create_dataset('message', (0,), maxshape=(None,), dtype=TEXT, chunks=(64,)))
+            analysis = _group(file, 'analysis')
+            for task_id, result in (metadata.get('analysis') or {}).items():write_analysis(analysis, task_id, result)
+            flush(); initialized = True; self.ready.set_result(True)
+
+            def append(block):
+                # The data is on disk before the counter that declares it valid; a failed append is never counted.
+                offset = len(spectra); size = len(block['spectra'])
+                if size == 0:return
+                if offset + size > MAX_FRAMES:raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames')
+                spectra.resize(offset + size, axis=0); spectra[offset:] = block['spectra']
+                for name, dataset in columns.items():
+                    dataset.resize(offset + size, axis=0); dataset[offset:] = np.asarray(block[name], dtype=dataset.dtype)
+                flush(); frame.attrs.modify('committed_frames', np.int64(offset + size)); flush()
+                self.stats['batches'] += 1; self.stats['frames'] += size
+
+            done = False
             while not done:
-                active=[self.tasks.get()];deadline=time.monotonic()+self.batch_latency
-                while len(active)<self.batch_size and active[-1][0]!='close':
-                    try:active.append(self.tasks.get(timeout=max(.00001,deadline-time.monotonic())))
+                active = [self.tasks.get()]; deadline = time.monotonic() + self.batch_latency
+                while len(active) < self.batch_size and active[-1][0] != 'close':
+                    try:active.append(self.tasks.get(timeout=max(.00001, deadline - time.monotonic())))
                     except Empty:break
-                    if time.monotonic()>=deadline:break
-                cursor=0
-                while cursor<len(active):
-                    operation,value,future=active[cursor]
-                    if operation=='record':
-                        batch=[];encoded=[];invalid=None;end=cursor
-                        while end<len(active) and active[end][0]=='record':
-                            _,record,ack=active[end];end+=1
-                            if self.failure:fail(ack,RuntimeError(self.failure));continue
+                    if time.monotonic() >= deadline:break
+                cursor = 0
+                while cursor < len(active):
+                    operation, value, future = active[cursor]
+                    if operation == 'record':
+                        batch = []; invalid = None; end = cursor; offset = len(spectra)
+                        while end < len(active) and active[end][0] == 'record':
+                            _, record, ack = active[end]; end += 1
+                            if self.failure:fail(ack, RuntimeError(self.failure)); continue
                             try:
-                                validate_record(record,pixels)
+                                validate_record(record, offset + len(batch), pixels)
                                 if record.get('inject_write_failure'):raise OSError('Injected disk write failure')
-                                encoded.append(strict_json({k:v for k,v in record.items() if k not in {'spectrum','inject_write_failure'}}))
-                                batch.append((record,ack))
+                                batch.append((record, ack))
                             except Exception as exc:
-                                self.failure=str(exc);invalid=(ack,exc)
+                                self.failure = str(exc); invalid = (ack, exc)
                         if batch:
-                            offset=len(spectra);size=len(batch)
                             try:
-                                for dataset in (spectra,record_meta,indices,committed):dataset.resize(offset+size,axis=0)
-                                committed[offset:offset+size]=False
-                                spectra[offset:offset+size]=np.stack([r['spectrum'] for r,_ in batch])
-                                record_meta[offset:offset+size]=encoded
-                                indices[offset:offset+size]=[[r[k] for k in ['record_id','round_index','point_index','frame_index']] for r,_ in batch]
-                                flush();committed[offset:offset+size]=True;flush()
-                                self.stats['batches']+=1;self.stats['frames']+=size
-                                for _,ack in batch:ack.set_result(True)
+                                append(rows_of_records([record for record, _ in batch]))
+                                for _, ack in batch:ack.set_result(True)
                             except Exception as exc:
-                                self.failure=str(exc)
-                                # No failed batch is advertised as committed. Earlier batches remain intact.
-                                try:committed[offset:offset+size]=False;flush()
-                                except Exception:pass
-                                for _,ack in batch:fail(ack,exc)
+                                self.failure = str(exc)
+                                for _, ack in batch:fail(ack, exc)
                         if invalid:fail(*invalid)
-                        cursor=end;continue
+                        cursor = end; continue
                     try:
-                        if operation=='event':
-                            block=[];acks=[]
-                            while cursor<len(active) and active[cursor][0]=='event':
-                                _,event,ack=active[cursor];block.append(strict_json(event));acks.append(ack);cursor+=1
-                            offset=len(events);events.resize(offset+len(block),axis=0);events[offset:]=block
-                            log.write('\n'.join(block)+'\n');log.flush();flush();self.stats['event_batches']+=1
-                            for ack in acks:ack.set_result(True)
-                            continue
-                        if operation=='close':
-                            if value not in {'completed','stopped','error'}:raise ValueError('Invalid terminal status')
-                            terminal='error' if self.failure else value
-                            file['meta'].attrs['terminal_status']=terminal;flush();file.close();file=None;log.close();log=None
-                            final=self.partial if terminal=='error' else self.path if terminal=='completed' else self.path.with_suffix('.stopped.h5')
-                            if final!=self.partial:
+                        if operation == 'rows':
+                            if self.failure:raise RuntimeError(self.failure)
+                            if value['offset'] != len(spectra):raise ValueError(f'Frame block starts at {value["offset"]}, expected {len(spectra)}')
+                            if value['spectra'].shape[1:] != (pixels,):raise ValueError(f'Frame block must have {pixels} pixels per spectrum')
+                            append(value); future.set_result(True)
+                        elif operation == 'event':
+                            offset = len(log['t_s'])
+                            for dataset in log.values():dataset.resize(offset + 1, axis=0)
+                            log['t_s'][offset] = _number(value.get('t_s'))
+                            log['status'][offset] = FILE_STATUS.get(value['status'], value['status'])
+                            log['message'][offset] = str(value.get('message') or '')
+                            flush(); self.stats['events'] += 1; future.set_result(True)
+                        elif operation == 'truncate':
+                            # A stopped scan drops its unfinished round. The counter goes down first, so the rows
+                            # above it are invalid before they are removed.
+                            if self.failure:raise RuntimeError(self.failure)
+                            count = int(value)
+                            if not 0 <= count <= len(spectra):raise ValueError(f'Cannot keep {count} of {len(spectra)} frames')
+                            frame.attrs.modify('committed_frames', np.int64(count)); flush()
+                            spectra.resize(count, axis=0)
+                            for dataset in columns.values():dataset.resize(count, axis=0)
+                            flush(); self.stats['frames'] = count; future.set_result(True)
+                        elif operation == 'close':
+                            status = value['status']
+                            if status not in FILE_STATUS:raise ValueError('Invalid terminal status')
+                            terminal = 'error' if self.failure else status
+                            # modify() keeps each attribute in its place; create() would move it to the end.
+                            file.attrs.modify('ended_utc', str(value.get('ended_utc') or ''))
+                            file.attrs.modify('terminal_status', FILE_STATUS[terminal])
+                            file.attrs.modify('completed_rounds', np.int64(value.get('completed_rounds') or 0))
+                            stored = len(spectra)
+                            flush(); file.close(); file = None
+                            # A stopped scan that kept whole rounds is a usable experiment under its own name;
+                            # one with no whole round is NAME.stopped.h5.
+                            kept = terminal == 'completed' or (terminal == 'stopped' and stored > 0)
+                            final = self.partial if terminal == 'error' else self.path if kept else self.path.with_suffix('.stopped.h5')
+                            if final != self.partial:
                                 if final.exists():raise FileExistsError(final)
                                 self.partial.rename(final)
-                            future.set_result(str(final));done=True
-                        else:raise ValueError('Unknown writer operation: '+operation)
+                            future.set_result(str(final)); done = True
+                        else:raise ValueError('Unknown writer operation: ' + operation)
                     except Exception as exc:
-                        self.failure=str(exc);fail(future,exc)
-                        if operation=='event':
-                            for _,_,ack in active[cursor:]:fail(ack,exc)
+                        self.failure = str(exc); fail(future, exc)
+                        if operation == 'event':
+                            for _, _, ack in active[cursor + 1:]:fail(ack, exc)
                             raise
-                        if operation=='close':done=True
-                    cursor+=1
-                active=[]
+                        if operation == 'close':done = True
+                    cursor += 1
+                active = []
         except Exception as exc:
-            self.failure=str(exc)
+            self.failure = str(exc)
             if not self.ready.done():self.ready.set_exception(exc)
-            for _,_,future in active:fail(future,exc)
+            for _, _, future in active:fail(future, exc)
         finally:
             self.finished.set()
-            for resource in (file,log):
-                if resource is not None:
-                    try:resource.close()
-                    except Exception as exc:self.failure=self.failure or str(exc)
+            if file is not None:
+                try:file.close()
+                except Exception as exc:self.failure = self.failure or str(exc)
             while True:
-                try:_,_,future=self.tasks.get_nowait();fail(future,RuntimeError(self.failure or 'Writer closed'))
+                try:_, _, future = self.tasks.get_nowait(); fail(future, RuntimeError(self.failure or 'Writer closed'))
                 except Empty:break
-            if created and not initialized:
-                self.partial.unlink(missing_ok=True)
-                if created_log:self.path.with_suffix('.events.jsonl').unlink(missing_ok=True)
+            if created and not initialized:self.partial.unlink(missing_ok=True)
 
 
 def _read_run(path):
     with h5py.File(path, 'r') as f:
-        if 'raw/spectra' not in f or 'raw/committed' not in f:
-            raise ValueError('Unsupported experiment file')
-        if f['raw/spectra'].ndim!=2 or not 1<=f['raw/spectra'].shape[1]<=1024:
-            raise ValueError('Raw spectra must be a 2-D array of at most 1024 pixels')
-        pixels=int(f['raw/spectra'].shape[1])
-        if f['raw/spectra'].dtype.kind not in 'iu':raise ValueError('Raw spectra must have an integer dtype')
-        if f['raw/committed'].ndim!=1 or f['raw/record_meta'].ndim!=1:raise ValueError('Invalid raw record dimensions')
-        valid = np.flatnonzero(f['raw/committed'][:])
-        if len(valid)>25000:
-            raise ValueError('File exceeds this release\'s 25,000-record limit')
-        if len(valid) and valid[-1]>=min(len(f['raw/spectra']),len(f['raw/record_meta'])):raise ValueError('Committed record exceeds available spectra/metadata')
-        records=[]
-        for start in range(0,len(valid),128):
-            rows=valid[start:start+128]
-            selection=slice(int(rows[0]),int(rows[-1])+1) if rows[-1]-rows[0]+1==len(rows) else rows
-            spectra_batch=f['raw/spectra'][selection];metadata_batch=f['raw/record_meta'][selection]
-            for counts,encoded in zip(spectra_batch,metadata_batch):
-                meta=parse_json(encoded);meta['spectrum']=counts
-                validate_record(meta,pixels);records.append(meta)
-        metadata={k:parse_json(f[k].attrs['json']) for k in ['meta','config','devices','coordinates','calibration','background','simulation']}
-        if any(not isinstance(metadata[k],dict) for k in ['meta','config','devices','coordinates','calibration','simulation']):raise ValueError('Invalid experiment metadata shape')
-        from ..models import RunRequest
-        RunRequest(**metadata['config']['request'])
-        if not isinstance(metadata['meta']['run_id'],str) or not metadata['meta']['run_id'] or not metadata['meta']['created_utc']:raise ValueError('Invalid experiment identity')
-        if not isinstance(metadata['config']['plan'],dict):raise ValueError('Missing experiment scan plan')
-        if not {'rounds','total_points','total_frames','delays_ps'}<=metadata['config']['plan'].keys():raise ValueError('Incomplete experiment scan plan')
-        recent=[]
-        for name,value in f.get('analysis',{}).items():
-            result=parse_json(value[()])
-            if not isinstance(result,dict):raise ValueError('Invalid analysis result')
-            heapq.heappush(recent,(str(result.get('finished_utc','')),name,result))
-            if len(recent)>64:heapq.heappop(recent)
-        metadata['analysis']={name:result for _,name,result in sorted(recent)}
-        terminal=str(f['meta'].attrs.get('terminal_status','partial'))
-        if terminal not in {'completed','stopped','error','partial'}:raise ValueError('Invalid experiment terminal status')
-        return metadata,records,terminal
+        version = f.attrs.get('schema_version')
+        if version is None or isinstance(version, h5py.Empty) or int(version) != SCHEMA_VERSION:
+            raise ValueError(f'Unsupported experiment file (schema version {version}); this release reads version {SCHEMA_VERSION} only')
+        stored = f['frame/spectra']
+        count = int(f['frame'].attrs['committed_frames'])
+        if count > MAX_FRAMES:raise ValueError(f'File exceeds the {MAX_FRAMES:,}-frame limit')
+        if not 0 <= count <= min([len(stored)] + [len(f['frame'][name]) for name, _, _ in COLUMNS]):
+            raise ValueError('Committed frame count exceeds the stored rows')
+        metadata = read_metadata(f)
+        run_id = metadata['root']['run_id']
+        if not run_id or not metadata['root']['created_utc']:raise ValueError('Invalid experiment identity')
+        if not metadata['acquisition']['delays_ps']:raise ValueError('Missing experiment scan plan')
+        exposure = metadata['acquisition']['exposure_s']
+        if exposure is None or not exposure > 0:raise ValueError('Invalid exposure time')
+        # Whole columns at once: the rows below committed_frames are the experiment.
+        frames = FrameTable.from_arrays(stored[:count], {name: f['frame'][name][:count] for name, _, _ in COLUMNS},
+                                        exposure, metadata['root']['source_mode'])
+        events = f['events']; optional = lambda value: None if not np.isfinite(value) else float(value)
+        metadata['events'] = [dict(t_s=optional(t), status=RUN_STATUS.get(str(s), str(s)), message=str(m))
+                              for t, s, m in zip(events['t_s'][:], events['status'].asstr()[:], events['message'].asstr()[:])]
+        recent = []
+        for name, group in f['analysis'].items():
+            result = read_analysis(group, run_id)
+            heapq.heappush(recent, (str(result.get('finished_utc') or ''), name, result))
+            if len(recent) > 64:heapq.heappop(recent)
+        metadata['analysis'] = {name: result for _, name, result in sorted(recent)}
+        terminal = RUN_STATUS.get(metadata['root']['terminal_status'] or '')
+        if terminal is None:raise ValueError('Invalid experiment terminal status')
+        return metadata, frames, terminal
 
 
 def read_run(path):
+    """(metadata, FrameTable, terminal status) of an experiment file."""
     if not Path(path).is_file():raise FileNotFoundError('Experiment file does not exist')
     try:return _read_run(path)
-    except (OSError,KeyError,IndexError,TypeError,OverflowError,ValueError) as exc:
+    except (OSError, KeyError, IndexError, TypeError, OverflowError, ValueError) as exc:
         raise ValueError(f'Invalid or damaged experiment file: {exc}') from exc
 
 
-def append_analysis(path,task_id,result):
+def append_analysis(path, task_id, result):
     """Only used after live acquisition has finalized and closed its writer."""
-    with h5py.File(path,'r+') as file:
+    with h5py.File(path, 'r+') as file:
         if task_id in file['analysis']:raise ValueError('Analysis task already exists in this experiment')
-        file['analysis'].create_dataset(task_id,data=json.dumps(result,allow_nan=False),dtype=h5py.string_dtype('utf-8'))
+        write_analysis(file['analysis'], task_id, result)
         file.flush()

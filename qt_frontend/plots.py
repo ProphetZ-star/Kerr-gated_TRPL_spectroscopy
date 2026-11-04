@@ -6,7 +6,7 @@ import pyqtgraph as pg
 import pyqtgraph.functions as fn
 from PySide6.QtCore import Qt, Signal, QEvent, QPointF, QRectF, QRect
 from PySide6.QtGui import QColor,QFont,QFontMetricsF,QPen,QPainterPath
-from PySide6.QtWidgets import QFrame, QLineEdit, QHBoxLayout, QGraphicsRectItem, QGraphicsPathItem, QGraphicsSimpleTextItem, QWidget, QPushButton, QLabel
+from PySide6.QtWidgets import QFrame, QLineEdit, QHBoxLayout, QGraphicsRectItem, QGraphicsPathItem, QGraphicsSimpleTextItem, QGraphicsItem, QWidget, QPushButton, QLabel
 from .theme import palette, map_color, map_qcolors, SATURATED_COLOR
 
 def saturated_rgb():
@@ -405,6 +405,7 @@ class EditablePlot(pg.PlotWidget):
         self._x_peers = []
         self._editor_busy = False
         self.readout_units = {}
+        self._hidden_series = set()
         bottom = InlineAxis('bottom')
         left = InlineAxis('left')
         view_box = ZoomViewBox()
@@ -537,6 +538,26 @@ class EditablePlot(pg.PlotWidget):
                 label=getattr(line,'label',None)
                 if label is not None:
                     label.setColor(colors['text']);label.fill=pg.mkBrush(tag)
+    # Legend toggles: every drawn item carries the keys of the legend entries it belongs to and is hidden while
+    # any of them is switched off. Redraws re-create items, so the hidden set lives on the plot.
+    def tag_series(self, item, *keys):
+        item._series_keys = keys
+        item.setVisible(not (set(keys) & self._hidden_series))
+        return item
+    def series_hidden(self, key):
+        return key in self._hidden_series
+    def _series_items(self):
+        return list(self.plotItem.items)
+    def _series_changed(self):
+        pass
+    def set_series_visible(self, key, visible):
+        if visible:self._hidden_series.discard(key)
+        else:self._hidden_series.add(key)
+        for item in self._series_items():
+            keys = getattr(item, '_series_keys', None)
+            if keys and key in keys:
+                item.setVisible(not (set(keys) & self._hidden_series))
+        self._series_changed()
     AXIS_LABEL_STYLE = {'font-family': 'Segoe UI', 'font-size': '12px'}
     def set_x_label(self, text):
         self.bottom_axis.setLabel(text, color=palette()['muted'], **self.AXIS_LABEL_STYLE)
@@ -870,13 +891,24 @@ class EditablePlot(pg.PlotWidget):
     def leaveEvent(self,event):
         self._readout.hide()
         super().leaveEvent(event)
+    def overlay_axis(self, axis):
+        '''An extra scale drawn inside the plot (InsideAxisLabels) whose limits the axis editor sets, or None.'''
+        return None
+    def overlay_limits(self, axis):
+        return (0.0, 1.0)
+    def set_overlay_limits(self, axis, low, high):
+        pass
     def begin_axis_edit(self, axis, endpoint):
         '''Turn the clicked axis limit into a text field in place, styled like the label it replaces.'''
-        axis_item = self.bottom_axis if axis == 'x' else self.left_axis
+        overlay = self.overlay_axis(axis)
+        axis_item = overlay or (self.bottom_axis if axis == 'x' else self.left_axis)
         rect = axis_item.endpoint_rects().get(endpoint)
         if rect is None:
             return
-        low, high = sorted(self.viewRange()[0 if axis == 'x' else 1])
+        if overlay is not None:
+            low, high = self.overlay_limits(axis)
+        else:
+            low, high = sorted(self.viewRange()[0 if axis == 'x' else 1])
         value = low if endpoint == 'min' else high
         self._edit_axis = axis
         self._edit_endpoint = endpoint
@@ -931,11 +963,20 @@ class EditablePlot(pg.PlotWidget):
             value = float(self._editor.text().strip())
         except Exception:
             value = math.nan
-        low, high = sorted(self.viewRange()[0 if self._edit_axis == 'x' else 1])
+        overlay = self.overlay_axis(self._edit_axis) is not None
+        if overlay:
+            low, high = self.overlay_limits(self._edit_axis)
+        else:
+            low, high = sorted(self.viewRange()[0 if self._edit_axis == 'x' else 1])
         if self._edit_endpoint == 'min':
             low = value
         else:
             high = value
+        if overlay and math.isfinite(value) and high > low:
+            try:self.set_overlay_limits(self._edit_axis, low, high)
+            except ValueError as error:
+                set_invalid(self._editor, True); self._editor.setToolTip(str(error)); return False
+            self._editor.setToolTip(''); self._close_editor(); return True
         if not math.isfinite(value) or high <= low:
             set_invalid(self._editor, True)
             self._editor.setToolTip('Enter a number; the minimum must stay below the maximum')
@@ -945,12 +986,207 @@ class EditablePlot(pg.PlotWidget):
         self.apply_user_range(x=(low, high) if self._edit_axis == 'x' else None, y=(low, high) if self._edit_axis == 'y' else None)
         return True
 
-class SpectrumPlot(EditablePlot):
+class PinnedLines:
+    '''Pinned wavelengths as dashed vertical lines, shared by the TRPL map and the Live spectrum. Right-click
+    the plot to add one (pinAddRequested), right-click a line to remove it (pinRemoveRequested), drag a line to
+    move it (pinMoved(key, wavelength, finished)). The window owns the list and redraws every plot from it.'''
+    PIN_HIT_PX = 6
+    def _init_pins(self):
+        self._pin_lines = {}; self._pin_guard = False
+        self.scene().sigMouseClicked.connect(self._pin_clicked)
+    def set_pins(self, pins):
+        '''[(legend key, wavelength, palette colour key, label)]; existing lines are moved, not recreated, so a
+        drag in progress is never interrupted.'''
+        colors = palette(); keys = {pin[0] for pin in pins or []}
+        for key in [key for key in self._pin_lines if key not in keys]:
+            self.plotItem.removeItem(self._pin_lines.pop(key))
+        self._pin_guard = True
+        try:
+            for key, wave, color, label in pins or []:
+                line = self._pin_lines.get(key)
+                if line is None:
+                    line = pg.InfiniteLine(pos=float(wave), angle=90, movable=True)
+                    line.setZValue(20); self.plotItem.addItem(line, ignoreBounds=True); self.tag_series(line, key)
+                    line.sigPositionChanged.connect(lambda item, key=key: None if self._pin_guard else self.pinMoved.emit(key, float(item.value()), False))
+                    line.sigPositionChangeFinished.connect(lambda item, key=key: self.pinMoved.emit(key, float(item.value()), True))
+                    self._pin_lines[key] = line
+                elif not line.moving and abs(float(line.value()) - float(wave)) > 1e-9:
+                    line.setPos(float(wave))
+                line.setPen(pg.mkPen(colors[color], width=1.2, style=Qt.DashLine)); line.setHoverPen(pg.mkPen(colors[color], width=2.4))
+                line.setToolTip(f'{label} · drag to move · right-click to remove')
+        finally:
+            self._pin_guard = False
+    def _pin_clicked(self, event):
+        if event.button() != Qt.RightButton or event.double():
+            return
+        view = self.plotItem.vb; position = event.scenePos()
+        if not view.sceneBoundingRect().contains(position):
+            return
+        for key, line in self._pin_lines.items():
+            if line.isVisible() and abs(view.mapViewToScene(QPointF(float(line.value()), 0)).x() - position.x()) <= self.PIN_HIT_PX:
+                self.pinRemoveRequested.emit(key); event.accept(); return
+        self.pinAddRequested.emit(float(view.mapSceneToView(position).x())); event.accept()
+
+class OverlayViewBox(pg.ViewBox):
+    '''A second y scale laid over a plot's view box (same x). It takes no mouse input: zoom, pan, cursors and
+    picking all reach the plot underneath.'''
+    def __init__(self):
+        super().__init__(enableMenu=False)
+        self.setMouseEnabled(False, False); self.setAcceptedMouseButtons(Qt.NoButton); self.setAcceptHoverEvents(False)
+        # Its y range is set explicitly and its x follows the plot; auto-range would move both.
+        self.disableAutoRange()
+    def wheelEvent(self, ev, axis=None):
+        ev.ignore()
+    def mouseDragEvent(self, ev, axis=None):
+        ev.ignore()
+    def mouseClickEvent(self, ev):
+        ev.ignore()
+
+class InsideAxisLabels(pg.GraphicsObject):
+    '''An overlay scale drawn just inside the plot's right edge in the colour of its data, so it needs no gutter
+    of its own; the legend says which data it belongs to. Its two limits, at the top and bottom, are editable
+    like the main axes' (click, type, Enter). Only those labels take the mouse (see shape()); clicks anywhere
+    else reach the plot underneath.'''
+    def __init__(self, view, color_key, owner=None, axis='noise'):
+        super().__init__(view)
+        self.view = view; self.color_key = color_key; self.owner = owner; self.axis = axis
+        self.log = False; self.suffix = ''; self._hovered = None
+        self.setAcceptedMouseButtons(Qt.LeftButton); self.setAcceptHoverEvents(True); self.setZValue(1e6)
+        view.sigRangeChanged.connect(lambda *args: (self.prepareGeometryChange(), self.update()))
+        view.sigResized.connect(self._resized)
+    def _resized(self, *args):
+        self.prepareGeometryChange(); self.update()
+    def boundingRect(self):
+        return QRectF(self.view.rect())
+    def _font(self):
+        font = QFont('Segoe UI'); font.setPixelSize(11); return font
+    def value_text(self, value):
+        '''A limit as shown and typed: percent in log mode too (the view holds log10 of it).'''
+        value = 10 ** value if self.log else value
+        return f'{value:.4g}{self.suffix}'
+    def _top(self, rect):
+        # Below the plot's Back / Full view chips while they are shown.
+        bar = getattr(self.owner, '_zoom_bar', None)
+        return rect.top() + (bar.height() + 8 if bar is not None and bar.isVisible() else 2)
+    def endpoint_rects(self):
+        rect = QRectF(self.view.rect()); low, high = self.view.viewRange()[1]; metrics = QFontMetricsF(self._font())
+        out = {}
+        for name, value in (('max', high), ('min', low)):
+            text = self.value_text(value); width = metrics.horizontalAdvance(text)
+            top = self._top(rect) if name == 'max' else rect.bottom() - metrics.height() - 2
+            out[name] = QRectF(rect.right() - 8 - width, top, width, metrics.height())
+        return out
+    def overflow(self):
+        '''{'max': text, 'min': text} for the data past either end of the scale (in the visible x range).'''
+        extent = self.owner.overlay_extent(self.axis) if self.owner is not None else None
+        if not extent:
+            return {}
+        low, high = self.view.viewRange()[1]; low_data, high_data = extent; out = {}
+        if self.log:
+            low_data, high_data = (math.log10(v) if v > 0 else -math.inf for v in (low_data, high_data))
+        if high_data > high + 1e-9 * max(1.0, abs(high)):out['max'] = '▲ ' + self.value_text(high_data)
+        if math.isfinite(low_data) and low_data < low - 1e-9 * max(1.0, abs(low)):out['min'] = '▼ ' + self.value_text(low_data)
+        return out
+    def hint_rects(self):
+        metrics = QFontMetricsF(self._font()); ends = self.endpoint_rects(); out = {}
+        for name, text in self.overflow().items():
+            width = metrics.horizontalAdvance(text); box = ends[name]
+            out['fit_' + name] = QRectF(box.left() - 10 - width, box.top(), width, box.height())
+        return out
+    def _targets(self):
+        return {**self.endpoint_rects(), **self.hint_rects()}
+    def shape(self):
+        path = QPainterPath()
+        for box in self._targets().values():path.addRect(box.adjusted(-6, -3, 6, 3))
+        return path
+    def endpoint_at(self, pos):
+        for name, box in self._targets().items():
+            if box.adjusted(-6, -3, 6, 3).contains(pos):return name
+        return None
+    def hoverEvent(self, ev):
+        hovered = None if ev.isExit() else self.endpoint_at(ev.pos())
+        if hovered:ev.acceptClicks(Qt.LeftButton)
+        if hovered != self._hovered:
+            self._hovered = hovered
+            if hovered and hovered.startswith('fit_'):
+                end = 'above' if hovered == 'fit_max' else 'below'
+                self.setCursor(Qt.PointingHandCursor); self.setToolTip(f'The noise goes {end} the scale here · click to widen this end to include it')
+            elif hovered:self.setCursor(Qt.PointingHandCursor); self.setToolTip('Click to type this limit')
+            else:self.unsetCursor(); self.setToolTip('')
+            self.update()
+    def mouseClickEvent(self, ev):
+        target = self.endpoint_at(ev.pos()) if ev.button() == Qt.LeftButton and not ev.double() else None
+        if target and self.owner is not None:
+            if target.startswith('fit_'):self.owner.widen_overlay(self.axis, target[4:])
+            else:self.owner.begin_axis_edit(self.axis, target)
+            ev.accept()
+        else:
+            ev.ignore()
+    def ticks(self):
+        low, high = self.view.viewRange()[1]
+        if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+            return []
+        if self.log:
+            return [(float(v), format_count(10 ** v, 2) + self.suffix) for v in range(math.ceil(low), math.floor(high) + 1)]
+        step = nice_step(high - low, 4)
+        first = math.ceil(low / step - 1e-9); last = math.floor(high / step + 1e-9)
+        return [(index * step, format_tick(index * step, step) + self.suffix) for index in range(first, last + 1)][:20]
+    def paint(self, painter, option, widget=None):
+        rect = QRectF(self.view.rect()); low, high = self.view.viewRange()[1]
+        if rect.height() < 40 or not high > low:
+            return
+        colors = palette(); color = QColor(colors[self.color_key])
+        font = self._font(); painter.setFont(font); metrics = QFontMetricsF(font)
+        halo = QColor(colors['plot']); halo.setAlpha(215)
+        tick = QPen(color, 1); tick.setCosmetic(True)
+        ends = self.endpoint_rects()
+        for value, text in self.ticks():
+            y = rect.bottom() - (value - low) / (high - low) * rect.height()
+            # Interior ticks only: the limits are drawn as editable labels and nothing may crowd them.
+            if y < ends['max'].bottom() + 6 or y > ends['min'].top() - 6:
+                continue
+            painter.setPen(tick); painter.drawLine(QPointF(rect.right() - 5, y), QPointF(rect.right(), y))
+            width = metrics.horizontalAdvance(text)
+            painter.fillRect(QRectF(rect.right() - 8 - width - 2, y - metrics.height() / 2, width + 4, metrics.height()), halo)
+            painter.setPen(color); painter.drawText(QPointF(rect.right() - 8 - width, y + metrics.ascent() / 2 - 1), text)
+        for name, box in ends.items():
+            text = self.value_text(high if name == 'max' else low); baseline = box.top() + metrics.ascent()
+            painter.fillRect(box.adjusted(-2, 0, 2, 0), halo)
+            if self._hovered == name:
+                # Same editable affordance as the main axes: blue with a dotted underline.
+                blue = QColor(colors['blue']); painter.setPen(blue); painter.drawText(QPointF(box.left(), baseline), text)
+                underline = QPen(blue, 1, Qt.DotLine); underline.setCosmetic(True); painter.setPen(underline)
+                painter.drawLine(QPointF(box.left(), baseline + 2), QPointF(box.right(), baseline + 2))
+            else:
+                painter.setPen(color); painter.drawText(QPointF(box.left(), baseline), text)
+        # Data past an end: a small warning-coloured tag beside that limit (click widens the scale to it).
+        warning = QColor(colors['warning']); texts = self.overflow()
+        for name, box in self.hint_rects().items():
+            painter.fillRect(box.adjusted(-2, 0, 2, 0), halo)
+            painter.setPen(QColor(colors['blue']) if self._hovered == name else warning)
+            painter.drawText(QPointF(box.left(), box.top() + metrics.ascent()), texts[name[4:]])
+
+class SpectrumPlot(PinnedLines, EditablePlot):
     wavePicked=Signal(float)
+    pinAddRequested = Signal(float)
+    pinRemoveRequested = Signal(str)
+    pinMoved = Signal(str, float, bool)
     def __init__(self, parent=None, grid=True):
         super().__init__(parent=parent, grid=grid)
+        self._init_pins()
         self._items = []
         self._marker_guard=False
+        # Noise on its own scale (right side, labelled inside the plot), sharing the wavelength axis.
+        self.noise_view = OverlayViewBox(); self.noise_view.setParentItem(self.plotItem.vb)
+        self.noise_view.setXLink(self.plotItem.vb)
+        self.plotItem.vb.sigResized.connect(self._place_noise_view); self._place_noise_view()
+        self.noise_axis = InsideAxisLabels(self.noise_view, 'noise', owner=self); self.noise_axis.suffix = '%'; self.noise_axis.hide()
+        self._noise_item = None; self._noise_curve = None; self._noise_limit = None; self._noise_ratio = None
+        self._limit_item = None
+        # A fixed scale, never fitted to the data, so the noise can be read against the same range frame after
+        # frame. Set by typing its limits; one range per Y mode, in percent.
+        self.noise_range = {'linear': (0.0, 10.0), 'log': (0.1, 100.0)}; self._noise_log = None
+        self._apply_noise_range(False)
         self.band=pg.LinearRegionItem(values=(595,605),movable=False,brush=pg.mkBrush(90,130,180,25),pen=pg.mkPen(None))
         self.band.setZValue(-1);self.plotItem.addItem(self.band)
         self.wave_line=pg.InfiniteLine(pos=600,angle=90,movable=True,pen=pg.mkPen(palette()['cursor'],style=Qt.DashLine),label='{value:.2f} nm',labelOpts={'position':.95})
@@ -970,14 +1206,107 @@ class SpectrumPlot(EditablePlot):
             except Exception:
                 pass
         self._items = []
+    def overlay_axis(self, axis):
+        return self.noise_axis if axis == 'noise' else None
+    def overlay_limits(self, axis):
+        return self.noise_range['log' if self._noise_log else 'linear']
+    def overlay_extent(self, axis):
+        '''(min, max) of the noise drawn within the visible wavelength range, or None.'''
+        if axis != 'noise' or self._noise_curve is None or self.series_hidden('noise'):
+            return None
+        xs, ys = self._noise_curve; x0, x1 = self.plotItem.vb.viewRange()[0]
+        shown = ys[(xs >= min(x0, x1)) & (xs <= max(x0, x1)) & np.isfinite(ys)]
+        if self._noise_log:shown = shown[shown > 0]
+        return (float(shown.min()), float(shown.max())) if shown.size else None
+    def widen_overlay(self, axis, end):
+        '''Move one end of the noise scale to a round value just past the data (1-2-5 steps on a log scale).'''
+        extent = self.overlay_extent(axis)
+        if not extent:
+            return
+        low, high = self.overlay_limits(axis)
+        def round_log(value, up):
+            exponent = math.floor(math.log10(value)); steps = [1, 2, 5, 10]
+            candidates = [step * 10 ** exponent for step in steps]
+            return min(c for c in candidates if c >= value) if up else max(c for c in [0.5 * 10 ** exponent] + candidates if c <= value)
+        if end == 'max':
+            value = extent[1] * 1.1
+            if self._noise_log:high = round_log(value, True)
+            else:step = nice_step(value, 4); high = math.ceil(value / step) * step
+        else:
+            if self._noise_log:low = round_log(extent[0] * .9, False)
+            else:low = 0.0 if extent[0] >= 0 else -math.ceil(-extent[0] / nice_step(-extent[0], 4)) * nice_step(-extent[0], 4)
+        self.set_noise_range(low, high)
+    def set_overlay_limits(self, axis, low, high):
+        self.set_noise_range(low, high)
+    def _place_noise_view(self, *args):
+        self.noise_view.setGeometry(QRectF(self.plotItem.vb.rect()))
+    def _series_items(self):
+        return list(self.plotItem.items) + list(self.noise_view.addedItems)
+    def _series_changed(self):
+        self.noise_axis.setVisible(self._noise_curve is not None and not self.series_hidden('noise'))
+    def update_theme(self):
+        super().update_theme()
+        if hasattr(self, 'noise_axis'):self.noise_axis.update()
+    def _noise_curve_item(self, key):
+        # Curve items are kept and refilled: a clipped PlotDataItem taken out of an overlay view looks for its
+        # view on the plot widget and fails.
+        item = pg.PlotDataItem([], [], antialias=True); item.setDownsampling(auto=True, method='peak')
+        self.noise_view.addItem(item); self.tag_series(item, key); return item
+    def set_noise(self, x, sigma, scale='linear', limit=None):
+        '''Noise per pixel, in % of the signal, on the right-hand scale; None clears it. limit (in %) is the
+        shot-noise limit, drawn as a dashed line (its legend entry starts switched off).'''
+        if self._noise_item is None:
+            self._noise_item = self._noise_curve_item('noise')
+            self._limit_item = self._noise_curve_item('shot')
+        self._noise_curve = self._noise_limit = self._noise_ratio = None
+        if sigma is None or x is None or not len(sigma):
+            for item in (self._noise_item, self._limit_item):item.setData([], [])
+            self._series_changed(); return
+        xs = np.asarray(x, dtype=float)[:len(sigma)]; ys = np.asarray(sigma, dtype=float)[:len(xs)]
+        log = scale == 'log'; colors = palette()
+        def show(item, values, pen):
+            item.setPen(pen); item.setLogMode(False, log)
+            item.setData(xs, np.where(values > 0, values, np.nan) if log else values)
+        show(self._noise_item, ys, pg.mkPen(colors['noise'], width=1.2))
+        if limit is not None:
+            limit = np.asarray(limit, dtype=float)[:len(xs)]
+            show(self._limit_item, limit, pg.mkPen(colors['muted'], width=1, style=Qt.DashLine))
+            self._noise_limit = limit
+            with np.errstate(divide='ignore', invalid='ignore'):self._noise_ratio = ys / limit
+        else:
+            self._limit_item.setData([], [])
+        self._noise_curve = (xs, ys)
+        if log != self._noise_log:self._apply_noise_range(log)
+        self.noise_axis.update(); self._series_changed()
+    def _apply_noise_range(self, log=None):
+        if log is not None:self._noise_log = bool(log)
+        low, high = self.noise_range['log' if self._noise_log else 'linear']
+        self.noise_axis.log = self._noise_log
+        if self._noise_log:self.noise_view.setYRange(math.log10(low), math.log10(high), padding=0)
+        else:self.noise_view.setYRange(low, high, padding=0)
+        self.noise_axis.prepareGeometryChange(); self.noise_axis.update()
+    def set_noise_range(self, low, high):
+        '''Limits of the noise scale in percent, for the current Y mode.'''
+        log = bool(self._noise_log)
+        if not (math.isfinite(low) and math.isfinite(high) and high > low) or (log and low <= 0):
+            raise ValueError('Enter a number; the minimum must stay below the maximum' + (' and above 0 on a log scale' if log else ''))
+        self.noise_range['log' if log else 'linear'] = (float(low), float(high)); self._apply_noise_range()
     def readout_text(self, x, y):
-        # Read the drawn spectrum (the last curve, i.e. the current one) at the cursor wavelength.
+        # Read the drawn spectrum (the last curve, i.e. the current one) at the cursor wavelength, and its noise.
         curve = getattr(self, '_readout_curve', None)
         if curve is None or not len(curve[0]):
             return super().readout_text(x, y)
         xs, ys = curve
         index = int(np.nanargmin(np.abs(xs - x)))
-        return f'{format_reading(xs[index], self.bottom_axis.labelText)}  ·  {format_reading(ys[index], self.left_axis.labelText)}'
+        text = f'{format_reading(xs[index], self.bottom_axis.labelText)}  ·  {format_reading(ys[index], self.left_axis.labelText)}'
+        if self._noise_curve is not None and not self.series_hidden('noise'):
+            nx, ny = self._noise_curve
+            near = int(np.nanargmin(np.abs(nx - x)))
+            if math.isfinite(ny[near]):
+                text += f'  ·  σ {ny[near]:.2g} %'
+                ratio = self._noise_ratio[near] if self._noise_ratio is not None and not self.series_hidden('shot') else math.nan
+                if math.isfinite(ratio):text += f' ({ratio:.2g}× shot limit)'
+        return text
     def set_spectra(self, curves, x_label='Wavelength / nm', y_label='Counts', scale='linear'):
         self.set_empty('Start preview or acquisition' if not curves else '')
         self._clear()
@@ -1006,6 +1335,7 @@ class SpectrumPlot(EditablePlot):
                 ya = np.where(ya > 0, ya, np.nan)
             pen = pg.mkPen(color, width=width, style=Qt.DashLine if dashed else Qt.SolidLine)
             item = self.plotItem.plot(xa, ya, antialias=True,pen=pen)
+            if len(curve) > 5 and curve[5]:self.tag_series(item, curve[5])
             self._items.append(item)
             self._readout_curve = (xa, ya)
             local_min = float(np.nanmin(xa))
@@ -1026,14 +1356,17 @@ class SpectrumPlot(EditablePlot):
         colors = palette()
         curves = []
         if background is not None and len(background):
-            curves.append((x[:len(background)], background, colors['amber'], True, 1.4))
+            curves.append((x[:len(background)], background, colors['amber'], True, 1.4, 'background'))
         if current is not None and len(current):
-            curves.append((x[:len(current)], current, colors['data'], False, 1.7))
+            curves.append((x[:len(current)], current, colors['data'], False, 1.7, 'current'))
         self.set_spectra(curves, x_label, 'Counts', scale)
 
-class MapPlot(EditablePlot):
+class MapPlot(PinnedLines, EditablePlot):
     delayPicked = Signal(float)
     wavePicked = Signal(float)
+    pinAddRequested = Signal(float)
+    pinRemoveRequested = Signal(str)
+    pinMoved = Signal(str, float, bool)
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=False, invert_y=True)
         self.clamp_to_data = True
@@ -1061,6 +1394,7 @@ class MapPlot(EditablePlot):
             self.scene().sigMouseClicked.connect(self._clicked)
         except Exception:
             pass
+        self._init_pins()
         self.set_x_label('Wavelength / nm')
         self.set_y_label('Delay / ps')
         self.update_theme()
@@ -1245,11 +1579,17 @@ class DecayPlot(EditablePlot):
             self.marker.setPen(pg.mkPen(colors['cursor'], width=1, style=Qt.DashLine))
             self.point.setBrush(pg.mkBrush(colors['cursor']))
     def readout_text(self, x, y):
-        # The decay is read by delay: report the measured point nearest the cursor row.
+        # The decay is read by delay: report the measured point nearest the cursor row, for every decay shown.
         if not self._delays:
             return ''
         index = min(range(len(self._delays)), key=lambda i: abs(self._delays[i] - y))
-        return f'{format_reading(self._delays[index], "Delay / ps")}  ·  {format_reading(self._intensities[index], self.bottom_axis.labelText)}'
+        own = getattr(self, '_label', None)
+        text = f'{format_reading(self._delays[index], "Delay / ps")}  ·  ' + (f'{own} ' if own else '') + format_reading(self._intensities[index], self.bottom_axis.labelText)
+        for key, label, delays, values in getattr(self, '_extra', []):
+            if self.series_hidden(key) or not len(delays):continue
+            near = int(np.argmin(np.abs(np.asarray(delays) - self._delays[index])))
+            text += f'  ·  {label} {format_reading(values[near], self.bottom_axis.labelText)}'
+        return text
     def _moved(self, line):
         if not self._settings:
             self.delayPicked.emit(float(line.value()))
@@ -1262,20 +1602,36 @@ class DecayPlot(EditablePlot):
                 self.delayPicked.emit(float(point.y()))
         except Exception:
             pass
-    def set_decay(self, delays, intensities, scale='linear'):
+    def set_decay(self, delays, intensities, scale='linear', key=None, extra=None, normalize=False, label=None):
+        '''The decay at the marked wavelength (legend key `key`), and extra decays [(key, label, palette colour
+        key, delays, values)] at pinned wavelengths. normalize scales each to its own maximum, to compare shapes.'''
         self.set_empty('No data' if not delays else '')
+        self._label = label
         for item in self._items:
             try:
                 self.plotItem.removeItem(item)
             except Exception:
                 pass
         self._items = []
+        def scaled(values):
+            values = np.asarray(values, dtype=float)
+            top = np.nanmax(values) if values.size else math.nan
+            return values / top if normalize and math.isfinite(top) and top > 0 else values
         pairs = []
-        for delay, intensity in zip(delays, intensities):
+        for delay, intensity in zip(delays, scaled(intensities)):
             if math.isfinite(float(delay)) and math.isfinite(float(intensity)):
                 pairs.append((float(intensity), float(delay)))
         self._delays = [item[1] for item in pairs]
         self._intensities = [item[0] for item in pairs]
+        self.set_x_label('normalized' if normalize else 'counts / pixel')
+        colors = palette(); self._extra = []; spread = []
+        for extra_key, label, color, extra_delays, values in extra or []:
+            ex = scaled(values); ey = np.asarray(extra_delays, dtype=float); keep = np.isfinite(ex) & np.isfinite(ey)
+            if not keep.any():continue
+            item = self.plotItem.plot(ex[keep], ey[keep], antialias=True, pen=pg.mkPen(colors[color], width=1.3), symbol='o', symbolSize=4,
+                                      symbolBrush=pg.mkBrush(colors[color]), symbolPen=pg.mkPen(colors[color]))
+            self.tag_series(item, extra_key); self._items.append(item)
+            self._extra.append((extra_key, label, ey[keep].tolist(), ex[keep].tolist())); spread += ex[keep].tolist()
         if not pairs:
             self.set_axis_bounds('x', 0, 1.1)
             self.set_axis_bounds('y', 0, 1)
@@ -1285,11 +1641,13 @@ class DecayPlot(EditablePlot):
         xs = np.asarray([item[0] for item in pairs], dtype=float)
         ys = np.asarray([item[1] for item in pairs], dtype=float)
         item = self.plotItem.plot(xs, ys, antialias=True,pen=pg.mkPen(colors['data'], width=1.4), symbol='o', symbolSize=6, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+        if key:self.tag_series(item, key)
         self.make_pickable(item, None, 'Delay / ps', key='y')
         self._items.append(item)
         self.set_axis_bounds('y', min(ys), max(ys))
         try:
-            self.set_axis_bounds('x',min(0,float(xs.min())),max(1,float(xs.max()))*1.1)
+            values = np.concatenate([xs, np.asarray(spread, dtype=float)])
+            self.set_axis_bounds('x', min(0, float(values.min())), (1.0 if normalize else max(1, float(values.max()))) * 1.1)
         except Exception:
             pass
     def set_marker(self, delay=None):
@@ -1344,7 +1702,9 @@ class AnalysisCurvePlot(EditablePlot):
             except Exception:
                 pass
         self._items = []
-    def set_decay(self, observed, fit=None, scale='linear'):
+    def set_decay(self, observed, fit=None, scale='linear', rounds=None, left_out=None):
+        '''observed and fit as (delay, value) pairs; rounds as [(round_index, delays, values)] drawn behind the
+        average, each round in its own colour; left_out as (delay, value) pairs of excluded points, drawn hollow in the warning colour.'''
         self.set_empty('Open an experiment to view its decay' if not observed else '')
         self._mode = 'decay'
         self._clear_items()
@@ -1354,12 +1714,32 @@ class AnalysisCurvePlot(EditablePlot):
         except Exception:
             pass
         colors = palette()
+        extra = []
+        from .theme import round_key
+        for index, rx, ry in rounds or []:
+            rx = np.asarray(rx, dtype=float); ry = np.asarray(ry, dtype=float)
+            if scale == 'log':
+                ry = np.where(ry > 0, ry, np.nan)
+            color = QColor(colors[round_key(index)]); color.setAlpha(225)
+            item = self.plotItem.plot(rx, ry, antialias=True, pen=pg.mkPen(color, width=1.3), symbol='o', symbolSize=4,
+                                      symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color))
+            self.tag_series(item, 'rounds', f'round{int(index)}')
+            self._items.append(item); extra += [float(v) for v in ry if np.isfinite(v)]
+        if left_out:
+            lx = np.asarray([item[0] for item in left_out], dtype=float); ly = np.asarray([item[1] for item in left_out], dtype=float)
+            if scale == 'log':
+                ly = np.where(ly > 0, ly, np.nan)
+            item = self.plotItem.plot(lx, ly, pen=None, symbol='o', symbolSize=8, symbolBrush=pg.mkBrush(0, 0, 0, 0),
+                                      symbolPen=pg.mkPen(colors['warning'], width=1.6))
+            self.tag_series(item, 'left_out')
+            self._items.append(item); extra += [float(v) for v in ly if np.isfinite(v)]
         if self._observed:
             xs = np.asarray([item[0] for item in self._observed], dtype=float)
             ys = np.asarray([item[1] for item in self._observed], dtype=float)
             if scale == 'log':
                 ys = np.where(ys > 0, ys, np.nan)
             item = self.plotItem.plot(xs, ys, antialias=True,pen=None, symbol='o', symbolSize=7, symbolBrush=pg.mkBrush(colors['data']), symbolPen=pg.mkPen(colors['data']))
+            self.tag_series(item, 'observed')
             self.make_pickable(item)
             self._items.append(item)
             self.set_axis_bounds('x', min(xs), max(xs))
@@ -1372,13 +1752,14 @@ class AnalysisCurvePlot(EditablePlot):
             if scale == 'log':
                 fy = np.where(fy > 0, fy, np.nan)
             item = self.plotItem.plot(fx, fy, antialias=True,pen=pg.mkPen(colors['amber'], width=1.8))
+            self.tag_series(item, 'fit')
             self._items.append(item)
         self.marker.setVisible(bool(self._observed))
         self.point.setVisible(False)
         self.marker.setVisible(False)
         self.set_x_label('Delay / ps')
         self.set_y_label('counts / s')
-        limits=[v for _,v in self._observed]+[v for _,v in fit_points]
+        limits=[v for _,v in self._observed]+[v for _,v in fit_points]+extra
         if scale=='log':limits=[math.log10(v) for v in limits if v>0]
         low=math.floor(min(limits)) if limits and scale=='log' else 0;high=max(limits,default=1)
         if high<=low:high=low+1
@@ -1657,14 +2038,15 @@ class CalibrationProfilePlot(EditablePlot):
             x = np.arange(len(values), dtype=float)
             self._x_values = x
         item = self.plotItem.plot(x, values, antialias=True,pen=pg.mkPen(colors['data'], width=1.6))
+        self.tag_series(item, 'ccd')
         self._items.append(item)
         for index,reference in enumerate(references or []):
             try:
                 line = pg.InfiniteLine(pos=float(reference), angle=90, movable=False, pen=pg.mkPen(colors['amber'], width=1, style=Qt.DashLine))
-                self.plotItem.addItem(line)
+                self.plotItem.addItem(line); self.tag_series(line, 'references')
                 self._items.append(line)
-                label=pg.TextItem('L'+str(index+1),color=colors['muted'],anchor=(.5,0));font=QFont('Segoe UI');font.setPixelSize(11);label.setFont(font);label.setPos(float(reference),max(1,float(values.max()))*1.18);self.plotItem.addItem(label);self._items.append(label)
-                nearest=int(np.argmin(np.abs(x-float(reference))));point=self.plotItem.plot([x[nearest]],[values[nearest]],antialias=True,pen=None,symbol='o',symbolSize=5,symbolBrush=colors['data'],symbolPen=None);self._items.append(point)
+                label=pg.TextItem('L'+str(index+1),color=colors['muted'],anchor=(.5,0));font=QFont('Segoe UI');font.setPixelSize(11);label.setFont(font);label.setPos(float(reference),max(1,float(values.max()))*1.18);self.plotItem.addItem(label);self.tag_series(label,'references');self._items.append(label)
+                nearest=int(np.argmin(np.abs(x-float(reference))));point=self.plotItem.plot([x[nearest]],[values[nearest]],antialias=True,pen=None,symbol='o',symbolSize=5,symbolBrush=colors['data'],symbolPen=None);self.tag_series(point,'references');self._items.append(point)
             except Exception:
                 pass
         self.set_x_label('')

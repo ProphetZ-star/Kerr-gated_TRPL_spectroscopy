@@ -6,6 +6,16 @@ LIGHT={'bg':'#f3f4f6','surface':'#ffffff','field':'#f1f3f5','line':'#e2e5ea','bl
 MAP_COLORS=['#2b305b','#2c6989','#4cc3d9','#caebf0']
 SATURATED_COLOR='#ff7b1c'  # pixels at CCD full scale; warm so it never reads as a map / frame intensity
 DARK['saturated']=LIGHT['saturated']=SATURATED_COLOR
+# Repeat rounds on the Analysis decay: distinct hues of similar weight, none close to the data (teal),
+# the fit (amber) or left-out points (warning). Keys round0..round5; a round keeps its colour by number.
+ROUND_COLORS={'light':['#3d6fd6','#9a4fc9','#d0457f','#5b8a1e','#b0473a','#66758a'],
+              'dark':['#7ea6ff','#c08cf2','#f27fae','#a9cf5f','#f08c7a','#a3b0c2']}
+for _mode,_colors in (('light',LIGHT),('dark',DARK)):
+    _colors.update({f'round{i}':c for i,c in enumerate(ROUND_COLORS[_mode])})
+    # Live spectrum noise (right-hand scale): violet, apart from the current (teal) and background (amber) traces.
+    _colors['noise']=ROUND_COLORS[_mode][1]
+def round_key(index):
+    return f'round{int(index)%len(ROUND_COLORS["light"])}'
 _CURRENT='light'
 def palette(mode=None):
     return dict(LIGHT if (mode or _CURRENT)=='light' else DARK)
@@ -22,7 +32,7 @@ QWidget{color:%(text)s;font:14px 'Segoe UI';}
 QMainWindow#MainWindow,QWidget#acquisitionPage,QWidget#analysisPage,QWidget#calibrationPage,QWidget#analysisResults,QWidget#centralStack{background:%(bg)s;}
 QWidget#top,QWidget#subnav,QFrame#foot{background:%(surface)s;}
 QWidget#top{border-bottom:1px solid %(line)s;}QWidget#subnav{border-bottom:1px solid %(line)s;}
-QLabel{background:transparent;}QLabel[muted=true]{color:%(muted)s;}QLabel[h2=true]{font-size:15px;font-weight:600;}QLabel[mono=true]{font-family:Consolas;}
+QLabel{background:transparent;}QLabel[muted=true]{color:%(muted)s;}QLabel[muted=true][warning=true]{color:%(warning)s;}QLabel#backgroundStatus[state=ready]{color:%(success)s;}QLabel#backgroundStatus[state=busy]{color:%(blue)s;}QLabel#prescanTitle{font-weight:600;color:%(warning)s;}QLabel[h2=true]{font-size:15px;font-weight:600;}QLabel[mono=true]{font-family:Consolas;}
 QLabel#runStatus{color:%(muted)s;}QLabel#sampleName{color:%(muted)s;font-size:12px;}QLabel#progressText,QLabel#remaining,QLabel#stageStatus,QLabel#validation,QLabel#saveStatus,QLabel#fitStatus,QLabel#calFeedback{color:%(muted)s;}
 QLabel#validation,QLabel#calFeedback.error{color:%(danger)s;}QLabel#saturation,QLabel#calRoiLabel{color:%(warning)s;font-weight:600;}
 QWidget#saturatedKey{background:transparent;}QFrame#saturatedSwatch{background:%(saturated)s;border-radius:2px;}QLabel#saturatedText{color:%(warning)s;font-size:11px;font-weight:600;}
@@ -106,7 +116,7 @@ QWidget#panelHead Legend QLabel{font-size:12px;}
 QFrame#foot{background:%(surface)s;border:0;border-radius:7px;}
 QFrame#foot QLabel,QFrame#foot QCheckBox{font-size:12px;}
 QFrame#foot QPushButton,QFrame#foot QLineEdit{font-size:13px;}QLabel#folderLabel{color:%(muted)s;}
-QFrame#foot QCheckBox::indicator{width:12px;height:12px;}
+QFrame#foot QCheckBox::indicator{width:12px;height:12px;}QCheckBox#repeatForever{font-size:13px;}QCheckBox#decayNormalize{font-size:12px;}
 QLabel#saveStatus{min-width:150px;max-width:280px;}
 QFrame#analysisControls QLabel,QFrame#calibrationControls QLabel{font-size:13px;}
 QFrame#analysisControls QLabel[h2=true],QFrame#calibrationControls QLabel[h2=true]{font-size:15px;}

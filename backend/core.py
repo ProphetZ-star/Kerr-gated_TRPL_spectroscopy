@@ -3,6 +3,7 @@ from decimal import Decimal
 import hashlib
 import json
 import math
+from .storage.schema import MAX_FRAMES
 
 C_MM_PS = 0.299792458
 
@@ -45,13 +46,16 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0, limits
         raise ValueError(f'Scan or approach position exceeds stage soft limits {limits[0]}–{limits[1]} mm')
     if len(set(targets)) != len(targets):
         raise ValueError('Different delays map to indistinguishable stage positions')
-    rounds = request.repeats if request.mode == 'repeat' else 1
-    frames = len(points) * rounds * request.frames_per_point
-    # Also bound the Python metadata and browser recovery workload in this first release.
-    if frames > 25000:
-        raise ValueError('This release supports at most 25,000 frames per run')
-    if not request.autosave and frames * (1024 * 4 + 2048) > 128 * 1024**2:
-        raise ValueError('Memory-only run exceeds the 128 MiB estimate; enable autosave or reduce frames')
+    until_stopped = request.mode == 'repeat' and request.repeats == 0
+    per_round = len(points) * request.frames_per_point
+    # Frames are held as arrays (4 KiB per full-chip spectrum), so one limit covers saved and memory-only runs.
+    if per_round > MAX_FRAMES:
+        raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames (one round of this plan has {per_round:,})')
+    # Repeat until stopped: as many rounds as the frame limit allows.
+    rounds = MAX_FRAMES // per_round if until_stopped else request.repeats if request.mode == 'repeat' else 1
+    frames = per_round * rounds
+    if frames > MAX_FRAMES:
+        raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames (this plan has {frames:,})')
     def duration(a,b):
         d=abs(a-b);return 2*math.sqrt(d/12) if d<3 else 1+(d-3)/6
     position=delay_to_mm(current_delay,zero,sign);motion=0
@@ -60,10 +64,10 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0, limits
         for target in targets:motion+=duration(position,target);position=target
     seconds=motion+rounds*len(points)*request.settle_s+frames*(request.exposure_s+.03)
     data = dict(delays_ps=points, targets_mm=targets, approach_mm=approach,
-                rounds=rounds, total_points=len(points)*rounds, total_frames=frames,
-                estimated_seconds=seconds, estimated_bytes=frames * (4096 + 2048),
+                rounds=rounds, total_points=len(points)*rounds, total_frames=frames, until_stopped=until_stopped,
+                estimated_seconds=seconds, round_seconds=seconds / rounds, estimated_bytes=frames * (4096 + 2048),
                 revision=revision, zero_mm=zero, delay_sign=sign, path_multiplier=2)
-    identity={k:v for k,v in data.items() if k!='estimated_seconds'}
+    identity={k:v for k,v in data.items() if k not in ('estimated_seconds','round_seconds')}
     identity['request']=request.model_dump(exclude={'request_id','save_path','overwrite_token'})
     data['plan_id'] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
     return data

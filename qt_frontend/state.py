@@ -1,4 +1,7 @@
-'''Plain Python acquisition datasets and grouped spectra.'''
+'''Acquisition datasets on the GUI side: per-delay sums of the run's frames plus its latest frame.
+
+Frames arrive from the worker in blocks of arrays (see backend/storage/frames.py FrameTable.block); the GUI
+keeps per-delay sums, not every spectrum, so a long run costs memory per delay rather than per frame.'''
 import numpy as np
 
 FULL_SCALE=65535.0
@@ -18,13 +21,31 @@ class SpectrumGroup:
     def size(self):
         return int(self.raw_sum.size)
     def add(self,spectrum,exposure,full_scale=FULL_SCALE):
-        self.raw_sum+=spectrum; self.norm_sum+=spectrum/exposure; self.count+=1
-        self.saturated|=spectrum>=full_scale
+        self.add_many(np.asarray(spectrum,dtype=float)[None,:],exposure,full_scale)
+    def add_many(self,spectra,exposure,full_scale=FULL_SCALE):
+        total=spectra.sum(axis=0)
+        self.raw_sum+=total; self.norm_sum+=total/exposure; self.count+=len(spectra)
+        self.saturated|=(spectra>=full_scale).any(axis=0)
+
+class FrameCount:
+    '''Stands in for the old list of frame dicts: len() and truth are the frames received; [-1] is the latest.'''
+    __slots__=('count','latest')
+    def __init__(self):
+        self.count=0; self.latest=None
+    def __len__(self):
+        return self.count
+    def __bool__(self):
+        return self.count>0
+    def __getitem__(self,index):
+        if index in (-1,self.count-1) and self.latest is not None:
+            return self.latest
+        raise IndexError('Only the latest frame is kept on the GUI side')
 
 class Dataset:
     def __init__(self,run=None,records=None,fit=None,wave=600.0,half_window=5.0):
-        self.run=run; self.records=[]; self.fit=fit; self.wave=float(wave); self.half_window=float(half_window)
-        self._groups={}; self._seen=set(); self._revision=0;self._sorted_delays=None;self._observed_cache=None
+        self.run=run; self.records=FrameCount(); self.fit=fit; self.wave=float(wave); self.half_window=float(half_window)
+        self._groups={}; self._revision=0;self._sorted_delays=None;self._observed_cache=None
+        self.quality={}
         if records:
             self.append_records(records)
     @property
@@ -65,56 +86,98 @@ class Dataset:
     @property
     def full_scale(self):
         try:
-            value=float(self.run['metadata']['devices']['camera']['full_scale'])
+            value=float(self.run['metadata']['instrument']['camera']['full_scale'])
         except Exception:
             return FULL_SCALE
         return value if np.isfinite(value) and value>0 else FULL_SCALE
     @property
     def latest_record(self):
-        return self.records[-1] if self.records else None
+        return self.records.latest
     def clear_fit(self):
         self.fit=None
-    def append(self,record):
-        return self.append_record(record)
-    def append_record(self,record):
-        if not isinstance(record,dict):
-            return False
-        rid=record.get('record_id')
-        if rid is not None:
-            try:
-                key=('id',rid)
-                if key in self._seen:
-                    return False
-            except Exception:
-                key=None
-        else:
-            key=None
+    def append_block(self,block):
+        '''Add rows offset.. of the run. Rows already received are skipped; a block that would leave a gap, or
+        whose values are invalid, is refused whole. Returns the number of new frames.'''
         try:
-            delay=float(record.get('delay_ps')); exposure=float(record.get('exposure_s'))
-            spectrum=np.asarray(record.get('spectrum'),dtype=float)
+            offset=int(block['offset']); exposure=float(block['exposure_s'])
+            spectra=np.asarray(block['spectra'],dtype=float); delays=np.asarray(block['delay_ps'],dtype=float)
+            index=np.asarray(block['index']); saturated=np.asarray(block['saturated_pixels'])
         except Exception:
-            return False
-        if not np.isfinite(delay) or not np.isfinite(exposure) or exposure<=0 or spectrum.ndim!=1 or spectrum.size==0:
-            return False
-        if not bool(np.all(np.isfinite(spectrum))):
-            return False
-        group=self._groups.get(delay)
-        if group is not None and group.size!=spectrum.size:
-            return False
-        if group is None:
-            group=SpectrumGroup(delay,spectrum.size); self._groups[delay]=group
-            self._sorted_delays=None
-        group.add(spectrum,exposure,self.full_scale)
-        if key is not None:
-            self._seen.add(key)
-        self.records.append(record); self._revision+=1
-        return True
+            return 0
+        if offset>self.records.count or spectra.ndim!=2 or spectra.shape[1]==0 or delays.shape!=(len(spectra),) or index.shape!=(len(spectra),3):
+            return 0
+        skip=self.records.count-offset
+        spectra,delays,index,saturated=spectra[skip:],delays[skip:],index[skip:],saturated[skip:]
+        if not len(spectra) or not np.isfinite(exposure) or exposure<=0 or not np.isfinite(delays).all() or not np.isfinite(spectra).all():
+            return 0
+        unique,inverse=np.unique(delays,return_inverse=True)
+        if any(d in self._groups and self._groups[d].size!=spectra.shape[1] for d in unique.tolist()):
+            return 0
+        full_scale=self.full_scale
+        for position,delay in enumerate(unique.tolist()):
+            group=self._groups.get(delay)
+            if group is None:
+                group=SpectrumGroup(delay,spectra.shape[1]); self._groups[delay]=group; self._sorted_delays=None
+            group.add_many(spectra[inverse==position],exposure,full_scale)
+        self._add_quality(block,skip)
+        last=len(spectra)-1
+        self.records.latest=dict(record_id=offset+skip+last,round_index=int(index[last,0]),point_index=int(index[last,1]),frame_index=int(index[last,2]),
+                                 delay_ps=float(delays[last]),exposure_s=exposure,source_mode=block.get('source_mode'),
+                                 saturated_pixels=int(saturated[last]),spectrum=spectra[last].tolist())
+        self.records.count+=len(spectra); self._revision+=1
+        return len(spectra)
+    def _add_quality(self,block,skip):
+        '''Running summary of the per-frame columns for the experiment details: CCD temperature range and state,
+        saturated frames, stage position error against the plan, and the span of frame times.'''
+        def column(name):
+            value=block.get(name)
+            return None if value is None else np.asarray(value)[skip:]
+        q=self.quality
+        temperature=column('temperature_c')
+        if temperature is not None:
+            finite=temperature[np.isfinite(temperature)]
+            if finite.size:
+                q['temperature_min']=min(q.get('temperature_min',np.inf),float(finite.min()))
+                q['temperature_max']=max(q.get('temperature_max',-np.inf),float(finite.max()))
+        state=column('temperature_state')
+        if state is not None:
+            q['unstable_frames']=q.get('unstable_frames',0)+int(np.count_nonzero((state>=0)&(state!=3)))
+            q['unknown_state_frames']=q.get('unknown_state_frames',0)+int(np.count_nonzero(state<0))
+        saturated=column('saturated_pixels')
+        if saturated is not None:
+            q['saturated_frames']=q.get('saturated_frames',0)+int(np.count_nonzero(saturated>0))
+        reported=column('stage_reported_mm'); index=column('index')
+        try:targets=np.asarray(self.run['metadata']['acquisition']['targets_mm'],dtype=float)
+        except Exception:targets=None
+        if reported is not None and index is not None and targets is not None and targets.size:
+            points=index[:,1]; valid=np.isfinite(reported)&(points>=0)&(points<targets.size)
+            if valid.any():
+                error=float(np.max(np.abs(reported[valid]-targets[points[valid]])))
+                q['position_error_max_mm']=max(q.get('position_error_max_mm',0.0),error)
+        start=column('t_start_s'); end=column('t_end_s')
+        if start is not None and end is not None:
+            finite=np.isfinite(start)&np.isfinite(end)
+            if finite.any():
+                q['first_start_s']=min(q.get('first_start_s',np.inf),float(start[finite].min()))
+                q['last_end_s']=max(q.get('last_end_s',-np.inf),float(end[finite].max()))
+                q['exposure_span_s']=q.get('exposure_span_s',0.0)+float(np.sum(end[finite]-start[finite]))
     def append_records(self,records):
+        '''Frame dicts (delay_ps, exposure_s, spectrum, ...) in run order, e.g. from tests or older callers.'''
         added=0
         for record in records or []:
-            if self.append_record(record):
-                added+=1
+            try:
+                block=dict(offset=self.records.count,exposure_s=record['exposure_s'],source_mode=record.get('source_mode'),
+                           spectra=np.asarray(record['spectrum'],dtype=float)[None,:],delay_ps=np.asarray([record['delay_ps']],dtype=float),
+                           index=np.asarray([[record.get('round_index',0),record.get('point_index',0),record.get('frame_index',0)]]),
+                           saturated_pixels=np.asarray([record.get('saturated_pixels') or 0]))
+            except Exception:
+                continue
+            added+=self.append_block(block)
         return added
+    def append_record(self,record):
+        return self.append_records([record])==1
+    def append(self,record):
+        return self.append_record(record)
     def frames_for_delay(self,delay):
         group=self._groups.get(float(delay))
         return group.count if group else 0

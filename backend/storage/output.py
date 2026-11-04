@@ -16,7 +16,7 @@ def target_path(path,run_id='experiment'):
 
 def output_info(path,run_id='experiment'):
     target=target_path(path,run_id)
-    family=[target,target.with_suffix('.partial.h5'),target.with_suffix('.stopped.h5'),target.with_suffix('.events.jsonl')]
+    family=[target,target.with_suffix('.partial.h5'),target.with_suffix('.stopped.h5')]
     versions=[]
     for file in family:
         try:stat=file.stat()

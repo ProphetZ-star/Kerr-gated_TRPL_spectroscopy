@@ -63,7 +63,8 @@ class RunRequest(_StrictModel):
         min_length=1,
         max_length=10,
     )
-    repeats: int = Field(default=1, ge=1, le=100)
+    # 0: repeat until stopped (bounded by the frame limit).
+    repeats: int = Field(default=1, ge=0, le=100)
     exposure_s: float = Field(default=1.0, ge=0.001, le=3600.0)
     frames_per_point: int = Field(default=1, ge=1, le=100)
     save_path: str | None = None
@@ -115,6 +116,8 @@ class VelocityRequest(_StrictModel):
 class BackgroundRequest(_StrictModel):
     kind: Literal["dark", "optical_background"]
     condition: str = Field(min_length=1, max_length=500)
+    # Frames averaged into the background (same exposure and readout as the scan).
+    frames: int = Field(default=1, ge=1, le=1000)
 
 
 class SpectrographConfig(_StrictModel):
@@ -152,9 +155,17 @@ class FitRequest(_StrictModel):
     irf_fwhm_ps: float = Field(default=0.25, ge=0.0001, le=100)
     min_delay_ps: float | None = None
     max_delay_ps: float | None = None
+    # Processing (backend/processing.py): what is subtracted and which frames are left out.
+    subtract_background: bool = False
+    exclude_saturated: bool = True
+    exclude_unstable: bool = False
+    position_tolerance_um: float | None = Field(default=None, gt=0, le=1e6)
+    rounds: list[int] | None = Field(default=None, min_length=1, max_length=100)
 
     @model_validator(mode="after")
     def _check_delay_bounds(self) -> "FitRequest":
+        if self.rounds is not None and any(r < 0 for r in self.rounds):
+            raise ValueError("rounds must be nonnegative round indices")
         if self.min_delay_ps is not None and self.max_delay_ps is not None:
             if not self.max_delay_ps > self.min_delay_ps:
                 raise ValueError("max_delay_ps must be greater than min_delay_ps")

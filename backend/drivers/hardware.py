@@ -93,6 +93,7 @@ class AndorSDK2Camera:
             low=ct.c_int();high=ct.c_int();self.call('GetTemperatureRange',ct.byref(low),ct.byref(high));self.temperature_range=(low.value,high.value)
             cooler=ct.c_int();self.call('IsCoolerOn',ct.byref(cooler));self.cooler_on=bool(cooler.value)
             self.target_c=max(low.value,min(high.value,-60))
+            self.electrons_per_count=self._sensitivity()
             self.call('SetAcquisitionMode',1);self.call('SetTriggerMode',0)
             self.call('SetReadMode',0)
             self.readout=default_readout(self.rows)
@@ -102,14 +103,31 @@ class AndorSDK2Camera:
     def call(self,name,*args):
         with self.lock:sdk_check(self.dll,name,*args)
 
+    def _sensitivity(self):
+        # Electrons per count at the readout in use (AD channel 0, horizontal speed 0, conventional amplifier,
+        # pre-amp gain 0: this driver never changes them). Older SDK builds lack GetSensitivity.
+        function=getattr(self.dll,'GetSensitivity',None)
+        if function is None:return None
+        value=ct.c_float()
+        try:
+            with self.lock:code=function(0,0,0,0,ct.byref(value))
+        except Exception:return None
+        return float(value.value) if code==20002 and value.value>0 else None
+
     @property
     def temperature_c(self):return self.temperature()[0]
+
+    @property
+    def temperature_resolution_c(self):
+        # GetTemperatureF reports fractional degrees; older SDK builds only have the whole-degree GetTemperature.
+        return None if getattr(self.dll,'GetTemperatureF',None) is not None else 1.0
 
     def temperature(self):
         value,state,stamp=self._temperature
         if time.monotonic()-stamp>1:
-            reading=ct.c_int()
-            with self.lock:code=self.dll.GetTemperature(ct.byref(reading))
+            precise=getattr(self.dll,'GetTemperatureF',None)
+            reading=ct.c_float() if precise is not None else ct.c_int()
+            with self.lock:code=(precise or self.dll.GetTemperature)(ct.byref(reading))
             value,state=float(reading.value),self.TEMPERATURE_STATES.get(code,str(code))
             self._temperature=(value,state,time.monotonic())
         return value,state
@@ -119,7 +137,10 @@ class AndorSDK2Camera:
         return dict(model='Andor Newton DU920P',shape=[255,1024],pixels=readout_shape(self.readout)[1],chip_pixels=1024,detector_rows=self.rows,
                     bit_depth=16,full_scale=spectrum_full_scale(self.readout),read_modes=['fvb','full_image'],source_mode='hardware',
                     temperature_c=temperature,temperature_state=state,cooler_on=self.cooler_on,target_temperature_c=self.target_c,
-                    temperature_range_c=list(self.temperature_range),readout=dict(self.readout),serial_number=self.serial_number)
+                    temperature_range_c=list(self.temperature_range),temperature_resolution_c=self.temperature_resolution_c,
+                    readout=dict(self.readout),serial_number=str(self.serial_number),
+                    # The SDK reports no read noise; the shot-noise limit then counts photon noise only.
+                    electrons_per_count=self.electrons_per_count,read_noise_e=None)
 
     def set_cooling(self,enabled,target_c):
         low,high=self.temperature_range;target=int(round(max(low,min(high,target_c))))

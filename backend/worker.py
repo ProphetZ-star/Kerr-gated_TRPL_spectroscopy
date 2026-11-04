@@ -15,7 +15,9 @@ from .models import RunRequest, FitRequest, SpectrographConfig
 from .drivers.sim import SimCamera, SimStage
 from .devices import DeviceConnections, serial_ports
 from .drivers.hardware import HardwareError, AcquisitionCancelled, camera_choices
-from .storage.hdf5 import HDFWriter, choose_path, read_run, append_analysis
+from .storage.hdf5 import HDFWriter, read_run, append_analysis
+from .storage.frames import FrameTable
+from .storage import schema
 from .storage.output import output_info,prepare_output
 from .storage.export import export_csv
 from .calibration_service import CalibrationWorkbench
@@ -35,10 +37,22 @@ from .readout import readout_axis,readout_shape
 from .errors import CommandError,error_status
 
 
-def fit_records(*args,**kwargs):
+def fit_run(*args,**kwargs):
     # Keep expensive fitting imports out of the worker's first status handshake.
-    from .analysis import fit_records as fit
+    from .analysis import fit_run as fit
     return fit(*args,**kwargs)
+
+
+def run_inputs(run,count=None):
+    """What processing needs from a run besides its frames: wavelength axis, background, full scale, plan.
+
+    Frames are only ever appended, so the first count rows are a stable snapshot for another thread."""
+    frames=run['frames'];count=len(frames) if count is None else count;metadata=run['metadata']
+    background=metadata.get('background') or {}
+    full_scale=((metadata.get('instrument') or {}).get('camera') or {}).get('full_scale')
+    return dict(block=frames.block(0,count),axis=copy.deepcopy(metadata['calibration']['wavelengths_nm']),
+                background=background.get('spectrum') if background.get('present') else None,
+                full_scale=full_scale,targets_mm=(metadata.get('acquisition') or {}).get('targets_mm'))
 
 
 def now():
@@ -65,7 +79,7 @@ class Engine:
     def __init__(self, events, device_factories=None):
         self.events=events;self.lock=RLock();self.seq=0;self.session=uuid.uuid4().hex
         self.devices=DeviceConnections(device_factories);self.zero=150.0;self.zero_version=1
-        self.revision=0;self.busy=None;self.latest=None;self.background=None
+        self.revision=0;self.busy=None;self.latest=None;self.background=None;self.background_progress=None
         self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
         self.latest_axis=None
         self.spectrograph=dict(center_nm=600.0,grating=300,slit_um=200.0)
@@ -110,6 +124,10 @@ class Engine:
                     delay_ps=mm_to_delay(self.stage.position_mm,self.zero) if connected else None,
                     zero_mm=self.zero,zero_version=self.zero_version,
                     moving=self.preview_moving or self.busy=='move' or bool(self.busy=='scan' and run and run['step']=='moving'))
+
+    @staticmethod
+    def run_clock(run):
+        return time.time()-run['clock_origin']
 
     def hardware_failure(self,exc):
         # A rejected command or timeout is reported but leaves the device connected; only a lost link takes it offline.
@@ -180,7 +198,7 @@ class Engine:
 
     def public_run(self,run):
         with self.lock:
-            return {k:serial(v) for k,v in run.items() if k not in {'records','writer'}}
+            return {k:serial(v) for k,v in run.items() if k not in {'frames','writer'}}
 
     def compact_status(self,since=None,latest_version=-1):
         with self.lock:
@@ -192,18 +210,15 @@ class Engine:
             state=dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,worker_session_id=self.session,seq=self.seq,revision=self.revision,
                        stage=self.stage_state(run),
                        camera=self.camera.capabilities()|dict(exposure_s=self.camera.exposure_s),
-                       run={k:serial(v) for k,v in run.items() if k not in {'records','writer','metadata','request','plan'}} if run else None,
+                       background_progress=copy.deepcopy(self.background_progress),
+                       run={k:serial(v) for k,v in run.items() if k not in {'frames','writer','metadata','request','plan'}} if run else None,
                        _sync=dict(full=full,token=token,latest_version=self.latest_version))
             if full:
                 state.update(calibration=serial(self.calibration),spectrograph=self.spectrograph.copy(),calibration_warning=self.calibration_workbench.warning,
                              live_axis=serial(self.latest_axis),background=serial(self.background))
                 if run:
-                    metadata={k:v for k,v in run['metadata'].items() if k!='analysis'}
-                    history=run['metadata'].get('analysis',{})
-                    if history:
-                        newest=max(history,key=lambda k:history[k].get('finished_utc',''))
-                        metadata['analysis']={newest:history[newest]}
-                    state['run'].update(metadata=serial(metadata),request=serial(run['request']),plan=serial(run['plan']))
+                    # The whole fit history (at most 64) goes along so Analysis can list and reopen every saved fit.
+                    state['run'].update(metadata=serial(run['metadata']),request=serial(run['request']),plan=serial(run['plan']))
             if full or latest_version!=self.latest_version:state['latest']=serial(self.latest)
             return state
 
@@ -267,30 +282,57 @@ class Engine:
         self.emit('stage.position',dict(moving=False,controller_reported_mm=target,delay_ps=mm_to_delay(target,self.zero)))
 
     def run_calibration(self):
-        # Runs store the axis of their own binned pixels; the chip axis is kept for provenance.
-        calibration=copy.deepcopy(self.calibration)
-        if getattr(self.camera,'readout',None) is not None and calibration.get('wavelengths_nm') is not None:
-            calibration['chip_wavelengths_nm']=calibration['wavelengths_nm'];calibration['wavelengths_nm']=self.live_axis()
-        return calibration
+        # Runs store the axis of their own binned pixels. A fitted mapping keeps its polynomial, from which the
+        # full-chip axis follows; only a calibration without one keeps the chip axis, and only when it differs.
+        calibration=self.calibration;fit=calibration.get('provenance') or {}
+        chip=calibration.get('wavelengths_nm')
+        axis=self.live_axis() if getattr(self.camera,'readout',None) is not None and chip is not None else copy.deepcopy(chip)
+        pairs=[[pair['pixel'],pair['wavelength_nm']] for pair in fit.get('line_pairs') or [] if pair.get('enabled',True)]
+        result=dict(wavelengths_nm=axis,coefficients=fit.get('coefficients'),line_pairs=pairs or None,
+                    calibration_id=calibration.get('calibration_id'),source=calibration.get('source'),installed_utc=calibration.get('installed_utc'),
+                    convention=calibration.get('convention') or fit.get('convention'),degree=fit.get('degree'),
+                    pixel_origin=fit.get('pixel_origin'),pixel_scale=fit.get('pixel_scale'),rms_nm=fit.get('rms_nm'),
+                    max_error_nm=fit.get('max_error_nm'),reference_name=fit.get('reference_name'))
+        if fit.get('coefficients') is None and chip is not None and list(chip)!=list(axis):result['chip_wavelengths_nm']=copy.deepcopy(chip)
+        return result
 
-    def metadata(self,request,plan,run_id):
-        readout=copy.deepcopy(getattr(self.camera,'readout',None))
-        return dict(meta=dict(schema_version=1,software_version='0.1.1',source_mode=self.devices.mode,run_id=run_id,created_utc=now()),
-                    config=dict(request=request,plan=plan,applied=dict(read_mode=readout['mode'] if readout else 'fvb',exposure_s=self.camera.exposure_s,hbin=readout['hbin'] if readout else 1,
-                                                                readout=readout,pixels=readout_shape(readout)[1] if readout else 1024)),
-                    devices=dict(camera=self.camera.capabilities(),stage=dict(model='PI M-414.32S',controller_model=getattr(self.stage,'controller_model',None),
-                        controller_identity=self.devices.links['stage']['identity'],**self.stage_state()),spectrometer=self.devices.status()['spectrometer']),
-                    coordinates=dict(zero_mm=self.zero,zero_version=self.zero_version,path_multiplier=2,delay_sign=1),
-                    calibration=self.run_calibration(),background=serial(self.background),
-                    simulation=dict(seed=request['seed'],speedup=request['speedup'],fault=request['fault'],
-                                    tau_ps=[.42,3.8],irf_fwhm_ps=.25,gain_e_per_count=2.5) if self.devices.mode=='simulation' else {} )
+    def run_background(self):
+        background=self.background
+        if not background:return dict(present=False,spectrum=None,frames=None,condition=None,temperature_c=None,acquired_utc=None)
+        return dict(present=True,spectrum=copy.deepcopy(background['spectrum']),frames=background.get('frames',1),condition=background.get('condition'),
+                    temperature_c=background.get('temperature_c'),acquired_utc=background.get('timestamp_utc'))
+
+    def metadata(self,request,plan,run_id,created):
+        """Run description in the layout of the experiment file (backend/storage/hdf5.py)."""
+        readout=copy.deepcopy(self.camera.readout);camera=self.camera.capabilities();links=self.devices.status()
+        spectrometer=links['spectrometer'];stage=self.stage_state()
+        height=readout['y1']-readout['y0']+1
+        # Field lists come from the file schema; whatever a device does not report is stored empty.
+        return dict(root=dict(schema_version=schema.SCHEMA_VERSION,software_version=schema.SOFTWARE_VERSION,run_id=run_id,source_mode=self.devices.mode,
+                              created_utc=created.isoformat(),ended_utc=None,terminal_status=None,completed_rounds=0),
+                    instrument=dict(
+                        camera=schema.pick(camera,schema.INSTRUMENT['camera']),
+                        stage=dict(model='PI M-414.32S',controller_model=getattr(self.stage,'controller_model',None),
+                                   controller_identity=links['stage']['identity'],velocity_mm_s=stage['velocity_mm_s'],referenced=stage['referenced'],
+                                   position_source=stage['position_source'],position_sensor=stage['position_sensor']),
+                        spectrometer=dict(driver=spectrometer['config'].get('driver'),model=spectrometer['config'].get('model'),
+                                          manual=spectrometer['capabilities'].get('manual'),identity=spectrometer['identity'])),
+                    request=dict(schema.pick(request,schema.REQUEST),segments=copy.deepcopy(request['segments'])),
+                    coordinates=dict(zero_mm=plan['zero_mm'],path_multiplier=plan['path_multiplier'],delay_sign=plan['delay_sign']),
+                    acquisition=dict({k:copy.deepcopy(plan[k]) for k in schema.PLAN_ARRAYS},**schema.pick(plan,schema.PLAN),
+                                     exposure_s=self.camera.exposure_s,readout_mode=readout['mode'],
+                                     readout_roi=[readout['x0'],readout['x1'],readout['y0'],readout['y1']],hbin=readout['hbin'],
+                                     # V bin "full" (all rows summed on the chip) is stored as the ROI height.
+                                     vbin=height if readout['vbin']=='full' else readout['vbin'],pixels=readout_shape(readout)[1],
+                                     center_nm=self.spectrograph['center_nm'],grating=self.spectrograph['grating'],slit_um=self.spectrograph['slit_um']),
+                    calibration=self.run_calibration(),background=self.run_background(),events=[])
 
     def run_scan(self,run):
         request=run['request'];plan=run['plan'];writer=run.get('writer')
         terminal='completed';pending=deque()
         def commit(record):
             with self.lock:
-                run['records'].append(record);run['committed_frames']=len(run['records']);self.latest=record;self.latest_version+=1
+                run['frames'].append(record);run['committed_frames']=len(run['frames']);self.latest=record;self.latest_version+=1
                 self.latest_axis=run['metadata']['calibration']['wavelengths_nm']
                 if record['frame_index']==request['frames_per_point']-1:run['completed_points']+=1
             self.emit('spectrum.preview',record)
@@ -301,14 +343,21 @@ class Engine:
                 record,ack=pending.popleft();ack.result(timeout=30);commit(record)
         def step(name):
             with self.lock:run['step']=name
-            message=self.emit('run.state',{k:run[k] for k in ['run_id','status','step','completed_points','committed_frames','acquired_frames']})
-            if writer and message:writer.submit('event',message)
+            self.emit('run.state',{k:run[k] for k in ['run_id','status','step','completed_points','committed_frames','acquired_frames']})
+        def transition(status,message=None):
+            # The file's event log holds state changes only; progress goes to the live display.
+            event=dict(t_s=self.run_clock(run),status=status,message=message or '')
+            with self.lock:run['metadata']['events'].append(event)
+            return event
         try:
             if request['autosave'] and writer is None:
                 writer=HDFWriter(run['path'],run['metadata'])
                 with self.lock:run['writer']=writer
             with self.lock:run['status']='running'
+            event=transition('running')
+            if writer:writer.submit('event',event)
             for round_index in range(plan['rounds']):
+                with self.lock:run['current_round']=round_index
                 if request['mode']!='single':
                     step('moving');self.move(plan['approach_mm'],request['speedup'])
                 for point_index,(delay,target) in enumerate(zip(plan['delays_ps'],plan['targets_mm'])):
@@ -319,7 +368,7 @@ class Engine:
                     self.move(target,request['speedup'])
                     step('settling');self.wait(request['settle_s'],request['speedup'] if self.devices.mode=='simulation' else 1)
                     for frame_index in range(request['frames_per_point']):
-                        started=now();step('exposing')
+                        started=self.run_clock(run);step('exposing')
                         if self.devices.mode=='simulation':self.wait(request['exposure_s'],request['speedup'])
                         if fault=='camera_disconnect':raise ConnectionError('Injected camera disconnect')
                         step('reading')
@@ -327,13 +376,12 @@ class Engine:
                         if self.stop.is_set():raise Cancelled()
                         drain();record_id=run['acquired_frames']
                         spectrum,saturated=self.acquire_counts(delay,request['seed'],record_id,request['exposure_s'],
-                                                               run['metadata']['config'].get('center_nm',self.spectrograph['center_nm']),fault)
+                                                               run['metadata']['acquisition']['center_nm'],fault)
+                        ended=self.run_clock(run);camera=self.camera.capabilities()
                         record=dict(record_id=record_id,round_index=round_index,point_index=point_index,frame_index=frame_index,
-                                    delay_ps=delay,requested_mm=target,controller_reported_mm=self.stage.position_mm,
-                                    position_source=self.stage_state()['position_source'],zero_version=run['metadata']['coordinates']['zero_version'],
-                                    exposure_s=self.camera.exposure_s,requested_exposure_s=request['exposure_s'],temperature_c=self.camera.capabilities().get('temperature_c'),
-                                    host_exposure_start_utc=started,host_readout_end_utc=now(),hardware_timestamp=None,
-                                    saturated_pixels=saturated,spectrum=spectrum,source_mode=self.devices.mode)
+                                    delay_ps=delay,stage_reported_mm=self.stage.position_mm,exposure_s=self.camera.exposure_s,
+                                    temperature_c=camera.get('temperature_c'),temperature_state=camera.get('temperature_state'),
+                                    t_start_s=started,t_end_s=ended,saturated_pixels=saturated,spectrum=spectrum,source_mode=self.devices.mode)
                         with self.lock:run['acquired_frames']+=1
                         step('committing')
                         if fault=='write_failure' and not writer:raise OSError('Injected storage failure (memory-only run)')
@@ -346,9 +394,14 @@ class Engine:
                     if self.pause.is_set() and not (round_index==plan['rounds']-1 and point_index==len(plan['delays_ps'])-1):
                         drain(wait=True)
                         with self.lock:run['status']='paused';run['step']='paused'
+                        event=transition('paused')
+                        if writer:writer.submit('event',event)
                         self.emit('run.state',self.public_run(run))
                         while self.pause.is_set():self.wait(.05,1)
                         with self.lock:run['status']='running'
+                        event=transition('running')
+                        if writer:writer.submit('event',event)
+                with self.lock:run['completed_rounds']=round_index+1
             drain(wait=True)
             if self.stop.is_set():raise Cancelled()
         except Cancelled:
@@ -356,7 +409,7 @@ class Engine:
         except Exception as exc:
             if isinstance(exc,HardwareError):self.hardware_failure(exc)
             terminal='error';run['error']=str(exc)
-            self.emit('run.error',dict(message=str(exc),committed_frames=len(run['records'])))
+            self.emit('run.error',dict(message=str(exc),committed_frames=len(run['frames'])))
         finally:
             # Stop/pause acknowledge every already-acquired queued frame. Failed
             # writes expose only the successfully committed contiguous prefix.
@@ -366,19 +419,37 @@ class Engine:
                 if terminal=='completed' and self.stop.is_set():terminal='stopped'
                 run['status']='finalizing';run['step']='finalizing'
             self.emit('run.state',self.public_run(run))
+            # Only whole rounds are kept when a scan is stopped: the round in progress is dropped, in memory
+            # and in the file, so every stored round covers the full delay range.
+            per_round=len(plan['delays_ps'])*request['frames_per_point']
+            whole=len(run['frames'])//per_round;message=run['error']
+            if terminal=='stopped':
+                keep=whole*per_round;dropped=len(run['frames'])-keep
+                try:
+                    if writer and dropped:writer.call('truncate',keep)
+                    with self.lock:
+                        run['frames'].truncate(keep);run['committed_frames']=run['acquired_frames']=keep
+                        run['completed_points']=whole*len(plan['delays_ps']);run['dropped_frames']=dropped
+                        self.revision+=1
+                    message=f"Stopped after {whole} complete round{'s' if whole!=1 else ''}"+(f'; the {dropped} frames of round {whole+1} were discarded' if dropped else '')
+                except Exception as exc:
+                    terminal='error';run['error']=message=f'Could not drop the unfinished round: {exc}'
+            with self.lock:run['completed_rounds']=whole
+            ended=now();event=transition(terminal,message)
             try:
                 if writer:
-                    try:writer.call('event',dict(type='run.terminal',status=terminal,error=run['error'],timestamp_utc=now()))
+                    try:writer.call('event',event)
                     except Exception as exc:
                         terminal='error';run['error']=f'Event write failed: {exc}'
-                    run['path']=writer.call('close',terminal)
+                    run['path']=writer.call('close',dict(status=terminal,ended_utc=ended,completed_rounds=whole))
                     run['writer_stats']=dict(writer.stats)
                     run['saved']=True
             except Exception as exc:
                 terminal='error';run['error']=(run['error']+'; ' if run['error'] else '')+f'Finalization failed: {exc}'
                 run['path']=str(writer.partial) if writer else run['path']
             with self.lock:
-                run.pop('writer',None);run['status']=terminal;run['step']='idle';run['ended_utc']=now()
+                run.pop('writer',None);run['status']=terminal;run['step']='idle';run['ended_utc']=ended
+                run['metadata']['root'].update(ended_utc=ended,terminal_status=terminal,completed_rounds=whole)
             self.emit('run.state',self.public_run(run))
 
     def preview(self):
@@ -424,11 +495,23 @@ class Engine:
         self.emit('stage.position',self.stage_state())
 
     def acquire_background(self,data):
-        exposure=self.camera.exposure_s
-        if self.devices.mode=='simulation':self.wait(exposure,50)
-        counts,_=self.acquire_counts(0,849,0,exposure,self.spectrograph['center_nm'],dark=data['kind']=='dark',optical_background=data['kind']=='optical_background')
+        # The mean of several frames lowers the noise the subtraction adds; Stop keeps the frames already taken.
+        exposure=self.camera.exposure_s;wanted=int(data.get('frames',1));total=None;taken=0
+        with self.lock:self.background_progress=dict(frames=0,total=wanted)
+        try:
+            for index in range(wanted):
+                if self.stop.is_set():break
+                try:
+                    if self.devices.mode=='simulation':self.wait(exposure,50)
+                    counts,_=self.acquire_counts(0,849,index,exposure,self.spectrograph['center_nm'],dark=data['kind']=='dark',optical_background=data['kind']=='optical_background')
+                except (Cancelled,AcquisitionCancelled):break  # Stop during an exposure keeps the frames already averaged
+                counts=np.asarray(counts,dtype=float);total=counts if total is None else total+counts;taken+=1
+                with self.lock:self.background_progress=dict(frames=taken,total=wanted)
+        finally:
+            with self.lock:self.background_progress=None
+        if not taken:return
         with self.lock:
-            self.background=dict(spectrum=counts,exposure_s=exposure,kind=data['kind'],condition=data['condition'],source_mode=self.devices.mode,
+            self.background=dict(spectrum=(total/taken).tolist(),frames=taken,exposure_s=exposure,kind=data['kind'],condition=data['condition'],source_mode=self.devices.mode,
                                  revision=self.revision,temperature_c=self.camera.capabilities().get('temperature_c'),read_mode=getattr(self.camera,'readout',{}).get('mode','fvb'),timestamp_utc=now())
         self.emit('background.ready',self.background)
 
@@ -597,13 +680,19 @@ class Engine:
             path=None;writer=None
             self.set_exposure(request.exposure_s)
             plan=self.make_scan_plan(request)
-            metadata=self.metadata(data,plan,run_id);metadata['config']['center_nm']=self.spectrograph['center_nm']
+            # Every time column in the file counts seconds from this instant.
+            created=datetime.now(timezone.utc)
+            metadata=self.metadata(request.model_dump(),plan,run_id,created)
             if request.autosave:
                 with prepare_output(request.save_path,run_id,plan['estimated_bytes'],request.overwrite_token) as path:
                     writer=HDFWriter(path,metadata)
-            run=dict(run_id=run_id,status='preparing',step='preparing',request=data,plan=plan,records=[],
-                     metadata=metadata,path=str(path) if path else None,saved=False,created_utc=now(),ended_utc=None,
-                     acquired_frames=0,committed_frames=0,completed_points=0,error=None)
+            acquisition=metadata['acquisition']
+            frames=FrameTable(acquisition['pixels'],acquisition['exposure_s'],self.devices.mode,capacity=plan['total_frames'])
+            run=dict(run_id=run_id,status='preparing',step='preparing',request=data,plan=plan,frames=frames,
+                     metadata=metadata,path=str(path) if path else None,saved=False,created_utc=metadata['root']['created_utc'],ended_utc=None,
+                     clock_origin=created.timestamp(),
+                     acquired_frames=0,committed_frames=0,completed_points=0,current_round=0,completed_rounds=0,
+                     until_stopped=plan['until_stopped'],error=None)
             if writer:run['writer']=writer
             # Replace a memory-only experiment only after new output is ready.
             self.runs={run_id:run};self.current=run_id
@@ -637,26 +726,29 @@ class Engine:
             separate=name=='analysis_open'
             if not separate:
                 self.idle(devices=False)
-                if self.current and not self.runs[self.current]['saved'] and self.runs[self.current]['records']:raise ValueError('Save or discard the current run first')
-            metadata,records,terminal=read_run(data['path']);run_id=metadata['meta']['run_id']
+                if self.current and not self.runs[self.current]['saved'] and self.runs[self.current]['frames']:raise ValueError('Save or discard the current run first')
+            metadata,frames,terminal=read_run(data['path']);run_id=metadata['root']['run_id']
             if separate and len(self.analysis_runs)>=8:
                 active={task['run_id'] for task in self.tasks.values() if task['status']=='running'}
                 old=next((id for id in self.analysis_runs if id not in active),None)
                 if old is None:raise CommandError('Close an Analysis file or finish its fit before loading another')
                 self.analysis_runs.pop(old)
             if separate:run_id='analysis-'+uuid.uuid4().hex
-            run=dict(run_id=run_id,status=terminal,step='idle',metadata=metadata,records=records,
-                     request=metadata['config']['request'],plan=metadata['config']['plan'],path=data['path'],saved=True,
-                     acquired_frames=len(records),committed_frames=len(records),
-                     completed_points=len({(r['round_index'],r['point_index']) for r in records if r['frame_index']==metadata['config']['request']['frames_per_point']-1}),
-                     created_utc=metadata['meta']['created_utc'],ended_utc=None,error=None)
+            plan={k:metadata['acquisition'][k] for k in schema.PLAN_ARRAYS+schema.names(schema.PLAN)}
+            run=dict(run_id=run_id,status=terminal,step='idle',metadata=metadata,frames=frames,
+                     request=metadata['request'],plan=plan,path=data['path'],saved=True,
+                     acquired_frames=len(frames),committed_frames=len(frames),
+                     completed_points=frames.completed_points(metadata['request']['frames_per_point']),
+                     completed_rounds=metadata['root']['completed_rounds'] or 0,current_round=None,
+                     until_stopped=metadata['request']['mode']=='repeat' and metadata['request']['repeats']==0,
+                     created_utc=metadata['root']['created_utc'],ended_utc=metadata['root']['ended_utc'],error=None)
             if separate:
                 self.analysis_runs[run_id]=run;return self.public_run(run)
-            self.runs={run_id:run};self.current=run_id;self.latest=records[-1] if records else None;self.latest_version+=1
+            self.runs={run_id:run};self.current=run_id;self.latest=frames.record(-1) if frames else None;self.latest_version+=1
             self.latest_axis=metadata['calibration']['wavelengths_nm']
             self.set_exposure(run['request']['exposure_s'])
             return self.public_run(run)
-        if name in {'get_run','records','export','save','fit','discard','run_files_removed','analysis_close'}:
+        if name in {'get_run','records','export','save','fit','kinetics','discard','run_files_removed','analysis_close'}:
             separate=bool(data.get('analysis'))
             run=(self.analysis_runs if separate else self.runs).get(data.get('run_id',self.current))
             if not run:raise CommandError('Run not found',404)
@@ -666,30 +758,40 @@ class Engine:
                     if task['run_id']==run['run_id'] and task['status']=='running':self._handle('task_cancel',dict(task_id=id))
                 self.analysis_runs.pop(run['run_id']);return dict(closed=True)
             if name=='get_run':return self.public_run(run)
+            if name=='kinetics':
+                # The Analysis decay plot: the same selection and averaging the fit uses (whole delay range).
+                from .processing import kinetics
+                inputs=run_inputs(run);options=FitRequest(**data['options'])
+                if inputs['axis'] is None:raise CommandError('Wavelength calibration is required')
+                return kinetics(inputs['block'],inputs['axis'],options,inputs['background'],inputs['full_scale'],inputs['targets_mm'],delay_range=False)
             if name=='records':
-                offset=data.get('offset',0);limit=data.get('limit',100)
-                return dict(records=serial(run['records'][offset:offset+limit]),total=len(run['records']))
+                # A block of rows as arrays (spectra, index, delay_ps, ...); worker_main sends it without converting to lists.
+                offset=data.get('offset',0);limit=data.get('limit',2000)
+                frames=run['frames'];block=frames.block(offset,offset+limit)
+                return dict(block={k:v.copy() if isinstance(v,np.ndarray) else v for k,v in block.items()},total=len(frames))
             if name=='export':
                 if run['metadata']['calibration']['wavelengths_nm'] is None:raise CommandError('Wavelength calibration is required for export')
-                return export_csv(run['records'],run['metadata']['calibration']['wavelengths_nm'],data['center_nm'],data['half_window_nm'],run['metadata']['meta']['source_mode'])
+                inputs=run_inputs(run)
+                return export_csv(run['frames'],run['metadata']['calibration']['wavelengths_nm'],data['center_nm'],data['half_window_nm'],run['metadata']['root']['source_mode'],
+                                  inputs['background'],inputs['full_scale'],inputs['targets_mm'])
             if name=='save':
                 self.idle(devices=False)
                 with self.analysis_lock:
                     # A run whose unfinished files were moved to the Recycle Bin can be written out again.
                     if run['saved'] and not run.get('files_removed'):return self.public_run(run)
-                    with prepare_output(data.get('path'),run['run_id'],run['plan']['estimated_bytes'],data.get('overwrite_token')) as path:
+                    frames=run['frames'];estimate=run['plan'].get('estimated_bytes',len(frames)*(4096+2048))
+                    with prepare_output(data.get('path'),run['run_id'],estimate,data.get('overwrite_token')) as path:
                         writer=HDFWriter(path,run['metadata'])
+                        ended=run['ended_utc'] or now()
                         try:
-                            pending=[]
-                            for record in run['records']:
-                                pending.append(writer.submit('record',record))
-                                if len(pending)>=128:
-                                    for ack in pending:ack.result(timeout=30)
-                                    pending=[]
-                            for ack in pending:ack.result(timeout=30)
+                            for start in range(0,len(frames),1024):writer.call('rows',frames.block(start,start+1024))
+                            for event in run['metadata'].get('events',[]):writer.call('event',event)
                         except Exception:
-                            writer.call('close','error');raise
-                        run['path']=writer.call('close',run['status']);run['saved']=True;run['files_removed']=False;return self.public_run(run)
+                            writer.call('close',dict(status='error',ended_utc=ended));raise
+                        run['path']=writer.call('close',dict(status=run['status'],ended_utc=ended,completed_rounds=run.get('completed_rounds') or 0))
+                        run['saved']=True;run['files_removed']=False
+                        for result in run['metadata'].get('analysis',{}).values():result['stored']=True
+                        run['analysis_version']=run.get('analysis_version',0)+1;return self.public_run(run)
             if name=='run_files_removed':
                 # The frames stay in memory; the run still counts as handled, so a new scan can start without a prompt.
                 run['files_removed']=True;run['path']=None;self.revision+=1;return self.public_run(run)
@@ -699,25 +801,29 @@ class Engine:
                 if not separate:self.idle(devices=False)
                 self.prune_tasks()
                 if sum(t['status']=='running' for t in self.tasks.values())>=4:raise CommandError('Four fit tasks are already running or queued; wait or cancel a task')
-                if not run['saved'] and len(run['metadata'].get('analysis',{}))+sum(t['status']=='running' and t.get('run_id')==run['run_id'] for t in self.tasks.values())>=64:
+                # A stopped run whose files went to the Recycle Bin keeps saved=True but has no file to append to.
+                on_disk=bool(run['saved'] and run.get('path') and not run.get('files_removed'))
+                if not on_disk and len(run['metadata'].get('analysis',{}))+sum(t['status']=='running' and t.get('run_id')==run['run_id'] for t in self.tasks.values())>=64:
                     raise CommandError('Save this memory-only experiment before creating more than 64 fit results')
                 options=FitRequest(**data['options']);task_id=uuid.uuid4().hex[:16]
-                records=list(run['records']);axis=copy.deepcopy(run['metadata']['calibration']['wavelengths_nm'])
+                inputs=run_inputs(run);count=len(inputs['block']['delay_ps'])
                 self.tasks[task_id]=dict(status='running',run_id=run['run_id'])
                 cancel=Event();self.task_controls[task_id]=dict(cancel=cancel)
                 def fit():
                     try:
-                        result=fit_records(records,axis,options,cancel=cancel)
+                        result=fit_run(inputs['block'],inputs['axis'],options,inputs['background'],inputs['full_scale'],inputs['targets_mm'],cancel=cancel)
                         result['request']=options.model_dump()
                         result['run_id']=run['run_id'];result['task_id']=task_id
-                        result['record_count']=len(records)
+                        result['record_count']=count
                         result['finished_utc']=now()
+                        # Whether the fit is in the experiment file: fits on a file opened in Analysis stay in memory.
+                        result['stored']=bool(on_disk and not separate)
                         if cancel.is_set():raise ValueError('Fit cancelled')
                         with self.analysis_lock:
-                            if run['saved'] and not separate:append_analysis(run['path'],task_id,result)
+                            if on_disk and not separate:append_analysis(run['path'],task_id,result)
                             with self.lock:
                                 history=run['metadata'].setdefault('analysis',{});history[task_id]=result;run['analysis_version']=run.get('analysis_version',0)+1
-                                if run['saved']:
+                                if on_disk:
                                     while len(history)>64:history.pop(next(iter(history)))
                             self.tasks[task_id]=dict(status='completed',run_id=run['run_id'],result=result)
                     except Exception as exc:self.tasks[task_id]=dict(status='cancelled' if cancel.is_set() else 'error',run_id=run['run_id'],error=str(exc))
@@ -770,6 +876,7 @@ def worker_main(commands,responses,events):
             return
         try:
             result=engine.handle(message['name'],message['data'])
-            responses.put(dict(id=message['id'],result=serial(result)))
+            # Frame blocks keep their NumPy arrays: the queue pickles them far faster than lists of numbers.
+            responses.put(dict(id=message['id'],result=result if message['name']=='records' else serial(result)))
         except Exception as exc:
             responses.put(dict(id=message['id'],error=str(exc),error_type=type(exc).__name__,status_code=error_status(exc,message['name'])))

@@ -5,6 +5,9 @@ from PySide6.QtCore import QObject,QTimer,Signal
 from .state import Dataset
 from .bridge import BackendBridge
 
+# Frames per 'records' request: one block of arrays (about 8 MB of full-chip spectra).
+PAGE_FRAMES=2000
+
 class Controller(QObject):
     snapshotChanged=Signal(dict)
     stateChanged=Signal()
@@ -130,6 +133,13 @@ class Controller(QObject):
             self._invalidate_fits_for_dataset(self.acquisition)
             self.acquisition=Dataset(run=run,wave=wave,half_window=half)
             self._records_inflight=None; self._record_failed=None
+        elif isinstance(run,dict) and int(run.get('committed_frames') or 0)<len(self.acquisition.records):
+            # A stopped scan dropped its unfinished round: rebuild from the frames the worker kept.
+            wave=self.acquisition.wave; half=self.acquisition.half_window
+            self._invalidate_fits_for_dataset(self.acquisition)
+            self.acquisition=Dataset(run=run,wave=wave,half_window=half)
+            self._records_inflight=None; self._record_failed=None
+            changed=True
         elif isinstance(run,dict):
             self.acquisition.run=run
         elif current is not None:
@@ -159,8 +169,8 @@ class Controller(QObject):
             if dataset is not self.acquisition or dataset.run is None or dataset.run.get('run_id')!=run_id:
                 return
             self._records_inflight=None
-            records=page.get('records',[]) if isinstance(page,dict) else []
-            added=dataset.append_records(records)
+            block=page.get('block') if isinstance(page,dict) else None
+            added=dataset.append_block(block) if isinstance(block,dict) else 0
             total=page.get('total',len(dataset.records)) if isinstance(page,dict) else len(dataset.records)
             self._record_failed=None
             self.dataChanged.emit()
@@ -177,7 +187,7 @@ class Controller(QObject):
             code=payload.get('status_code') if isinstance(payload,dict) else None
             if code in {404,409}:
                 self.request_status()
-        token=self.dispatch('records',{'run_id':run_id,'analysis':False,'offset':offset,'limit':200},success=success,failure=failure)
+        token=self.dispatch('records',{'run_id':run_id,'analysis':False,'offset':offset,'limit':PAGE_FRAMES},success=success,failure=failure)
         self._records_inflight=token
     def open_analysis_file(self,path,success=None,failure=None):
         self._analysis_generation+=1; generation=self._analysis_generation
@@ -208,10 +218,10 @@ class Controller(QObject):
         def page_ok(page):
             if generation!=self._analysis_generation:
                 self.dispatch('analysis_close',{'run_id':run_id,'analysis':True}); return
-            records=page.get('records',[]) if isinstance(page,dict) else []
-            dataset.append_records(records)
+            block=page.get('block') if isinstance(page,dict) else None
+            added=dataset.append_block(block) if isinstance(block,dict) else 0
             total=page.get('total',len(dataset.records)) if isinstance(page,dict) else len(dataset.records)
-            if len(dataset.records)<int(total or 0) and records:
+            if len(dataset.records)<int(total or 0) and added:
                 self._load_analysis_page(dataset,run_id,generation,len(dataset.records),success,failure)
                 return
             if len(dataset.records)<int(total or 0):
@@ -226,7 +236,7 @@ class Controller(QObject):
         def page_fail(payload):
             message=payload.get('message') if isinstance(payload,dict) else str(payload)
             self._open_failed(generation,failure,'Could not load Analysis records: '+message,run_id)
-        self.dispatch('records',{'run_id':run_id,'analysis':True,'offset':offset,'limit':200},success=page_ok,failure=page_fail)
+        self.dispatch('records',{'run_id':run_id,'analysis':True,'offset':offset,'limit':PAGE_FRAMES},success=page_ok,failure=page_fail)
     def close_analysis(self,success=None,failure=None):
         dataset=self.analysis_imported
         if dataset is None:
@@ -300,7 +310,12 @@ class Controller(QObject):
                 if status=='completed' and result.get('result') is not None:
                     current_ok=(dataset is self.acquisition) or (dataset is self.analysis_imported)
                     if current_ok and dataset.run and dataset.run.get('run_id')==job['run_id']:
-                        dataset.fit=result.get('result'); self.dataChanged.emit(); self.analysisChanged.emit(); self.fitReady.emit(scope,result.get('result'))
+                        dataset.fit=result.get('result')
+                        # The new fit joins the experiment's fit history at once (the next snapshot carries it too).
+                        if isinstance(dataset.run,dict) and isinstance(dataset.fit,dict) and dataset.fit.get('task_id'):
+                            metadata=dataset.run.setdefault('metadata',{})
+                            if isinstance(metadata,dict):metadata.setdefault('analysis',{})[dataset.fit['task_id']]=dataset.fit
+                        self.dataChanged.emit(); self.analysisChanged.emit(); self.fitReady.emit(scope,result.get('result'))
                 else:
                     message=result.get('error') if isinstance(result,dict) else None
                     message=message or ('Fit cancelled' if status=='cancelled' else 'Fit task failed')
