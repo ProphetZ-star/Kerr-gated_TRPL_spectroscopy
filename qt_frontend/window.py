@@ -1381,6 +1381,13 @@ class MainWindow(QMainWindow):
         self.analysis_time_key.hide()
         self._reg('analysisTimeKey', self.analysis_time_key, False)
         panel.add_tool(self.analysis_time_key)
+        # Decay & fit in counts per pixel of one frame (as on the TRPL map) or per second of exposure.
+        self.analysis_unit = Segmented([('counts', 'counts'), ('counts/s', 'rate')])
+        self.analysis_unit.set_selected('counts')
+        self.analysis_unit.setToolTip('counts: per pixel of one frame, like the TRPL decay · counts/s: divided by the exposure, so exposures compare')
+        self.analysis_unit.changed.connect(lambda value: self._redraw_analysis())
+        self._reg('analysisUnit', self.analysis_unit, False)
+        panel.add_tool(self.analysis_unit)
         self.analysis_scale = Segmented([('Linear', 'linear'), ('Log Y', 'log')])
         self.analysis_scale.set_selected('linear')
         self.analysis_scale.changed.connect(lambda value: self._redraw_analysis())
@@ -1455,13 +1462,14 @@ class MainWindow(QMainWindow):
         self._reg('fitSampleCount', self.fit_sample_count, False)
         self._reg('fitRmse', self.fit_rmse, False)
         self._reg('fitCondition', self.fit_condition, False)
-        for label_text, value in [('Samples', self.fit_sample_count), ('Frames used', self.fit_frames_used), ('RMSE / counts·s⁻¹', self.fit_rmse), ('Jacobian condition', self.fit_condition)]:
+        for label_text, value in [('Samples', self.fit_sample_count), ('Frames used', self.fit_frames_used), ('RMSE / counts', self.fit_rmse), ('Jacobian condition', self.fit_condition)]:
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(8)
             caption = QLabel(label_text)
             caption.setProperty('muted', True)
+            if value is self.fit_rmse:self.fit_rmse_key = caption
             row_layout.addWidget(caption)
             row_layout.addStretch(1)
             row_layout.addWidget(value)
@@ -2395,12 +2403,15 @@ class MainWindow(QMainWindow):
         if self._selected_delay is None and dataset.delays:
             self._selected_delay = dataset.delays[0]
         delays, intensities = self._raw_decay_points(dataset)
+        baseline, basis = self._decay_baseline(dataset, dataset.wave, delays, intensities)
         extra = []
         for pin in self._decay_pins:
             pin_delays, pin_values = self._raw_decay_points(dataset, pin['wave'])
-            extra.append((pin['key'], pin['label'], pin['color'], pin_delays, pin_values))
+            extra.append((pin['key'], pin['label'], pin['color'], pin_delays, pin_values, self._decay_baseline(dataset, pin['wave'], pin_delays, pin_values)[0]))
         self.decay_plot.set_decay(delays, intensities, 'linear', key='decay_main', extra=extra, normalize=self.decay_normalize.isChecked(),
-                                  label=f'{float(dataset.wave):.1f} nm' if extra else None)
+                                  label=f'{float(dataset.wave):.1f} nm' if extra else None, baseline=baseline)
+        self.decay_normalize.setToolTip('Scale each decay as (I − B) / (max − B), so it runs from 0 before time zero to 1 at its peak. '
+                                        f'B, the baseline: {basis}.')
         self._sync_pins()
         self._update_decay_legend(dataset)
         self.map_plot.set_marker(self._selected_delay, dataset.wave if dataset.records else None, show_delay=self._picked_spectrum_active())
@@ -2540,13 +2551,29 @@ class MainWindow(QMainWindow):
         if label.text() != text:label.setText(text)
         visible = bool(dataset.records)
         self.decay_legend.setVisible(visible); self.decay_normalize.setVisible(visible and bool(self._decay_pins))
+    PRE_ZERO_PS = -0.3  # delays at or before this are taken as "before time zero" (clear of the IRF rise)
+    def _decay_window(self, dataset, wave):
+        axis = dataset.axis
+        return [index for index, value in enumerate(axis) if abs(value - wave) <= dataset.half_window] if axis else None
+    def _decay_baseline(self, dataset, wave, delays, values):
+        '''(B, how it was taken) for normalizing one decay: the run's recorded background in the same wavelength
+        window (offset, dark and stray light, as Analysis subtracts it); without one the mean of the points before
+        time zero; with neither, the lowest point.'''
+        background = (((dataset.run or {}).get('metadata') or {}).get('background') or {}).get('spectrum')
+        indices = self._decay_window(dataset, wave)
+        if background and indices and max(indices) < len(background):
+            return float(np.mean(np.asarray(background, dtype=float)[indices])), 'the recorded background in the same wavelength window'
+        early = [value for delay, value in zip(delays, values) if delay <= self.PRE_ZERO_PS]
+        if early:
+            return float(np.mean(early)), f'no background recorded, so the mean of the {len(early)} points at or before {self.PRE_ZERO_PS:g} ps'
+        if values:
+            return float(np.min(values)), 'no background and no points before time zero, so the lowest point'
+        return 0.0, 'none'
     def _raw_decay_points(self, dataset, wave=None):
         axis = dataset.axis
         wave = dataset.wave if wave is None else wave
         half = dataset.half_window
-        indices = None
-        if axis:
-            indices = [index for index, value in enumerate(axis) if abs(value - wave) <= half]
+        indices = self._decay_window(dataset, wave)
         delays = []
         intensities = []
         for delay in dataset.delays:
@@ -3087,6 +3114,7 @@ class MainWindow(QMainWindow):
             return
         view = self.analysis_view.currentData()
         scale = self.analysis_scale.current()
+        self.analysis_unit.setVisible(view != 'spectrum')  # the spectra view stays in counts / s
         delays = dataset.delays
         if view == 'spectrum':
             curves = []
@@ -3141,10 +3169,16 @@ class MainWindow(QMainWindow):
         fit_points = self._fit_curve_points(fit)
         self.analysis_plot_title.setText('Decay & fit')
         self.analysis_window_label.setText(f'{dataset.wave:g} ± {dataset.half_window:g} nm' + (' · background subtracted' if options['subtract_background'] else ''))
-        self.analysis_curve.set_decay(observed, fit_points, scale, rounds=rounds, left_out=left_out)
+        # Processing and fits work in counts per second (exposures compare); the plot shows counts per pixel of one
+        # frame, like the TRPL decay on the Acquisition page.
+        factor = self._counts_per_rate(dataset) if self.analysis_unit.current() == 'counts' else 1.0
+        counts = lambda points: [(float(t), float(v) * factor) for t, v in points or []]
         residuals = self._fit_residual_points(fit, observed, fit_points)
-        self.analysis_residual.set_points(residuals)
-        self._update_fit_panel(fit, observed)
+        self.analysis_curve.set_decay(counts(observed), counts(fit_points), scale, unit='counts / pixel' if self.analysis_unit.current() == 'counts' else 'counts / s',
+                                      rounds=[(index, t, [float(v) * factor for v in values]) for index, t, values in rounds] if rounds else None,
+                                      left_out=counts(left_out))
+        self.analysis_residual.set_points(counts(residuals))
+        self._update_fit_panel(fit, observed, factor)
         if observed:
             self.analysis_curve.set_marker(observed[0][0])
             self.analysis_residual.set_marker(observed[0][0])
@@ -3231,12 +3265,27 @@ class MainWindow(QMainWindow):
                 output.append((float(delay), float(intensity) - model))
             return output
         return []
+    @staticmethod
+    def _counts_per_rate(dataset):
+        '''Seconds of exposure per frame: counts / s x this = counts per pixel of one frame.'''
+        run = getattr(dataset, 'run', None) or {}
+        for source in (((run.get('metadata') or {}).get('acquisition') or {}), run.get('request') or {}):
+            try:
+                value = float(source.get('exposure_s'))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                return value
+        return 1.0
+    COUNT_PARAMETERS = ('amplitude', 'amplitude_1', 'amplitude_2', 'offset_counts_s')
     def _fit_parameters(self,fit):
         if not isinstance(fit,dict):return []
         names={'tau_ps':('τ','ps'),'tau_1_ps':('τ₁','ps'),'tau_2_ps':('τ₂','ps'),'amplitude':('Amplitude','counts/s'),'amplitude_1':('Amplitude 1','counts/s'),'amplitude_2':('Amplitude 2','counts/s'),'t0_ps':('t₀','ps'),'offset_counts_s':('Offset','counts/s')}
         spread=fit.get('round_spread') or {}
-        return [(label,fit['parameters'][key],fit.get('standard_errors',{}).get(key),unit,spread.get(key)) for key,(label,unit) in names.items() if key in fit.get('parameters',{})]
-    def _update_fit_panel(self, fit, observed):
+        return [(label,fit['parameters'][key],fit.get('standard_errors',{}).get(key),unit,spread.get(key),key) for key,(label,unit) in names.items() if key in fit.get('parameters',{})]
+    def _update_fit_panel(self, fit, observed, factor=1.0):
+        '''factor converts the fit's counts / s to the counts per pixel the plot shows (amplitudes, offset, RMSE).'''
+        self.fit_rmse_key.setText('RMSE / counts' if self.analysis_unit.current() == 'counts' else 'RMSE / counts·s⁻¹')
         self.fit_table.clearSpans()
         self.fit_table.setRowCount(0)
         parameters = self._fit_parameters(fit)
@@ -3262,7 +3311,9 @@ class MainWindow(QMainWindow):
             return
         self.fit_table.setRowCount(len(parameters))
         for row, parameter in enumerate(parameters):
-            name, value, error, unit, spread = parameter
+            name, value, error, unit, spread, key = parameter
+            if key in self.COUNT_PARAMETERS and self.analysis_unit.current() == 'counts':
+                value, error, spread = (None if v is None else float(v) * factor for v in (value, error, spread)); unit = 'counts / pixel'
             for column, text in enumerate((str(name), fmt(value, 6), fmt(error, 6)) + ((fmt(spread, 6) if spread is not None else '—',) if between else ()) + (str(unit or ''),)):
                 cell = QTableWidgetItem(text); cell.setTextAlignment(Qt.AlignCenter)
                 self.fit_table.setItem(row, column, cell)
@@ -3272,7 +3323,7 @@ class MainWindow(QMainWindow):
             rmse=float(np.sqrt(np.mean(np.square(fit['residuals']))))
         condition = fit.get('condition_number', fit.get('jacobian_condition')) if isinstance(fit, dict) else None
         self.fit_sample_count.setText(str(samples))
-        self.fit_rmse.setText(fmt(rmse, 5))
+        self.fit_rmse.setText(fmt(None if rmse is None else float(rmse) * factor, 5))
         self.fit_condition.setText(fmt(condition, 5))
         warnings = fit.get('warnings') if isinstance(fit, dict) else None
         warning_text = '; '.join(str(item) for item in warnings) if isinstance(warnings, list) else str(warnings or '')

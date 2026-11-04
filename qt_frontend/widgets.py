@@ -60,7 +60,8 @@ class _SpinEditorGeometry:
         # (a disabled box showed no value); place it once Qt has finished.
         super().changeEvent(event)
         if event.type() in (QEvent.EnabledChange,QEvent.StyleChange,QEvent.FontChange,QEvent.PaletteChange):
-            self._place_editor();QTimer.singleShot(0,self._place_editor)
+            # The box is the timer's context: a box deleted meanwhile (a closed dialog) is never called.
+            self._place_editor();QTimer.singleShot(0,self,self._place_editor)
 class NativeSpinBox(_SpinEditorGeometry,QSpinBox):pass
 class NativeDoubleSpinBox(_SpinEditorGeometry,QDoubleSpinBox):
     def textFromValue(self,value):

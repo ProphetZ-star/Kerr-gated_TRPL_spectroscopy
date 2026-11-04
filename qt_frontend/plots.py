@@ -41,6 +41,19 @@ def nice_step(span, target, integer=False):
     fitting = [value for value in candidates if value <= raw * 1.25]
     return max(fitting) if fitting else min(candidates)
 
+def padded_range(values, low_pad=.05, high_pad=.1):
+    '''Automatic axis range from the data at both ends (no end pinned to 0): a margin below the lowest and above
+    the highest value, as fractions of the span.'''
+    values = np.asarray([v for v in values if v is not None], dtype=float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return 0.0, 1.0
+    low, high = float(values.min()), float(values.max())
+    span = high - low if high > low else (abs(high) * .1 or 1.0)
+    # The margin never takes an all-positive range (counts) below zero.
+    bottom = low - span * low_pad
+    return (0.0 if low >= 0 > bottom else bottom), high + span * high_pad
+
 def _decimals(step):
     for digits in range(7):
         scaled = step * 10 ** digits
@@ -1602,9 +1615,10 @@ class DecayPlot(EditablePlot):
                 self.delayPicked.emit(float(point.y()))
         except Exception:
             pass
-    def set_decay(self, delays, intensities, scale='linear', key=None, extra=None, normalize=False, label=None):
+    def set_decay(self, delays, intensities, scale='linear', key=None, extra=None, normalize=False, label=None, baseline=None):
         '''The decay at the marked wavelength (legend key `key`), and extra decays [(key, label, palette colour
-        key, delays, values)] at pinned wavelengths. normalize scales each to its own maximum, to compare shapes.'''
+        key, delays, values, baseline)] at pinned wavelengths. normalize scales each as (I - B) / (max - B) with its
+        own baseline B, so every decay runs from 0 before time zero to 1 at its peak and the shapes compare.'''
         self.set_empty('No data' if not delays else '')
         self._label = label
         for item in self._items:
@@ -1613,20 +1627,23 @@ class DecayPlot(EditablePlot):
             except Exception:
                 pass
         self._items = []
-        def scaled(values):
+        def scaled(values, base):
             values = np.asarray(values, dtype=float)
-            top = np.nanmax(values) if values.size else math.nan
-            return values / top if normalize and math.isfinite(top) and top > 0 else values
+            if not normalize or not values.size:
+                return values
+            base = float(base) if base is not None and math.isfinite(float(base)) else 0.0
+            span = float(np.nanmax(values)) - base
+            return (values - base) / span if math.isfinite(span) and span > 0 else values
         pairs = []
-        for delay, intensity in zip(delays, scaled(intensities)):
+        for delay, intensity in zip(delays, scaled(intensities, baseline)):
             if math.isfinite(float(delay)) and math.isfinite(float(intensity)):
                 pairs.append((float(intensity), float(delay)))
         self._delays = [item[1] for item in pairs]
         self._intensities = [item[0] for item in pairs]
         self.set_x_label('normalized' if normalize else 'counts / pixel')
         colors = palette(); self._extra = []; spread = []
-        for extra_key, label, color, extra_delays, values in extra or []:
-            ex = scaled(values); ey = np.asarray(extra_delays, dtype=float); keep = np.isfinite(ex) & np.isfinite(ey)
+        for extra_key, label, color, extra_delays, values, extra_baseline in extra or []:
+            ex = scaled(values, extra_baseline); ey = np.asarray(extra_delays, dtype=float); keep = np.isfinite(ex) & np.isfinite(ey)
             if not keep.any():continue
             item = self.plotItem.plot(ex[keep], ey[keep], antialias=True, pen=pg.mkPen(colors[color], width=1.3), symbol='o', symbolSize=4,
                                       symbolBrush=pg.mkBrush(colors[color]), symbolPen=pg.mkPen(colors[color]))
@@ -1647,7 +1664,8 @@ class DecayPlot(EditablePlot):
         self.set_axis_bounds('y', min(ys), max(ys))
         try:
             values = np.concatenate([xs, np.asarray(spread, dtype=float)])
-            self.set_axis_bounds('x', min(0, float(values.min())), (1.0 if normalize else max(1, float(values.max()))) * 1.1)
+            low, high = padded_range(values)
+            self.set_axis_bounds('x', low, max(high, 1.05) if normalize else high)
         except Exception:
             pass
     def set_marker(self, delay=None):
@@ -1702,7 +1720,7 @@ class AnalysisCurvePlot(EditablePlot):
             except Exception:
                 pass
         self._items = []
-    def set_decay(self, observed, fit=None, scale='linear', rounds=None, left_out=None):
+    def set_decay(self, observed, fit=None, scale='linear', rounds=None, left_out=None, unit='counts / pixel'):
         '''observed and fit as (delay, value) pairs; rounds as [(round_index, delays, values)] drawn behind the
         average, each round in its own colour; left_out as (delay, value) pairs of excluded points, drawn hollow in the warning colour.'''
         self.set_empty('Open an experiment to view its decay' if not observed else '')
@@ -1758,12 +1776,15 @@ class AnalysisCurvePlot(EditablePlot):
         self.point.setVisible(False)
         self.marker.setVisible(False)
         self.set_x_label('Delay / ps')
-        self.set_y_label('counts / s')
+        self.set_y_label(unit)
         limits=[v for _,v in self._observed]+[v for _,v in fit_points]+extra
-        if scale=='log':limits=[math.log10(v) for v in limits if v>0]
-        low=math.floor(min(limits)) if limits and scale=='log' else 0;high=max(limits,default=1)
-        if high<=low:high=low+1
-        self.set_axis_bounds('y',low,high+(high-low)*.1)
+        if scale=='log':
+            limits=[math.log10(v) for v in limits if v>0]
+            low=math.floor(min(limits)) if limits else 0;high=max(limits,default=1)
+            if high<=low:high=low+1
+            self.set_axis_bounds('y',low,high+(high-low)*.1)
+        else:
+            self.set_axis_bounds('y',*padded_range(limits))
         if self._observed:
             self.set_marker(self._observed[0][0])
         else:
@@ -1806,9 +1827,12 @@ class AnalysisCurvePlot(EditablePlot):
         else:
             self.set_axis_bounds('x', xmin, xmax)
         try:
-            valid=[math.log10(v) for v in values if v>0] if scale=='log' else values
-            low=math.floor(min(valid)) if valid and scale=='log' else 0
-            high=max(valid,default=1);self.set_axis_bounds('y',low,max(low+1,high+(high-low)*.1))
+            if scale=='log':
+                valid=[math.log10(v) for v in values if v>0]
+                low=math.floor(min(valid)) if valid else 0
+                high=max(valid,default=1);self.set_axis_bounds('y',low,max(low+1,high+(high-low)*.1))
+            else:
+                self.set_axis_bounds('y',*padded_range(values))
         except Exception:
             pass
     def set_marker(self, delay=None):
@@ -2045,7 +2069,7 @@ class CalibrationProfilePlot(EditablePlot):
                 line = pg.InfiniteLine(pos=float(reference), angle=90, movable=False, pen=pg.mkPen(colors['amber'], width=1, style=Qt.DashLine))
                 self.plotItem.addItem(line); self.tag_series(line, 'references')
                 self._items.append(line)
-                label=pg.TextItem('L'+str(index+1),color=colors['muted'],anchor=(.5,0));font=QFont('Segoe UI');font.setPixelSize(11);label.setFont(font);label.setPos(float(reference),max(1,float(values.max()))*1.18);self.plotItem.addItem(label);self.tag_series(label,'references');self._items.append(label)
+                label=pg.TextItem('L'+str(index+1),color=colors['muted'],anchor=(.5,0));font=QFont('Segoe UI');font.setPixelSize(11);label.setFont(font);label.setPos(float(reference),padded_range(values, high_pad=.12)[1]);self.plotItem.addItem(label);self.tag_series(label,'references');self._items.append(label)
                 nearest=int(np.argmin(np.abs(x-float(reference))));point=self.plotItem.plot([x[nearest]],[values[nearest]],antialias=True,pen=None,symbol='o',symbolSize=5,symbolBrush=colors['data'],symbolPen=None);self.tag_series(point,'references');self._items.append(point)
             except Exception:
                 pass
@@ -2053,7 +2077,8 @@ class CalibrationProfilePlot(EditablePlot):
         self.set_y_label('CCD / counts')
         self.set_axis_bounds('x', float(np.nanmin(x)), float(np.nanmax(x)))
         try:
-            self.set_axis_bounds('y',0,max(1,float(values.max()))*1.18)
+            # Room above the spectrum for the reference-line labels.
+            self.set_axis_bounds('y',*padded_range(values, high_pad=.2))
         except Exception:
             pass
 
