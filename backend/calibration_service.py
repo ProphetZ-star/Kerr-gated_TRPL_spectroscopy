@@ -25,6 +25,7 @@ class CalibrationWorkbench:
         self.instrument=dict(driver='oriel_77400_manual',model='Oriel 77400 / MS125')
         self.directory = Path(os.environ.get('KERR_STATE_DIR', Path(__file__).resolve().parents[1] / 'data'))
         self.path = self.directory / 'installed-calibration.json'
+        self.response_path = self.directory / 'installed-response.json'
         with _LOCKS_GUARD:self.persistence_lock=_LOCKS.setdefault(str(self.path.resolve()),RLock())
         self.frame = None
         self.solutions = {}
@@ -32,6 +33,7 @@ class CalibrationWorkbench:
 
     def set_mode(self,mode):
         self.path=self.directory/('installed-calibration.json' if mode=='hardware' else 'installed-simulation-calibration.json')
+        self.response_path=self.directory/('installed-response.json' if mode=='hardware' else 'installed-simulation-response.json')
         with _LOCKS_GUARD:self.persistence_lock=_LOCKS.setdefault(str(self.path.resolve()),RLock())
         self.warning=None
 
@@ -94,6 +96,28 @@ class CalibrationWorkbench:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def persist_response(self, response, spectrograph):
+        '''Save the installed intensity response (or an empty one) with the settings it was made for.'''
+        self.directory.mkdir(parents=True, exist_ok=True)
+        payload = dict(version=1, response=response, spectrograph=spectrograph, instrument=self.instrument)
+        temporary = self.response_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+        os.replace(temporary, self.response_path)
+
+    def restore_response(self, spectrograph):
+        '''The saved response if it still applies: same spectrometer; a measured one also needs the same settings
+        (it carries the setup's pixel-dependent throughput), an imported one depends on wavelength only.'''
+        try:
+            payload = json.loads(self.response_path.read_text(encoding='utf-8'))
+            response = payload['response']
+            if payload['version'] != 1 or not self.instrument_matches(payload) or not response or not response.get('values'):
+                return None
+            if response.get('source') == 'measured' and payload['spectrograph'] != spectrograph:
+                return None
+            return response
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def invalidate(self):
         self.frame = None

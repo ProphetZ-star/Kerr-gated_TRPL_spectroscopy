@@ -18,8 +18,12 @@ def _number(value):
     return value if math.isfinite(value) else None
 
 
-def prescan_issues(snapshot, request):
-    '''[(kind, title, detail)] for a scan about to start with this request.'''
+def _size(nbytes):
+    return f'{nbytes / 1024 ** 3:.1f} GB' if nbytes >= 1024 ** 3 else f'{nbytes / 1024 ** 2:.0f} MB'
+
+
+def prescan_issues(snapshot, request, plan=None):
+    '''[(kind, title, detail)] for a scan about to start with this request (plan: its latest scan plan, if any).'''
     snapshot = snapshot or {}; issues = []
     exposure = _number(request.get('exposure_s'))
     background = snapshot.get('background') or {}
@@ -39,6 +43,12 @@ def prescan_issues(snapshot, request):
     elif state in UNSETTLED:
         issues.append(('temperature', 'CCD temperature not stable',
                        f'The chip is {UNSETTLED[state]}{now}. Frames taken before it settles are marked as unstable; Analysis can leave them out.'))
+    plan = plan or {}
+    need = _number(plan.get('estimated_memory_bytes')); usable = _number(plan.get('usable_memory_bytes'))
+    if need and usable is not None and need > usable:
+        issues.append(('memory', 'Not enough free memory for the whole scan',
+                       f'The frames take about {_size(need)} and {_size(usable)} is free. The scan will stop by itself when memory runs low, '
+                       'keeping every complete point.'))
     if snapshot.get('source_mode') == 'hardware':
         calibration = snapshot.get('calibration') or {}
         if not calibration.get('wavelengths_nm') or calibration.get('source') != 'measured':

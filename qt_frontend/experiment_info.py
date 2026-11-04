@@ -189,6 +189,17 @@ def sections(run, quality=None):
         ('Wavelengths', {'air': 'Air', 'vacuum': 'Vacuum'}.get(calibration.get('convention'), calibration.get('convention'))),
         ('Installed', local_time(calibration.get('installed_utc'))),
     ]))
+    response = calibration.get('response') or []
+    grid = calibration.get('response_wavelengths_nm') or []
+    defined = [w for w, v in zip(grid, response) if v is not None]
+    out.append(('Intensity response', [
+        ('Response', calibration.get('response_id') or 'None · spectra are raw counts'),
+        ('Source', {'measured': 'Measured with a lamp of known spectrum', 'imported': 'Imported curves'}.get(calibration.get('response_source'), calibration.get('response_source'))),
+        ('Reference', calibration.get('response_reference')),
+        ('Defined', f'{min(defined):.1f}–{max(defined):.1f} nm' if defined else None),
+        ('Installed', local_time(calibration.get('response_installed_utc'))),
+        ('Applied as', '(raw − background) ÷ R(λ); frames stored as raw counts' if calibration.get('response_id') else None),
+    ]))
     present = background.get('present')
     out.append(('Background', [
         ('Recorded', yes_no(present) if present is not None else None),

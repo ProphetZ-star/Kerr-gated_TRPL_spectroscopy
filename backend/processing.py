@@ -35,7 +35,7 @@ def _average(delays, values):
     return t, np.bincount(inverse, weights=values, minlength=len(t)) / counts, counts
 
 
-def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=None, delay_range=True, rounds=None):
+def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=None, delay_range=True, rounds=None, response=None):
     """Decay curve of a block of frames (FrameTable.block: spectra, delay_ps, index, temperature_state,
     stage_reported_mm, exposure_s). options is a FitRequest (or anything with the same attributes).
 
@@ -51,7 +51,20 @@ def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=
     window = np.asarray(spectra[:, mask], dtype=float)
     if not np.isfinite(window).all():raise ValueError('Fit spectrum must match the axis and contain only finite counts')
     subtract = bool(getattr(options, 'subtract_background', False))
-    if subtract:
+    if response is not None:
+        # Intensity response installed: every pixel is corrected, (raw - B) / R. The offset always comes off first
+        # (a corrected offset would be meaningless): the recorded background, or each frame's baseline.
+        from .response import baseline
+        r = np.asarray(response, dtype=float)
+        if r.shape != mask.shape:raise ValueError('The intensity response does not match the spectra')
+        good = np.isfinite(r[mask]) & (r[mask] > 0)
+        if not good.any():raise ValueError('The intensity response is undefined across this wavelength window')
+        if background is not None:
+            offset = np.asarray(background, dtype=float)[mask][good]
+        else:
+            offset = baseline(spectra)[:, None]
+        values = ((window[:, good] - offset) / r[mask][good]).mean(axis=1) / exposure
+    elif subtract:
         if background is None:raise ValueError('This experiment has no recorded background to subtract')
         background = np.asarray(background, dtype=float)
         if background.shape != mask.shape:raise ValueError('The recorded background does not match the spectra')

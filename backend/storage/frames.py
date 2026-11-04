@@ -6,7 +6,7 @@ mode are the same for every frame of a run, so the table holds them once.
 """
 import math
 import numpy as np
-from .schema import COLUMNS, TEMPERATURE_STATES, MAX_FRAMES
+from .schema import COLUMNS, TEMPERATURE_STATES
 
 INT32 = np.iinfo(np.int32)
 
@@ -94,8 +94,7 @@ class FrameTable:
     def append(self, record):
         validate_record(record, self._size, self.pixels)
         if self._size == len(self._spectra):
-            if self._size >= MAX_FRAMES:raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames')
-            self._allocate(min(MAX_FRAMES, self._size + max(64, self._size // 2)))
+            self._allocate(self._next_capacity())
         row = frame_row(record); i = self._size
         self._spectra[i] = np.asarray(record['spectrum'])
         for name, column in self._columns.items():column[i] = row[name]
@@ -105,6 +104,15 @@ class FrameTable:
         """Keep the first `size` frames (a stopped scan drops its unfinished round)."""
         if not 0 <= int(size) <= self._size:raise ValueError(f'Cannot keep {size} of {self._size} frames')
         self._size = int(size)
+
+    def _next_capacity(self):
+        return self._size + max(64, self._size // 2)
+
+    def growth_bytes(self):
+        '''Memory the next append takes if the table must grow: old and new arrays exist together while copying.'''
+        if self._size < len(self._spectra):
+            return 0
+        return self._next_capacity() * (self.pixels * 4 + 64)
 
     def record(self, i):
         """One frame as a dict (the latest frame shown in the GUI, single-frame previews)."""

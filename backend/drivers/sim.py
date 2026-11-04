@@ -28,6 +28,25 @@ DRIFT_PERIODS = (173.0, 541.0) # frames per cycle of the two drift components
 TIME_JITTER_PS = 0.03          # rms time-zero jitter per frame
 
 
+# Detection response of the simulated setup (CCD QE x grating x optics): highest at 650 nm, about a quarter at
+# 500 and 800 nm. It shapes every simulated photon; the response correction should take it back out.
+SIM_RESPONSE_CENTER_NM = 650.0
+SIM_RESPONSE_WIDTH_NM = 90.0
+SIM_LAMP_TEMPERATURE_K = 3000.0
+SIM_LAMP_RATE = 60000.0  # photoelectrons / s at the lamp's brightest pixel
+
+
+def sim_response(axis):
+    return np.exp(-.5 * ((np.asarray(axis, dtype=float) - SIM_RESPONSE_CENTER_NM) / SIM_RESPONSE_WIDTH_NM) ** 2)
+
+
+def lamp_spectrum(axis, temperature=SIM_LAMP_TEMPERATURE_K):
+    '''Relative spectral radiance of a blackbody lamp (Planck), 1 at its maximum on the axis.'''
+    wavelength = np.asarray(axis, dtype=float) * 1e-9
+    radiance = 1.0 / (wavelength ** 5 * np.expm1(1.438777e-2 / (wavelength * temperature)))
+    return radiance / radiance.max()
+
+
 def laser_drift(seed, record_id):
     """Slow pump power factor at one frame: two incommensurate cycles with a phase set by the seed."""
     phases = np.random.default_rng(np.random.SeedSequence([seed, 7919])).uniform(0, 2 * math.pi, 2)
@@ -79,7 +98,7 @@ class SimCamera:
         return self.readout, notes
 
     def acquire(self, delay_ps, seed, record_id, exposure_s, center_nm=600,
-                fault='none', dark=False, optical_background=False):
+                fault='none', dark=False, optical_background=False, lamp=False):
         try:valid=not isinstance(exposure_s,(bool,np.bool_)) and math.isfinite(exposure_s) and exposure_s>0
         except (TypeError,OverflowError):valid=False
         if not valid:raise ValueError('Exposure must be finite and positive')
@@ -92,7 +111,12 @@ class SimCamera:
         signal_rate = 120000 * gain * spectral * temporal
         if dark or optical_background:
             signal_rate = np.zeros_like(spectral)
+        if lamp:
+            signal_rate = SIM_LAMP_RATE * lamp_spectrum(self.axis)
         optical_rate = np.full(self.pixels, 35.0 if not dark else 0.0)
+        # Light (signal, lamp, stray light) passes the detection response; bias and read noise do not.
+        response = sim_response(self.axis)
+        signal_rate = signal_rate * response; optical_rate = optical_rate * response
         if fault == 'drift':
             signal_rate *= 1 + record_id * 0.002
         if fault == 'saturation':

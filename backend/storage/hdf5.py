@@ -11,7 +11,7 @@ import heapq
 import h5py
 import numpy as np
 from . import schema
-from .schema import (SCHEMA_VERSION, MAX_FRAMES, ROOT, INSTRUMENT, REQUEST, SEGMENT_COLUMNS, COORDINATES, PLAN_ARRAYS, ACQUISITION,
+from .schema import (SCHEMA_VERSION, ROOT, INSTRUMENT, REQUEST, SEGMENT_COLUMNS, COORDINATES, PLAN_ARRAYS, ACQUISITION,
                      CALIBRATION, BACKGROUND, COLUMNS, TEMPERATURE_CODES, FILE_STATUS, RUN_STATUS, FIT_ARRAYS, FIT_SETTINGS, FIT_SUMMARY,
                      FIT_PROCESSING, FIT_EXCLUDED)
 from .frames import FrameTable, frame_row, validate_record
@@ -127,6 +127,11 @@ def write_metadata(file, metadata):
     _array(calibration, 'coefficients', values.get('coefficients'))
     _array(calibration, 'line_pairs', values.get('line_pairs'), columns=2).attrs.create('columns', 'pixel, wavelength_nm', dtype=TEXT)
     if values.get('chip_wavelengths_nm') is not None:_array(calibration, 'chip_wavelengths_nm', values['chip_wavelengths_nm'])
+    if values.get('response') is not None:
+        # Undefined response (too weak to divide by) is stored as NaN.
+        _array(calibration, 'response_wavelengths_nm', values.get('response_wavelengths_nm'))
+        _array(calibration, 'response', [math.nan if v is None else v for v in values['response']]).attrs.create(
+            'meaning', 'relative intensity response, 1 at its peak; corrected = (raw - background) / response', dtype=TEXT)
     _put(calibration, values, CALIBRATION)
     background = _group(file, 'background'); values = metadata['background']
     if values.get('present'):background.create_dataset('spectrum', data=np.asarray(values['spectrum'], dtype='f8'))
@@ -141,6 +146,8 @@ def read_metadata(file):
     calibration = _get(file['calibration'], CALIBRATION)
     for name in schema.CALIBRATION_ARRAYS:
         calibration[name] = (file['calibration'][name][:].tolist() if name in file['calibration'] else []) or None
+    if calibration.get('response') is not None:
+        calibration['response'] = [None if not math.isfinite(v) else v for v in calibration['response']]
     background = _get(file['background'], BACKGROUND)
     background['spectrum'] = file['background/spectrum'][:].tolist() if 'spectrum' in file['background'] else None
     return dict(root=_get(file, ROOT), instrument={name: _get(file['instrument'][name], fields) for name, fields in INSTRUMENT.items()},
@@ -223,7 +230,6 @@ class HDFWriter:
                 # The data is on disk before the counter that declares it valid; a failed append is never counted.
                 offset = len(spectra); size = len(block['spectra'])
                 if size == 0:return
-                if offset + size > MAX_FRAMES:raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames')
                 spectra.resize(offset + size, axis=0); spectra[offset:] = block['spectra']
                 for name, dataset in columns.items():
                     dataset.resize(offset + size, axis=0); dataset[offset:] = np.asarray(block[name], dtype=dataset.dtype)
@@ -332,7 +338,12 @@ def _read_run(path):
             raise ValueError(f'Unsupported experiment file (schema version {version}); this release reads version {SCHEMA_VERSION} only')
         stored = f['frame/spectra']
         count = int(f['frame'].attrs['committed_frames'])
-        if count > MAX_FRAMES:raise ValueError(f'File exceeds the {MAX_FRAMES:,}-frame limit')
+        from ..resources import usable_memory, frame_bytes, describe
+        need = count * frame_bytes(stored.shape[1] if len(stored.shape) > 1 else 1) * 2  # read buffer and table
+        usable = usable_memory()
+        if usable is not None and need > usable:
+            # Not a damaged file: reported as it is (read_run only rewords file errors).
+            raise MemoryError(f'Opening this file needs about {describe(need)} of memory; {describe(usable)} is free')
         if not 0 <= count <= min([len(stored)] + [len(f['frame'][name]) for name, _, _ in COLUMNS]):
             raise ValueError('Committed frame count exceeds the stored rows')
         metadata = read_metadata(f)
@@ -364,6 +375,33 @@ def read_run(path):
     try:return _read_run(path)
     except (OSError, KeyError, IndexError, TypeError, OverflowError, ValueError) as exc:
         raise ValueError(f'Invalid or damaged experiment file: {exc}') from exc
+
+
+def store_analyses(path, run_id, results):
+    '''Write fits made on a file opened in Analysis back into it: {task_id: result} into /analysis. The frames and
+    every other group are left as they are; a fit already in the file is skipped. Returns the task ids written.'''
+    with h5py.File(path, 'r+') as file:
+        stored = file.attrs.get('run_id')
+        stored = stored.decode() if isinstance(stored, bytes) else str(stored)
+        if stored != run_id:raise ValueError(f'The file now holds another experiment (run {stored}, expected {run_id})')
+        written = []
+        for task_id, result in results.items():
+            if task_id in file['analysis']:continue
+            write_analysis(file['analysis'], task_id, result); written.append(task_id)
+        file.flush()
+    return written
+
+
+def delete_analysis(path, run_id, task_id):
+    '''Remove one fit group from /analysis; the frames and the rest of the file are untouched. True if it was there.
+    HDF5 does not shrink the file: the freed space is reused by later writes.'''
+    with h5py.File(path, 'r+') as file:
+        stored = file.attrs.get('run_id')
+        stored = stored.decode() if isinstance(stored, bytes) else str(stored)
+        if stored != run_id:raise ValueError(f'The file now holds another experiment (run {stored}, expected {run_id})')
+        if task_id not in file['analysis']:return False
+        del file['analysis'][task_id]; file.flush()
+        return True
 
 
 def append_analysis(path, task_id, result):

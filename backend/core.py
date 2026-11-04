@@ -3,7 +3,7 @@ from decimal import Decimal
 import hashlib
 import json
 import math
-from .storage.schema import MAX_FRAMES
+from .storage.schema import MAX_POINTS
 
 C_MM_PS = 0.299792458
 
@@ -27,8 +27,8 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0, limits
             if previous is not None and a != previous:
                 raise ValueError('Segments must be contiguous, ordered and non-overlapping')
             count = int((b - a) // step)
-            if count > 5000:
-                raise ValueError('A scan may contain at most 5001 points')
+            if count >= MAX_POINTS:
+                raise ValueError(f'A scan may contain at most {MAX_POINTS:,} delay points (the TRPL map draws one row per point)')
             values = [a + j * step for j in range(count + 1)]
             if values[-1] != b:
                 if abs(b-values[-1])<=abs(step)*Decimal('1e-12'):values[-1]=b
@@ -36,8 +36,8 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0, limits
             if points:
                 values = values[1:]
             points.extend(float(v) for v in values)
-            if len(points) > 5001:
-                raise ValueError('A scan may contain at most 5001 points')
+            if len(points) > MAX_POINTS:
+                raise ValueError(f'A scan may contain at most {MAX_POINTS:,} delay points (the TRPL map draws one row per point)')
             previous = b
     targets = [delay_to_mm(p, zero, sign) for p in points]
     # Positive-direction approach on every round. The extra travel is part of the plan.
@@ -48,24 +48,21 @@ def make_plan(request, current_delay=0.0, zero=150.0, sign=1, revision=0, limits
         raise ValueError('Different delays map to indistinguishable stage positions')
     until_stopped = request.mode == 'repeat' and request.repeats == 0
     per_round = len(points) * request.frames_per_point
-    # Frames are held as arrays (4 KiB per full-chip spectrum), so one limit covers saved and memory-only runs.
-    if per_round > MAX_FRAMES:
-        raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames (one round of this plan has {per_round:,})')
-    # Repeat until stopped: as many rounds as the frame limit allows.
-    rounds = MAX_FRAMES // per_round if until_stopped else request.repeats if request.mode == 'repeat' else 1
+    # No frame limit here: the acquisition stops by itself when memory or disk runs low. A run repeated until
+    # stopped has no planned round count (0); its estimates are for one round.
+    rounds = 0 if until_stopped else request.repeats if request.mode == 'repeat' else 1
+    counted = rounds or 1
     frames = per_round * rounds
-    if frames > MAX_FRAMES:
-        raise ValueError(f'A run holds at most {MAX_FRAMES:,} frames (this plan has {frames:,})')
     def duration(a,b):
         d=abs(a-b);return 2*math.sqrt(d/12) if d<3 else 1+(d-3)/6
     position=delay_to_mm(current_delay,zero,sign);motion=0
-    for _ in range(rounds):
+    for _ in range(counted):
         if request.mode!='single':motion+=duration(position,approach);position=approach
         for target in targets:motion+=duration(position,target);position=target
-    seconds=motion+rounds*len(points)*request.settle_s+frames*(request.exposure_s+.03)
+    seconds=motion+counted*len(points)*request.settle_s+per_round*counted*(request.exposure_s+.03)
     data = dict(delays_ps=points, targets_mm=targets, approach_mm=approach,
                 rounds=rounds, total_points=len(points)*rounds, total_frames=frames, until_stopped=until_stopped,
-                estimated_seconds=seconds, round_seconds=seconds / rounds, estimated_bytes=frames * (4096 + 2048),
+                estimated_seconds=seconds, round_seconds=seconds / counted, estimated_bytes=per_round * counted * (4096 + 2048),
                 revision=revision, zero_mm=zero, delay_sign=sign, path_multiplier=2)
     identity={k:v for k,v in data.items() if k not in ('estimated_seconds','round_seconds')}
     identity['request']=request.model_dump(exclude={'request_id','save_path','overwrite_token'})

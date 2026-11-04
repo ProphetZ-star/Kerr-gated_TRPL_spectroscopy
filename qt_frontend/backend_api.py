@@ -7,7 +7,7 @@ from backend.contracts import ConnectBody,DeviceBody,SDKBody,PIUSBBody,DeviceNam
 class ValidationError(ValueError):
     pass
 
-COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard run_files_removed export analysis_open analysis_close fit kinetics task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
+COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard run_files_removed export analysis_open analysis_close analysis_store analysis_delete response_import response_measure response_apply response_clear response_stop fit kinetics task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
 
 def _pydantic_text(name,error):
     try:
@@ -129,8 +129,23 @@ def validate_command(name,data=None):
         return {'run_id':_str(data,'run_id',name),'center_nm':_number(data,'center_nm',name,True),'half_window_nm':_number(data,'half_window_nm',name,True)}
     if name=='analysis_open':
         return {'path':_str(data,'path',name)}
-    if name=='analysis_close':
+    if name in {'analysis_close','analysis_store'}:
         return {'run_id':_str(data,'run_id',name),'analysis':True}
+    if name=='response_import':
+        curves=data.get('curves')
+        if not isinstance(curves,list) or not curves or len(curves)>8:raise ValidationError('response_import.curves must list 1–8 curves')
+        return {'curves':[{'name':_str(c,'name',name),'text':_str(c,'text',name)} for c in curves if isinstance(c,dict)]}
+    if name=='response_measure':
+        reference=data.get('reference')
+        if not isinstance(reference,dict):raise ValidationError('response_measure.reference is required')
+        known={'builtin':'simulated_lamp'} if reference.get('builtin')=='simulated_lamp' else {'name':_str(reference,'name',name),'text':_str(reference,'text',name)}
+        return {'reference':known,'frames':_int(data,'frames',name,minimum=1)}
+    if name=='response_apply':
+        return {'candidate_id':_str(data,'candidate_id',name)}
+    if name in {'response_clear','response_stop'}:
+        return {}
+    if name=='analysis_delete':
+        return {'run_id':_str(data,'run_id',name),'analysis':_bool(data,'analysis',name,False),'task_id':_str(data,'task_id',name)}
     if name in {'fit','kinetics'}:
         options=_model(name,FitRequest,_dict(data.get('options'),name+'.options'))
         return {'run_id':_str(data,'run_id',name),'analysis':_bool(data,'analysis',name,False),'options':options}

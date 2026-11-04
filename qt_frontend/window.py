@@ -20,13 +20,13 @@ from .widgets import ArrowComboBox as QComboBox,CheckBox as QCheckBox,WaveLogo,T
 from .controller import Controller
 from .theme import apply_to_app, palette, current_mode, map_color
 from .widgets import Panel, field, number_edit, number_value, int_spin, Segmented, CollapsibleSection, Legend, GradientBar, StartupOverlay, MetricsOverlay, fmt_value, device_availability, set_prop, add_outline, run_icon, ElidedLabel, install_focus_ring, apply_pointer_cursors, InlineValueEdit, parse_count, StatusButton, HoverReveal
-from .plots import SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt, format_duration
+from .plots import padded_range, ResponsePlot, SpectrumPlot, MapPlot, DecayPlot, AnalysisCurvePlot, ResidualPlot, CalibrationImagePlot, CalibrationProfilePlot, CalibrationMappingPlot, CalibrationResidualPlot, fmt, format_duration
 from .dialogs import DeviceDialog, DetectorDialog
 from .experiment_info import ExperimentInfoDialog
 from .prescan import PrescanDialog, prescan_issues
+from . import correction
 from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
-from backend.storage.schema import MAX_FRAMES
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 
@@ -484,6 +484,7 @@ class MainWindow(QMainWindow):
         self.export_button.setProperty('role', 'accent')
         self._reg('export', self.export_button, False)
         self.export_button.clicked.connect(self.export_current_csv)
+        self.export_button.setToolTip('Save the TRPL decays shown (marked and pinned wavelengths, not hidden ones) as CSV')
         self.export_button.setFixedHeight(34);self.export_button.setEnabled(False)
         self._set_icon(self.export_button, 'download')
         layout.addWidget(self.export_button)
@@ -806,7 +807,7 @@ class MainWindow(QMainWindow):
         self.background_status.setProperty('muted', True)
         self.background_status.setWordWrap(True)
         self._reg('backgroundStatus', self.background_status, False)
-        self.background_frames = int_spin(5, 1, 1000, 1)
+        self.background_frames = int_spin(5, 1, 1_000_000, 1)
         self.background_frames.setObjectName('backgroundFrames')
         self.background_frames.setPrefix('× ')
         self.background_frames.setFixedSize(62, 30)
@@ -861,6 +862,17 @@ class MainWindow(QMainWindow):
         self.segments_layout.setSpacing(6)
         self._reg('segments', self.segments_host, False)
         scan_layout.addWidget(self.segments_host)
+        # Spectra per delay position: taken back to back at each delay before the stage moves on.
+        frames_wrap = QWidget(); frames_layout = QHBoxLayout(frames_wrap)
+        frames_layout.setContentsMargins(0, 6, 0, 0); frames_layout.setSpacing(10)
+        frames_label = QLabel('Frames / point'); frames_label.setProperty('muted', True)
+        frames_layout.addWidget(frames_label); frames_layout.addStretch(1)
+        self.frames_input = int_spin(1, 1, 1_000_000, 1)
+        self.frames_input.setObjectName('framesPerPoint'); self.frames_input.setFixedSize(96, 30)
+        self.frames_input.setToolTip('Spectra taken one after another at each delay position; they are stored as separate frames and averaged in the decay')
+        self.frames_input.valueChanged.connect(lambda value: self._update_point_estimate())
+        self._reg('framesPerPoint', self.frames_input, False)
+        frames_layout.addWidget(self.frames_input)
         self.repeat_wrap = QWidget()
         repeat_layout = QHBoxLayout(self.repeat_wrap)
         repeat_layout.setContentsMargins(0, 6, 0, 0)
@@ -872,19 +884,21 @@ class MainWindow(QMainWindow):
         self.repeat_forever = QCheckBox('Until stopped')
         self.repeat_forever.setObjectName('repeatForever')
         self.repeat_forever.setMinimumHeight(24)
-        self.repeat_forever.setToolTip(f'Repeat the scan until Stop is pressed (at most {MAX_FRAMES:,} frames). '
+        self.repeat_forever.setToolTip('Repeat the scan until Stop is pressed, or until memory or disk space runs low. '
                                        'Stop keeps every complete round.')
         self.repeat_forever.toggled.connect(self._repeat_forever_changed)
         self._reg('repeatForever', self.repeat_forever, False)
         repeat_layout.addWidget(self.repeat_forever)
-        self.repeats_input = int_spin(3, 1, 100, 1)
+        self.repeats_input = int_spin(3, 1, 1_000_000, 1)
         self.repeats_input.setObjectName('repeats')
         self.repeats_input.setFixedSize(96, 30)
         self._reg('repeats', self.repeats_input, False)
         repeat_layout.addWidget(self.repeats_input)
         self.repeat_wrap.hide()
-        scan_layout.addWidget(self.repeat_wrap)
         layout.addWidget(self.scan_params)
+        # Frames / point applies to every mode (Single too), so it sits outside the scan segments; Repeat count below it.
+        layout.addWidget(frames_wrap)
+        layout.addWidget(self.repeat_wrap)
         self.validation = QLabel('')
         self.validation.setObjectName('validation')
         self._reg('validation', self.validation, False)
@@ -1268,7 +1282,16 @@ class MainWindow(QMainWindow):
         self.fit_history.setToolTip('Show a fit stored with this experiment; its wavelength window and settings are restored')
         self.fit_history.activated.connect(lambda index: self._show_saved_fit(self.fit_history.itemData(index)))
         self._reg('fitHistory', self.fit_history, False)
-        layout.addWidget(self.fit_history)
+        history_row = QWidget(); history_layout = QHBoxLayout(history_row)
+        history_layout.setContentsMargins(0, 0, 0, 0); history_layout.setSpacing(6)
+        history_layout.addWidget(self.fit_history, 1)
+        self.delete_fit = QPushButton(''); self.delete_fit.setObjectName('deleteFit'); self.delete_fit.setFixedSize(32, 32)
+        self._set_icon(self.delete_fit, 'trash')
+        self.delete_fit.setToolTip('Delete the selected fit (from the file too, if it is stored there); the recorded data are not changed')
+        self.delete_fit.clicked.connect(self._delete_fit)
+        self._reg('deleteFit', self.delete_fit, False)
+        history_layout.addWidget(self.delete_fit)
+        layout.addWidget(history_row)
         layout.addSpacing(4)
         grid = QWidget()
         grid_layout = QGridLayout(grid)
@@ -1511,6 +1534,7 @@ class MainWindow(QMainWindow):
         self._build_cal_extraction(controls)
         self._build_cal_reference(controls)
         self._build_cal_model(controls)
+        self._build_cal_response(controls)
         controls.addStretch(1)
         scroll.setWidget(inner)
         layout.addWidget(scroll)
@@ -1728,6 +1752,161 @@ class MainWindow(QMainWindow):
         details.add(self.calibration_state)
         layout.addWidget(details)
         parent_layout.addWidget(frame)
+    def _build_cal_response(self, parent_layout):
+        '''Intensity response R(lambda): imported vendor curves or a lamp of known spectrum; installed like the
+        wavelength calibration and applied to every spectrum shown, fitted and exported.'''
+        frame, layout = self._section()
+        self.response_state = QLabel('None'); self.response_state.setObjectName('responseState')
+        self._reg('responseState', self.response_state, False)
+        layout.addWidget(self._heading('Intensity response', self.response_state))
+        self.response_summary = QLabel('No response installed · spectra show raw counts')
+        self.response_summary.setObjectName('responseSummary'); self.response_summary.setWordWrap(True); self.response_summary.setProperty('muted', True)
+        self._reg('responseSummary', self.response_summary, False)
+        layout.addWidget(self.response_summary)
+        self.response_plot = ResponsePlot(); self.response_plot.setObjectName('responsePlot'); self.response_plot.setFixedHeight(150)
+        self._reg('responsePlot', self.response_plot, False)
+        layout.addWidget(self.response_plot)
+        self.response_import = QPushButton('Import curves…'); self.response_import.setObjectName('responseImport'); self.response_import.setFixedHeight(34)
+        self._set_icon(self.response_import, 'folder')
+        self.response_import.setToolTip('CSV / TXT files of wavelength (nm) and value, e.g. CCD quantum efficiency, grating efficiency, filter '
+                                        'transmission; several files are multiplied. Each is scaled to its own maximum.')
+        self.response_import.clicked.connect(self._import_response)
+        self._reg('responseImport', self.response_import, False)
+        layout.addWidget(self.response_import)
+        lamp_label = QLabel('Lamp of known spectrum'); lamp_label.setProperty('muted', True)
+        layout.addWidget(lamp_label)
+        reference_row = QWidget(); reference_layout = QHBoxLayout(reference_row)
+        reference_layout.setContentsMargins(0, 0, 0, 0); reference_layout.setSpacing(8)
+        self.response_reference_label = QLabel(''); self.response_reference_label.setObjectName('responseReference'); self.response_reference_label.setWordWrap(True)
+        self._reg('responseReference', self.response_reference_label, False)
+        self.response_reference_button = QPushButton('Reference…'); self.response_reference_button.setObjectName('responseReferenceFile'); self.response_reference_button.setFixedHeight(30)
+        self.response_reference_button.setToolTip("The lamp's known spectrum (CSV / TXT of wavelength in nm and spectral radiance, any scale)")
+        self.response_reference_button.clicked.connect(self._choose_response_reference)
+        self._reg('responseReferenceFile', self.response_reference_button, False)
+        reference_layout.addWidget(self.response_reference_label, 1); reference_layout.addWidget(self.response_reference_button)
+        layout.addWidget(reference_row)
+        measure_row = QWidget(); measure_layout = QHBoxLayout(measure_row)
+        measure_layout.setContentsMargins(0, 0, 0, 0); measure_layout.setSpacing(8)
+        self.response_frames = int_spin(10, 1, 1_000_000, 1); self.response_frames.setObjectName('responseFrames'); self.response_frames.setFixedSize(70, 32)
+        self.response_frames.setPrefix('× '); self.response_frames.setToolTip('Lamp frames averaged (current exposure and readout)')
+        self._reg('responseFrames', self.response_frames, False)
+        self.response_measure = QPushButton('Measure lamp'); self.response_measure.setObjectName('responseMeasure'); self.response_measure.setFixedHeight(32)
+        self.response_measure.setToolTip('Record the lamp through the whole detection path; the response is (lamp − background) ÷ its known spectrum')
+        self.response_measure.clicked.connect(self._measure_response)
+        self._reg('responseMeasure', self.response_measure, False)
+        measure_layout.addWidget(self.response_measure, 1); measure_layout.addWidget(self.response_frames)
+        layout.addWidget(measure_row)
+        self.response_feedback = QLabel(''); self.response_feedback.setObjectName('responseFeedback'); self.response_feedback.setWordWrap(True)
+        self._reg('responseFeedback', self.response_feedback, False)
+        layout.addWidget(self.response_feedback)
+        actions = QWidget(); actions_layout = QHBoxLayout(actions); actions_layout.setContentsMargins(0, 0, 0, 0); actions_layout.setSpacing(8)
+        self.response_apply = QPushButton('Apply response'); self.response_apply.setObjectName('responseApply'); self.response_apply.setProperty('role', 'primary')
+        self.response_apply.setFixedHeight(36); self.response_apply.setEnabled(False); self.response_apply.clicked.connect(self._apply_response)
+        self._reg('responseApply', self.response_apply, False)
+        self.response_clear = QPushButton('Clear'); self.response_clear.setObjectName('responseClear'); self.response_clear.setFixedHeight(36)
+        self.response_clear.setEnabled(False); self.response_clear.clicked.connect(self._clear_response)
+        self._reg('responseClear', self.response_clear, False)
+        actions_layout.addWidget(self.response_apply, 1); actions_layout.addWidget(self.response_clear)
+        layout.addWidget(actions)
+        note = QLabel('Applied to every spectrum shown, fitted and exported, as (raw − background) ÷ R; recorded frames stay raw counts. '
+                      'A measured response belongs to this spectrometer setting; imported curves depend on wavelength only.')
+        note.setWordWrap(True); note.setProperty('muted', True)
+        layout.addWidget(note)
+        self._response_reference = None; self._response_plot_key = None
+        parent_layout.addWidget(frame)
+    @staticmethod
+    def _read_text(path):
+        raw = Path(path).read_bytes()
+        for encoding in ('utf-8-sig', 'gbk', 'latin-1'):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode('latin-1', 'replace')
+    def _import_response(self):
+        paths, selected = QFileDialog.getOpenFileNames(self, 'Import response curves', str(self.output_dir), 'Curves (*.csv *.txt *.dat);;All files (*)')
+        if not paths:
+            return
+        try:
+            curves = [{'name': Path(path).name, 'text': self._read_text(path)} for path in paths[:8]]
+        except OSError as error:
+            self.show_toast(str(error)); return
+        self.controller.dispatch('response_import', {'curves': curves}, success=lambda result: (self.response_feedback.setText(''), self.controller.request_status()),
+                                 failure=lambda payload: self.response_feedback.setText(payload_message(payload)))
+    def _choose_response_reference(self):
+        path, selected = QFileDialog.getOpenFileName(self, "Lamp's known spectrum", str(self.output_dir), 'Curves (*.csv *.txt *.dat);;All files (*)')
+        if not path:
+            return
+        try:
+            self._response_reference = {'name': Path(path).name, 'text': self._read_text(path)}
+        except OSError as error:
+            self.show_toast(str(error)); return
+        self._update_response_controls(self._snapshot or {})
+    def _measure_response(self):
+        snapshot = self._snapshot or {}
+        if snapshot.get('busy') == 'response':
+            self.controller.dispatch('response_stop', {}, failure=lambda payload: self.show_toast(payload_message(payload))); return
+        reference = self._response_reference or ({'builtin': 'simulated_lamp'} if snapshot.get('source_mode') == 'simulation' else None)
+        if reference is None:
+            self.response_feedback.setText("Choose the lamp's known spectrum first (Reference…)"); return
+        self.response_feedback.setText('')
+        self.controller.dispatch('response_measure', {'reference': reference, 'frames': int(self.response_frames.value())},
+                                 failure=lambda payload: self.response_feedback.setText(payload_message(payload)))
+    def _apply_response(self):
+        candidate = (self._snapshot or {}).get('response_candidate') or {}
+        if not candidate.get('candidate_id'):
+            return
+        def applied(result):
+            self.show_toast('Intensity response applied · spectra are now shown corrected'); self.controller.request_status()
+            self._map_dirty = True; self._schedule_refresh()
+        self.controller.dispatch('response_apply', {'candidate_id': candidate['candidate_id']}, success=applied,
+                                 failure=lambda payload: self.response_feedback.setText(payload_message(payload)))
+    def _clear_response(self):
+        answer = QMessageBox.question(self, 'Clear intensity response', 'Remove the installed intensity response? Spectra are shown as raw counts again; '
+                                      'experiments already recorded keep the response stored with them.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes:
+            return
+        self.controller.dispatch('response_clear', {}, success=lambda result: (self.controller.request_status(), self.show_toast('Intensity response cleared')),
+                                 failure=lambda payload: self.show_toast(payload_message(payload)))
+    def _update_response_controls(self, snapshot):
+        installed = snapshot.get('response') or {}; candidate = snapshot.get('response_candidate') or {}
+        progress = snapshot.get('response_progress') or {}; busy = snapshot.get('busy')
+        has_axis = bool((snapshot.get('calibration') or {}).get('wavelengths_nm'))
+        online = bool(getattr(self.controller, 'online', False))
+        def stamp(text):
+            try:
+                return datetime.fromisoformat(str(text)).astimezone().strftime('%Y-%m-%d %H:%M')
+            except (TypeError, ValueError):
+                return ''
+        if installed.get('values'):
+            self.response_state.setText('Installed')
+            self.response_summary.setText(f"{str(installed.get('source') or '').capitalize()} · {installed.get('reference')} · {stamp(installed.get('installed_utc'))}")
+        else:
+            self.response_state.setText('None')
+            self.response_summary.setText('No response installed · spectra show raw counts' if has_axis else 'Needs a wavelength calibration first')
+        if candidate.get('error'):
+            self.response_feedback.setText(candidate['error']); set_prop(self.response_feedback, 'warning', True)
+        elif candidate.get('candidate_id'):
+            self.response_state.setText('Preview')
+            self.response_feedback.setText(f"Preview (dashed): {candidate.get('source')} · {candidate.get('reference')} · Apply to use it"); set_prop(self.response_feedback, 'warning', False)
+        elif busy == 'response':
+            self.response_feedback.setText(f"Measuring the lamp · {progress.get('frames', 0)} / {progress.get('total', self.response_frames.value())}"); set_prop(self.response_feedback, 'warning', False)
+        self.response_measure.setText('Stop' if busy == 'response' else 'Measure lamp')
+        reference = self._response_reference
+        self.response_reference_label.setText(reference['name'] if reference else 'Simulated lamp (3000 K blackbody)' if snapshot.get('source_mode') == 'simulation' else 'No reference spectrum chosen')
+        idle = online and busy is None
+        self.response_import.setEnabled(idle and has_axis)
+        self.response_measure.setEnabled(online and has_axis and (busy is None or busy == 'response'))
+        self.response_frames.setEnabled(idle)
+        self.response_apply.setEnabled(idle and bool(candidate.get('candidate_id')))
+        self.response_clear.setEnabled(idle and bool(installed.get('values')))
+        key = (installed.get('response_id'), candidate.get('candidate_id'))
+        if key != self._response_plot_key:
+            self._response_plot_key = key
+            curve = lambda item: (item['wavelengths_nm'], [np.nan if v is None else v for v in item['values']]) if item.get('values') else None
+            self.response_plot.set_curves(curve(installed), curve(candidate))
+        # The Live spectrum's Background entry means nothing while it is shown corrected (the background is taken off).
+        self.spectrum_legend.entries['background'].setVisible(not getattr(self, '_live_corrected', False))
     def _build_cal_image_panel(self):
         panel = Panel('CCD frame / pixel')
         panel.header.setFixedHeight(52)
@@ -2211,6 +2390,7 @@ class MainWindow(QMainWindow):
             self._check_pending_scan(snapshot, busy)
             self._update_header(snapshot)
             self._update_cal_controls()
+            self._update_response_controls(snapshot)
             self._update_output_status()
         finally:
             self._updating_controls = False
@@ -2273,7 +2453,8 @@ class MainWindow(QMainWindow):
             self.run_status.setText('✓ Scan complete' if complete else status.capitalize() if status else 'Ready' if online else 'Starting…')
             self._set_run_button('play', 'Start')
         # A stopped scan cannot continue, so the bar returns to its idle state (the next scan's plan).
-        show_run = bool(total and completed is not None and not (busy != 'scan' and status == 'stopped'))
+        # A run repeated until stopped has no planned total (0) but still shows its progress.
+        show_run = bool((total or plan.get('until_stopped') or run.get('until_stopped')) and completed is not None and not (busy != 'scan' and status == 'stopped'))
         self._run_progress_shown = show_run
         if show_run:
             self._show_run_progress(run, plan, busy, status)
@@ -2350,11 +2531,13 @@ class MainWindow(QMainWindow):
             percent = 100.0 * completed / (points * rounds)
         self._animate_progress(max(0, min(100, percent)))
         if busy == 'scan' and current is not None:
-            shown = min(int(current) + 1, rounds)
+            shown = int(current) + 1 if until else min(int(current) + 1, rounds)
         else:
             shown = max(done_rounds, 1 if completed else 0)
         label = f'Round {shown}' if until else f'Round {shown} / {rounds}'
-        self.progress_text.setText(f"{label} · {frames:,} frame{'s' if frames != 1 else ''}")
+        # Points done in the round shown (a point counts once all its frames are in).
+        in_round = max(0, min(points, completed - max(0, shown - 1) * points))
+        self.progress_text.setText(f'{label} · {in_round} / {points} points')
         self.remaining.setText(str(run.get('step') if busy == 'scan' else status))
     def _show_plan(self, plan, request):
         '''The idle progress bar: what the next scan will do.'''
@@ -2382,7 +2565,8 @@ class MainWindow(QMainWindow):
         dataset = self.controller.acquisition
         scale = self.map_scale.current()
         pins = tuple((pin['key'], pin['wave']) for pin in self._decay_pins)
-        key = (id(dataset), dataset.revision, current_mode(), scale, dataset.wave, dataset.half_window, pins, self.decay_normalize.isChecked())
+        key = (id(dataset), dataset.revision, current_mode(), scale, dataset.wave, dataset.half_window, pins, self.decay_normalize.isChecked(),
+               (((dataset.run or {}).get('metadata') or {}).get('calibration') or {}).get('response_id'))
         if not self._map_dirty and key == self._map_key:
             return
         if getattr(self,'_map_dataset',None) is not dataset:
@@ -2392,6 +2576,10 @@ class MainWindow(QMainWindow):
             if cached is None or cached[0]!=group.count:
                 self._map_spectra_cache[delay]=(group.count,group.raw)
         spectra={delay:entry[1] for delay,entry in self._map_spectra_cache.items()}
+        response=self._run_response_on_axis(dataset)
+        if response is not None:
+            background=correction.run_background(dataset.run)
+            spectra={delay:correction.apply(values,response,background) for delay,values in spectra.items()}
         saturated={delay:group.saturated for delay,group in dataset.groups.items() if group.saturated.any()}
         planned=(dataset.run or {}).get('plan',{}).get('delays_ps',[-2,20])
         vmin, vmax = self.map_plot.set_map(dataset.axis, spectra, scale, planned, saturated, self._map_levels)
@@ -2460,14 +2648,33 @@ class MainWindow(QMainWindow):
         background = snapshot.get('background') or {}
         bg = background.get('spectrum')
         bg_array = np.asarray(bg, dtype=float) if bg else None
+        raw_current = current
+        # With an intensity response the spectrum is shown corrected, (raw - background) / R: the live frame with
+        # the response installed now, a picked run spectrum with the one recorded with its run.
+        response = correction.on(correction.recorded(dataset.run) if picked else correction.installed(snapshot), x) if x_label == 'Wavelength / nm' else None
+        if response is not None and current is not None and len(current):
+            current = correction.apply(current, response, correction.run_background(dataset.run) if picked else bg_array)
+            bg_array = None
+        self._live_corrected = response is not None and current is not None
         self.spectrum_plot.set_spectrum(x, current, bg_array, x_label, self.spectrum_scale.current())
         self._sync_pins()
         averaged = dataset.groups[self._picked_delay].count if picked else 1
-        self._update_live_noise(snapshot, frame, latest, current, x, picked, averaged)
+        self._update_live_noise(snapshot, frame, latest, raw_current, x, picked, averaged)
         self.spectrum_plot.set_axis_bounds('x',float(np.min(x)),float(np.max(x)))
         full_scale=float(snapshot.get('camera',{}).get('full_scale',65535));logarithmic=self.spectrum_scale.current()=='log'
-        self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
-        self.spectrum_plot.set_y_label('CCD / counts')  # log axes label decades in counts
+        if self._live_corrected:
+            finite = np.asarray(current, dtype=float); finite = finite[np.isfinite(finite)]
+            if logarithmic:
+                positive = finite[finite > 0]
+                self.spectrum_plot.set_axis_bounds('y', 0, math.log10(max(10.0, float(positive.max()) if positive.size else 10.0)) * 1.05)
+            else:
+                self.spectrum_plot.set_axis_bounds('y', *padded_range(finite))
+            self.spectrum_plot.set_y_label('Corrected counts')
+            self.spectrum_legend.set_hint('current', f'{correction.LABEL}: (raw − background) / R(λ); raw counts are kept. The intensity response is installed on the Spectral calibration page.')
+        else:
+            self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
+            self.spectrum_plot.set_y_label('CCD / counts')  # log axes label decades in counts
+            self.spectrum_legend.set_hint('current', '')
         self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(axis) and current is not None)
         if saturated > 0:
             self.saturation.setText(f'⚠ {saturated} saturated pixels')
@@ -2561,6 +2768,10 @@ class MainWindow(QMainWindow):
         time zero; with neither, the lowest point.'''
         background = (((dataset.run or {}).get('metadata') or {}).get('background') or {}).get('spectrum')
         indices = self._decay_window(dataset, wave)
+        if self._run_response_on_axis(dataset) is not None:
+            # Corrected decays have their offset removed already: B is what remains before time zero.
+            early = [value for delay, value in zip(delays, values) if delay <= self.PRE_ZERO_PS]
+            return (float(np.mean(early)) if early else 0.0), 'response-corrected decay: the mean before time zero (the offset is already removed)'
         if background and indices and max(indices) < len(background):
             return float(np.mean(np.asarray(background, dtype=float)[indices])), 'the recorded background in the same wavelength window'
         early = [value for delay, value in zip(delays, values) if delay <= self.PRE_ZERO_PS]
@@ -2569,11 +2780,16 @@ class MainWindow(QMainWindow):
         if values:
             return float(np.min(values)), 'no background and no points before time zero, so the lowest point'
         return 0.0, 'none'
-    def _raw_decay_points(self, dataset, wave=None):
+    def _run_response_on_axis(self, dataset):
+        '''The response recorded with this run, on its wavelength axis, or None.'''
+        return correction.on(correction.recorded(dataset.run), dataset.axis) if dataset is not None and dataset.axis else None
+    def _raw_decay_points(self, dataset, wave=None, corrected=True):
         axis = dataset.axis
         wave = dataset.wave if wave is None else wave
         half = dataset.half_window
         indices = self._decay_window(dataset, wave)
+        response = self._run_response_on_axis(dataset) if corrected else None
+        background = correction.run_background(dataset.run) if response is not None else None
         delays = []
         intensities = []
         for delay in dataset.delays:
@@ -2581,10 +2797,12 @@ class MainWindow(QMainWindow):
             if group is None:
                 continue
             values = group.raw
+            if response is not None:
+                values = correction.apply(values, response, background)
             if indices:
                 valid = [index for index in indices if index < values.size]
                 if valid:
-                    intensities.append(float(np.mean(values[valid])))
+                    intensities.append(float(np.nanmean(values[valid])))
                 else:
                     intensities.append(float(np.mean(values)))
             else:
@@ -2689,7 +2907,15 @@ class MainWindow(QMainWindow):
         ready = bool(dataset is not None and run is not None and dataset.records and dataset.axis)
         self.run_fit_button.setEnabled(bool(self.controller.online and ready and not self._fit_running and (imported is not None or not self._snapshot.get('busy'))))
         self.export_fit.setEnabled(fit is not None and self.analysis_view.currentData()!='spectrum')
-        self.save_run.setEnabled(bool(imported is None and run is not None and (not run.get('saved') or run.get('files_removed'))))
+        if imported is not None:
+            # A file opened here: the button writes its new fits back into it.
+            unsaved = [fit for fit in ((imported.run or {}).get('metadata') or {}).get('analysis', {}).values() if not fit.get('stored')]
+            self.save_run.setText(f'Save fits to file ({len(unsaved)})' if unsaved else 'Save fits to file')
+            self.save_run.setToolTip('Write the fits made since this file was opened into its /analysis group; the recorded data are not changed')
+            self.save_run.setEnabled(bool(unsaved))
+        else:
+            self.save_run.setText('Save HDF5'); self.save_run.setToolTip('')
+            self.save_run.setEnabled(bool(run is not None and (not run.get('saved') or run.get('files_removed'))))
         self._refresh_analysis_delay_combo(delays)
         self._refresh_spectrum_legend()
         self.experiment_details.setEnabled(bool(run and run.get('metadata')))
@@ -2729,11 +2955,35 @@ class MainWindow(QMainWindow):
                 self.fit_history.setCurrentIndex(index)
             self.fit_history.setPlaceholderText(f'{len(items)} saved fit' + ('' if len(items) == 1 else 's') + ' · choose one to view' if items else 'No saved fits')
         self.fit_history.setEnabled(bool(items) and not self._fit_running)
+        self.delete_fit.setEnabled(bool(items) and self.fit_history.currentIndex() >= 0 and not self._fit_running)
         # A newly opened experiment shows its latest saved fit, with the window it was fitted in.
         if dataset is not None and dataset.records and getattr(self, '_fit_history_dataset', None) is not dataset:
             self._fit_history_dataset = dataset
             if current is None and items and not self._fit_running:
                 self._show_saved_fit(items[0][0])
+    def _delete_fit(self):
+        dataset = self.controller.analysis_context
+        task_id = self.fit_history.currentData()
+        if dataset is None or dataset.run is None or not task_id:
+            return
+        fit = (((dataset.run.get('metadata') or {}).get('analysis')) or {}).get(task_id) or {}
+        label = self._fit_history_label(fit) if fit else task_id
+        where = 'from this session and from the file' if fit.get('stored') else 'from this session (it is not in the file)'
+        answer = QMessageBox.question(self, 'Delete fit', f'Delete this fit {where}?\n\n{label}\n\nThe recorded data are not changed.',
+                                      QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes:
+            return
+        imported = dataset is self.controller.analysis_imported
+        def deleted(result):
+            (((dataset.run.get('metadata') or {}).get('analysis')) or {}).pop(task_id, None)
+            if isinstance(dataset.fit, dict) and dataset.fit.get('task_id') == task_id:
+                dataset.clear_fit(); self.fit_status.setText('Fit deleted')
+            self._fit_history_key = None
+            self.show_toast('Fit deleted' + (' · removed from the file' if isinstance(result, dict) and result.get('from_file') else ''))
+            self._update_analysis_labels(); self._redraw_analysis()
+            if not imported:self.controller.request_status()
+        self.controller.dispatch('analysis_delete', {'run_id': dataset.run.get('run_id'), 'analysis': imported, 'task_id': task_id},
+                                 success=deleted, failure=lambda payload: self.show_toast(payload_message(payload)))
     def _show_saved_fit(self, task_id):
         dataset = self.controller.analysis_context
         fit = dict(((dataset.run or {}).get('metadata') or {}).get('analysis') or {}).get(task_id) if dataset is not None else None
@@ -2782,6 +3032,8 @@ class MainWindow(QMainWindow):
             self._segment_rows.clear()
             for segment in segments:
                 self._add_segment_row(f"{float(segment['start']):g}", f"{float(segment['end']):g}", f"{float(segment['step']):g}")
+        if request.get('frames_per_point'):
+            self.frames_input.setValue(int(request['frames_per_point']))
         if request.get('repeats') is not None and mode == 'repeat':
             self.repeat_forever.setChecked(int(request['repeats']) == 0)
             if int(request['repeats']) > 0:
@@ -2987,8 +3239,11 @@ class MainWindow(QMainWindow):
                                  failure=lambda payload: finished(None, payload_message(payload)))
     def _update_processing_labels(self, dataset):
         available = self._background_available(dataset)
-        self.proc_background.setEnabled(available)
-        self.proc_background_note.setText('' if available else 'none recorded')
+        corrected = self._run_response_on_axis(dataset) is not None
+        self.proc_background.setEnabled(available and not corrected)
+        self.proc_background_note.setText('with the response' if corrected else '' if available else 'none recorded')
+        self.proc_background.setToolTip('The intensity response correction removes the background (or, without one, the estimated offset) itself'
+                                        if corrected else 'Subtract the recorded background before averaging')
         result = self._current_kinetics(dataset)
         counts = (result or {}).get('counts') or {}
         def plural(count, word):
@@ -3010,7 +3265,7 @@ class MainWindow(QMainWindow):
         spectrum = self.analysis_view.currentData() == 'spectrum'
         for widget in (self.proc_saturated, self.proc_unstable, self.proc_position, self.proc_tolerance, self.proc_rounds, self.proc_show_rounds):
             widget.setEnabled(not spectrum and not self._fit_running)
-        self.proc_background.setEnabled(available and not self._fit_running)
+        self.proc_background.setEnabled(available and not corrected and not self._fit_running)
     def _update_background_status(self, snapshot, busy):
         background = snapshot.get('background') or {}
         progress = snapshot.get('background_progress') or {}
@@ -3044,7 +3299,7 @@ class MainWindow(QMainWindow):
         self.controller.dispatch('background', data, success=success,
                                  failure=failure or (lambda payload: self.show_toast(payload_message(payload))))
     def _check_before_scan(self, request):
-        issues = [] if self._skip_prescan else prescan_issues(self._snapshot, request)
+        issues = [] if self._skip_prescan else prescan_issues(self._snapshot, request, getattr(self, '_last_plan', None))
         if not issues:
             self._preflight_and_call('run', request.get('save_path'), request, self._run_started, self._run_failed)
             return
@@ -3126,12 +3381,20 @@ class MainWindow(QMainWindow):
                 exposure = (metadata.get('acquisition') or {}).get('exposure_s')
                 if exposure:
                     background = np.asarray(metadata['background']['spectrum'], dtype=float) / float(exposure)
+            response = self._run_response_on_axis(dataset)
+            if response is not None:
+                # Corrected spectra take the offset off themselves: the recorded background, else the baseline.
+                metadata = dataset.run.get('metadata') or {}; exposure = (metadata.get('acquisition') or {}).get('exposure_s')
+                recorded_background = correction.run_background(dataset.run)
+                background = recorded_background / float(exposure) if recorded_background is not None and exposure else None
             for delay in self._spectrum_overlays:
                 group = dataset.groups.get(delay)
                 if group is None:
                     continue
                 values = group.normalized
-                if background is not None and background.shape == values.shape:
+                if response is not None:
+                    values = correction.apply(values, response, background)
+                elif background is not None and background.shape == values.shape:
                     values = values - background
                 if axis and len(axis):
                     x = np.asarray(axis[:values.size], dtype=float)
@@ -3168,7 +3431,8 @@ class MainWindow(QMainWindow):
         self._show_round_legend(rounds); self.analysis_legend_left_out.setVisible(bool(left_out))
         fit_points = self._fit_curve_points(fit)
         self.analysis_plot_title.setText('Decay & fit')
-        self.analysis_window_label.setText(f'{dataset.wave:g} ± {dataset.half_window:g} nm' + (' · background subtracted' if options['subtract_background'] else ''))
+        corrected = self._run_response_on_axis(dataset) is not None
+        self.analysis_window_label.setText(f'{dataset.wave:g} ± {dataset.half_window:g} nm' + (f' · {correction.LABEL}' if corrected else ' · background subtracted' if options['subtract_background'] else ''))
         # Processing and fits work in counts per second (exposures compare); the plot shows counts per pixel of one
         # frame, like the TRPL decay on the Acquisition page.
         factor = self._counts_per_rate(dataset) if self.analysis_unit.current() == 'counts' else 1.0
@@ -3378,7 +3642,9 @@ class MainWindow(QMainWindow):
         fit = self.controller.analysis_context.fit
         if fit is None:
             return
-        default = str(self.output_dir / 'fit.csv')
+        run = self.controller.analysis_context.run or {}
+        stem = Path(str(run['path'])).stem if run.get('path') else (self.save_path.text().strip() or 'acquisition')
+        default = str(self.output_dir / f'{stem}_fit.csv')
         path, selected = QFileDialog.getSaveFileName(self, 'Export fit CSV', default, 'CSV files (*.csv);;All files (*)')
         if not path:
             return
@@ -3387,9 +3653,11 @@ class MainWindow(QMainWindow):
         fit_points = self._fit_curve_points(fit)
         residuals = self._fit_residual_points(fit, observed, fit_points)
         try:
+            # One line ending per row (the file is written as-is) and UTF-8 with a byte-order mark: Excel then reads
+            # τ, ₁ and ± correctly and shows no empty line between rows (csv's default CR LF became CR CR LF on Windows).
             buffer = io.StringIO()
-            writer = csv.writer(buffer)
-            writer.writerow(['fit_export'])
+            writer = csv.writer(buffer, lineterminator='\n')
+            writer.writerow(['fit_export', fit.get('model', '')])
             writer.writerow(['wavelength_nm', dataset.wave])
             writer.writerow(['half_window_nm', dataset.half_window])
             for key, value in (fit.get('processing') or {}).items():
@@ -3401,15 +3669,16 @@ class MainWindow(QMainWindow):
             for item in self._fit_parameters(fit):
                 writer.writerow([item[0], item[1], item[2], '' if item[4] is None else item[4], item[3]])
             writer.writerow([])
-            writer.writerow(['delay_ps', 'observed', 'fit', 'residual'])
+            writer.writerow(['delay_ps', 'observed_counts_per_s', 'fit_counts_per_s', 'residual_counts_per_s'])
             fit_x = np.asarray([item[0] for item in fit_points], dtype=float) if fit_points else np.asarray([], dtype=float)
             fit_y = np.asarray([item[1] for item in fit_points], dtype=float) if fit_points else np.asarray([], dtype=float)
             residual_map = {item[0]: item[1] for item in residuals}
             for delay, intensity in observed:
                 fitted = float(np.interp(delay, fit_x, fit_y)) if fit_x.size else None
                 writer.writerow([delay, intensity, fitted, residual_map.get(delay)])
-            Path(path).write_text(buffer.getvalue(), encoding='utf-8')
-            self.show_toast('Fit CSV exported')
+            with open(path, 'w', encoding='utf-8-sig', newline='') as handle:
+                handle.write(buffer.getvalue())
+            self.show_toast(f'Fit CSV exported · {Path(path).name}')
         except Exception as error:
             self.show_toast(str(error))
     def _open_stage_dialog(self):
@@ -3568,7 +3837,7 @@ class MainWindow(QMainWindow):
             'mode': self._mode,
             'segments': segments,
             'repeats': repeats,
-            'frames_per_point': 1,
+            'frames_per_point': int(self.frames_input.value()),
             'exposure_s': float(exposure),
             'settle_s': 0.05,
             'seed': 42,
@@ -3828,6 +4097,13 @@ class MainWindow(QMainWindow):
         '''A stopped scan keeps its complete rounds (the worker already dropped the round in progress); one
         stopped before any round finished, or a failed scan, leaves an unfinished file that is removed.'''
         rounds = int(run.get('completed_rounds') or 0)
+        if run.get('status') == 'stopped' and run.get('stop_reason') and int(run.get('committed_frames') or 0) > 0:
+            # Stopped by the memory / disk guard: every complete point is kept, whatever the round.
+            points = int(run.get('completed_points') or 0)
+            where = f' · saved to {Path(str(run["path"])).name}' if run.get('saved') and run.get('path') else ' · in memory (Save HDF5 on Analysis writes it)'
+            self.show_toast(f"Scan stopped automatically: {run['stop_reason']} · {points:,} complete points kept{where}", 'warning')
+            self._update_output_status()
+            return
         if run.get('status') == 'stopped' and rounds > 0:
             dropped = int(run.get('dropped_frames') or 0)
             kept = f"{rounds} complete round{'s' if rounds != 1 else ''} kept"
@@ -3876,25 +4152,68 @@ class MainWindow(QMainWindow):
         else:
             self.save_status.setText('No experiment saved')
     def export_current_csv(self):
-        run = self.controller.acquisition.run
-        if not run:
+        '''Export the TRPL decays on screen (the marked wavelength and every pinned one not hidden in the legend)
+        for a quick look: one row per delay, per decay the mean count of its window and the recorded background.'''
+        dataset = self.controller.acquisition
+        if not dataset.run or not dataset.records:
             self.show_toast('No acquisition to export')
             return
-        default = str(self.output_dir / ((self.save_path.text().strip() or 'acquisition') + '.csv'))
-        path, selected = QFileDialog.getSaveFileName(self, 'Export CSV', default, 'CSV files (*.csv);;All files (*)')
+        if not dataset.axis:
+            self.show_toast('Exporting decays needs a wavelength calibration')
+            return
+        curves = [('decay_main', float(dataset.wave), 'marked')] + [(pin['key'], pin['wave'], 'pinned') for pin in self._decay_pins]
+        curves = [curve for curve in curves if not self.decay_plot.series_hidden(curve[0])]
+        if not curves:
+            self.show_toast('Every decay is hidden · show one in the legend to export it')
+            return
+        default = str(self.output_dir / ((self.save_path.text().strip() or 'acquisition') + '_decay.csv'))
+        path, selected = QFileDialog.getSaveFileName(self, 'Export TRPL decays', default, 'CSV files (*.csv);;All files (*)')
         if not path:
             return
-        center = number_value(self.center_edit) or 600.0
-        half = 5.0
-        data = {'run_id': run.get('run_id'), 'center_nm': float(center), 'half_window_nm': float(half)}
-        def success(result):
-            content = result if isinstance(result, str) else result.get('csv') or result.get('content') if isinstance(result, dict) else str(result)
-            try:
-                Path(path).write_text(content, encoding='utf-8')
-                self.show_toast('CSV exported')
-            except Exception as error:
-                self.show_toast(str(error))
-        self.controller.dispatch('export', data, success=success, failure=lambda payload: self.show_toast(payload_message(payload)))
+        try:
+            Path(path).write_text(self._decay_csv(dataset, curves), encoding='utf-8-sig')
+            self.show_toast(f"{len(curves)} decay{'s' if len(curves) != 1 else ''} exported · {Path(path).name}")
+        except Exception as error:
+            self.show_toast(str(error))
+    def _decay_csv(self, dataset, curves):
+        '''CSV text of the decays [(legend key, wavelength, role)]: comment lines, then delay_ps and per decay its mean and
+        background counts per pixel (the same values the TRPL decay plots, before Normalize).'''
+        run = dataset.run or {}; metadata = run.get('metadata') or {}
+        background = (metadata.get('background') or {}).get('spectrum')
+        exposure = self._counts_per_rate(dataset)
+        counts = sorted({group.count for group in dataset.groups.values()})
+        frames = (f'{counts[0]}' if len(counts) == 1 else f'{counts[0]}–{counts[-1]}') if counts else '0'
+        name = Path(str(run['path'])).name if run.get('path') else run.get('run_id', '')
+        buffer = io.StringIO(); writer = csv.writer(buffer, lineterminator='\n')
+        buffer.write(f"# Kerr Studio · TRPL decays · {name} · {(metadata.get('root') or {}).get('source_mode') or run.get('source_mode') or ''}\n")
+        buffer.write(f'# exposure {exposure:g} s · each delay is the mean of {frames} frame(s) (all rounds)\n')
+        for key, wave, role in curves:
+            buffer.write(f'# {wave:.1f} nm ± {dataset.half_window:g} nm ({role})\n')
+        buffer.write('# mean_counts_per_pixel: mean raw count of the pixels in the window\n')
+        buffer.write('# background_counts_per_pixel: the recorded background in the same window'
+                     + ('' if background else ' · empty: no background recorded') + '\n')
+        response = self._run_response_on_axis(dataset)
+        if response is not None:
+            calibration = metadata.get('calibration') or {}
+            buffer.write(f"# corrected_counts_per_pixel: (raw - background) / R, intensity response {calibration.get('response_id')} ({calibration.get('response_source')}: {calibration.get('response_reference')})\n")
+        columns = ['delay_ps']; series = []
+        for key, wave, role in curves:
+            delays, values = self._raw_decay_points(dataset, wave, corrected=False)
+            indices = self._decay_window(dataset, wave)
+            level = float(np.mean(np.asarray(background, dtype=float)[indices])) if background and indices and max(indices) < len(background) else None
+            fixed = dict(zip(*self._raw_decay_points(dataset, wave))) if response is not None else None
+            series.append((dict(zip(delays, values)), level, fixed))
+            columns += [f'mean_counts_per_pixel_{wave:.1f}nm', f'background_counts_per_pixel_{wave:.1f}nm'] + ([f'corrected_counts_per_pixel_{wave:.1f}nm'] if response is not None else [])
+        writer.writerow(columns)
+        for delay in sorted({delay for values, _, _ in series for delay in values}):
+            row = [f'{delay:g}']
+            for values, level, fixed in series:
+                value = values.get(delay)
+                row += ['' if value is None else f'{value:.6g}', '' if level is None else f'{level:.6g}']
+                if fixed is not None:
+                    value = fixed.get(delay); row.append('' if value is None or not math.isfinite(value) else f'{value:.6g}')
+            writer.writerow(row)
+        return buffer.getvalue()
     def _choose_analysis_file(self):
         path, selected = QFileDialog.getOpenFileName(self, 'Open HDF5 file', str(self.output_dir), 'HDF5 files (*.h5 *.hdf5);;All files (*)')
         if path:
@@ -3915,7 +4234,22 @@ class MainWindow(QMainWindow):
             self.fit_status.setText(str(message))
             self.show_toast(str(message))
         self.controller.open_analysis_file(str(path), success=success, failure=failure)
+    def _store_fits(self):
+        dataset = self.controller.analysis_imported
+        if dataset is None or dataset.run is None:
+            return
+        def stored(result):
+            for fit in ((dataset.run.get('metadata') or {}).get('analysis') or {}).values():fit['stored'] = True
+            if dataset.fit is not None:dataset.fit['stored'] = True
+            count = int(result.get('stored', 0)) if isinstance(result, dict) else 0
+            self.show_toast(f"{count} fit{'s' if count != 1 else ''} written to {Path(str(result.get('path', ''))).name}" if count else 'These fits are already in the file')
+            self._refresh_fit_history(dataset); self._update_analysis_labels()
+            if dataset.fit is not None:self.fit_status.setText('Saved fit')
+        self.controller.dispatch('analysis_store', {'run_id': dataset.run.get('run_id'), 'analysis': True}, success=stored,
+                                 failure=lambda payload: self.show_toast(payload_message(payload)))
     def _save_analysis_run(self):
+        if self.controller.analysis_imported is not None:
+            self._store_fits(); return
         dataset = self.controller.acquisition
         run = dataset.run
         if not run:
@@ -3965,8 +4299,9 @@ class MainWindow(QMainWindow):
         apply_to_app(mode)
         self._refresh_run_icons()
         self._apply_icons()
-        for plot in (self.spectrum_plot, self.map_plot, self.decay_plot, self.analysis_curve, self.analysis_residual, self.cal_image, self.cal_spectrum, self.cal_mapping, self.cal_residual):
+        for plot in (self.spectrum_plot, self.map_plot, self.decay_plot, self.analysis_curve, self.analysis_residual, self.cal_image, self.cal_spectrum, self.cal_mapping, self.cal_residual, self.response_plot):
             plot.update_theme()
+        self._response_plot_key = None  # redraw its curves in the new colours
         self._map_dirty = True
         self._schedule_refresh()
         self._redraw_analysis()

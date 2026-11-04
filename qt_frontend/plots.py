@@ -1533,6 +1533,8 @@ class MapPlot(PinnedLines, EditablePlot):
             bins=updated[delay][3]
             values=bins[column_indices//8] if len(bins)*8==width else bins[column_indices]
             if scale=='log':values=np.log10(np.maximum(values,1.0))
+            # Undefined pixels (no intensity response there) take the bottom of the colour range.
+            values=np.where(np.isfinite(values),values,low)
             indices=np.rint(np.clip((values-low)/(high-low),0,1)*255).astype(np.int32)
             pixels=lut[indices,:3]
             selected=row_indices==index
@@ -2081,6 +2083,26 @@ class CalibrationProfilePlot(EditablePlot):
             self.set_axis_bounds('y',*padded_range(values, high_pad=.2))
         except Exception:
             pass
+
+class ResponsePlot(EditablePlot):
+    '''The intensity response R(lambda): the installed one solid, a preview dashed.'''
+    def __init__(self, parent=None):
+        super().__init__(parent=parent, grid=True)
+        self.set_plot_margins(40, 10, 8, 36); self.left_axis.divisions = 2; self.bottom_axis.divisions = 3
+        self._items = []; self.set_x_label('Wavelength / nm'); self.set_y_label('R')
+        self.set_curves()
+    def set_curves(self, installed=None, preview=None):
+        for item in self._items:
+            self.plotItem.removeItem(item)
+        self._items = []; colors = palette(); xs = []
+        for curve, pen in ((installed, pg.mkPen(colors['data'], width=1.6)), (preview, pg.mkPen(colors['amber'], width=1.6, style=Qt.DashLine))):
+            if curve is None:
+                continue
+            x = np.asarray(curve[0], dtype=float); y = np.asarray(curve[1], dtype=float)
+            self._items.append(self.plotItem.plot(x, y, antialias=True, pen=pen)); xs += [float(x.min()), float(x.max())]
+        self.set_empty('' if xs else 'No intensity response')
+        self.set_axis_bounds('x', min(xs) if xs else 500.0, max(xs) if xs else 800.0)
+        self.set_axis_bounds('y', 0.0, 1.08)
 
 class CalibrationMappingPlot(EditablePlot):
     def __init__(self, parent=None):

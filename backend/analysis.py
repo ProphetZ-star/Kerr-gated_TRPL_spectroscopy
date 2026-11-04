@@ -27,7 +27,7 @@ def fit_frames(delays, spectra, exposure, axis, options, cancel=None):
     return _fit_curve(np.asarray(curve['delays_ps'],dtype=float),np.asarray(curve['values'],dtype=float),options,cancel)
 
 
-def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=None, cancel=None):
+def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=None, cancel=None, response=None):
     """Fit a run's frames (a FrameTable block) with the request's processing options.
 
     With two or more rounds the fit is repeated for each round on its own; the spread of those results gives a
@@ -35,9 +35,9 @@ def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=N
     from .models import FitRequest
     from .processing import kinetics, processing_of
     options=FitRequest(**options.model_dump())
-    curve=kinetics(block,axis,options,background,full_scale,targets_mm)
+    curve=kinetics(block,axis,options,background,full_scale,targets_mm,response=response)
     result=_fit_curve(np.asarray(curve['delays_ps'],dtype=float),np.asarray(curve['values'],dtype=float),options,cancel)
-    result.update(processing=processing_of(options),rounds_used=curve['rounds_used'],frames_used=curve['counts']['frames_used'],
+    result.update(processing=dict(processing_of(options),response_corrected=response is not None),rounds_used=curve['rounds_used'],frames_used=curve['counts']['frames_used'],
                   excluded=dict(saturated_points=curve['counts']['saturated_points'] if options.exclude_saturated else 0,
                                 unstable_frames=curve['counts']['unstable_frames'] if options.exclude_unstable else 0,
                                 off_position_frames=curve['counts']['off_position_frames']))
@@ -45,7 +45,7 @@ def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=N
     if len(curve['rounds_used'])>=2:
         for r in curve['rounds_used']:
             if cancel is not None and cancel.is_set():raise ValueError('Fit cancelled')
-            single=kinetics(block,axis,options,background,full_scale,targets_mm,rounds=[r])
+            single=kinetics(block,axis,options,background,full_scale,targets_mm,rounds=[r],response=response)
             try:fits.append(_fit_curve(np.asarray(single['delays_ps'],dtype=float),np.asarray(single['values'],dtype=float),options,cancel)['parameters'])
             except ValueError as exc:
                 if 'cancelled' in str(exc):raise
