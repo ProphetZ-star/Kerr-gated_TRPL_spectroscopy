@@ -29,7 +29,7 @@ End If
 
 result = 1
 If fso.FileExists(python) Then
-    args = Quote(probe) & " --probe --requirements " & Quote(requirements) & " --marker " & Quote(marker)
+    args = Quote(probe) & " --probe --quick --requirements " & Quote(requirements) & " --marker " & Quote(marker)
     result = shell.Run(Quote(python) & " " & args, 0, True)
 End If
 

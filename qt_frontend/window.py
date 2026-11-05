@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import get_args
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QVariantAnimation, QEasingCurve, QFile
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QVariantAnimation, QEasingCurve, QFile, QEvent
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QMenu
 from .icons import icon_box, line_icon
@@ -140,25 +140,24 @@ class MainWindow(QMainWindow):
         self._closing_started = False
         self.output_dir = Path.cwd() / 'data'
         self._build_ui()
-        for scroll in (self.acquisition_scroll, self.analysis_scroll, self.calibration_scroll):
-            HoverReveal(scroll)
+        HoverReveal(self.acquisition_scroll)
         # Plots that share a wavelength / pixel axis zoom together and share one undo history.
         self.spectrum_plot.sync_x_with(self.map_plot)
-        self.cal_image.sync_x_with(self.cal_spectrum)
         if QApplication.instance() is not None:
             install_focus_ring(QApplication.instance())
         apply_pointer_cursors(self)
         self._connect_controller()
         self._map_timer = QTimer(self)
         self._map_timer.setInterval(100)
+        self._map_timer.setSingleShot(True)
         self._map_timer.timeout.connect(self._flush_map)
         self._label_timer = QTimer(self)
         self._label_timer.setInterval(150)
+        self._label_timer.setSingleShot(True)
         self._label_timer.timeout.connect(self._flush_labels)
         self._cal_timer = QTimer(self)
         self._cal_timer.setInterval(300)
         self._cal_timer.timeout.connect(self._poll_calibration_capture)
-        self._load_demo_reference(silent=True)
         self._apply_theme()
         self._apply_visual_geometry()
         self._schedule_refresh()
@@ -265,12 +264,8 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.setObjectName('centralStack')
         self._acquisition_page = self._build_acquisition_page()
-        self._analysis_page = self._build_analysis_page()
-        self._calibration_page = self._build_calibration_page()
-        self._pages = {'acquisition': self._acquisition_page, 'analysis': self._analysis_page, 'calibration': self._calibration_page}
+        self._pages = {'acquisition': self._acquisition_page, 'analysis': None, 'calibration': None}
         self.stack.addWidget(self._acquisition_page)
-        self.stack.addWidget(self._analysis_page)
-        self.stack.addWidget(self._calibration_page)
         self._build_footer()
         root.addWidget(self.top)
         root.addWidget(self.subnav)
@@ -1763,7 +1758,7 @@ class MainWindow(QMainWindow):
         self.response_summary.setObjectName('responseSummary'); self.response_summary.setWordWrap(True); self.response_summary.setProperty('muted', True)
         self._reg('responseSummary', self.response_summary, False)
         layout.addWidget(self.response_summary)
-        self.response_plot = ResponsePlot(); self.response_plot.setObjectName('responsePlot'); self.response_plot.setFixedHeight(150)
+        self.response_plot = ResponsePlot(); self.response_plot.setObjectName('responsePlot'); self.response_plot.setFixedHeight(164)
         self._reg('responsePlot', self.response_plot, False)
         layout.addWidget(self.response_plot)
         self.response_import = QPushButton('Import curves…'); self.response_import.setObjectName('responseImport'); self.response_import.setFixedHeight(34)
@@ -1869,6 +1864,8 @@ class MainWindow(QMainWindow):
         self.controller.dispatch('response_clear', {}, success=lambda result: (self.controller.request_status(), self.show_toast('Intensity response cleared')),
                                  failure=lambda payload: self.show_toast(payload_message(payload)))
     def _update_response_controls(self, snapshot):
+        self.spectrum_legend.entries['background'].setVisible(not getattr(self, '_live_corrected', False))
+        if self._pages.get('calibration') is None:return
         installed = snapshot.get('response') or {}; candidate = snapshot.get('response_candidate') or {}
         progress = snapshot.get('response_progress') or {}; busy = snapshot.get('busy')
         has_axis = bool((snapshot.get('calibration') or {}).get('wavelengths_nm'))
@@ -1901,12 +1898,10 @@ class MainWindow(QMainWindow):
         self.response_apply.setEnabled(idle and bool(candidate.get('candidate_id')))
         self.response_clear.setEnabled(idle and bool(installed.get('values')))
         key = (installed.get('response_id'), candidate.get('candidate_id'))
-        if key != self._response_plot_key:
+        if key != self._response_plot_key and not self.isMinimized():
             self._response_plot_key = key
             curve = lambda item: (item['wavelengths_nm'], [np.nan if v is None else v for v in item['values']]) if item.get('values') else None
             self.response_plot.set_curves(curve(installed), curve(candidate))
-        # The Live spectrum's Background entry means nothing while it is shown corrected (the background is taken off).
-        self.spectrum_legend.entries['background'].setVisible(not getattr(self, '_live_corrected', False))
     def _build_cal_image_panel(self):
         panel = Panel('CCD frame / pixel')
         panel.header.setFixedHeight(52)
@@ -2023,11 +2018,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(mapping_panel, 21)
         return outer
     def _connect_controller(self):
-        self.cal_order.currentIndexChanged.connect(self._invalidate_cal_solution)
-        self.cal_convention.currentIndexChanged.connect(self._invalidate_cal_solution)
-        self.fit_model.currentIndexChanged.connect(self._analysis_options_changed)
-        for edit in (self.irf_width,self.fit_start,self.fit_end):
-            edit.editingFinished.connect(self._analysis_options_changed)
         self.controller.snapshotChanged.connect(self._on_snapshot)
         self.controller.stateChanged.connect(self._on_state)
         self.controller.dataChanged.connect(self._on_data)
@@ -2139,6 +2129,7 @@ class MainWindow(QMainWindow):
         for pin in pins:
             pin['box'].setProperty('hint', f"{pin['label']} · {self.PIN_HELP}" if compact else self.PIN_HELP); pin['box'].set_shown(pin['box'].shown)
     def _schedule_refresh(self):
+        if self.isMinimized():return
         if not self._map_timer.isActive():
             self._map_timer.start()
         if not self._label_timer.isActive():
@@ -2238,7 +2229,7 @@ class MainWindow(QMainWindow):
                 self.controller.dispatch('device_connect', {'device': 'camera', 'driver': 'andor_sdk2', 'transport': 'usb', 'dll_directory': '', 'camera_index': index}, success=connected, failure=failed)
             self.controller.dispatch('device_cameras', {'dll_directory': ''}, success=found, failure=failed)
     def _on_state(self):
-        self._update_from_snapshot()
+        # snapshotChanged has already synchronized controls for this same controller update.
         self._schedule_refresh()
     def _on_data(self):
         self._schedule_refresh()
@@ -2246,9 +2237,11 @@ class MainWindow(QMainWindow):
         self._update_analysis_labels()
         self._update_cal_controls()
     def _on_analysis(self):
+        self._analysis_dirty = True
         self._update_analysis_labels()
         self._redraw_analysis()
     def _on_fit_started(self, scope):
+        if self._pages.get('analysis') is None:return
         if scope == 'analysis':
             self._fit_running = True
             self.fit_status.setText('Fitting…')
@@ -2257,6 +2250,7 @@ class MainWindow(QMainWindow):
             set_prop(self.analysis_fit_state, 'data-state', 'warning')
             self.run_fit_button.setEnabled(False)
     def _on_fit_ready(self, scope, result):
+        if self._pages.get('analysis') is None:return
         if scope == 'analysis':
             self._fit_running = False
             self.fit_status.setText('Fit complete')
@@ -2265,6 +2259,7 @@ class MainWindow(QMainWindow):
             self.export_fit.setEnabled(True)
             self.show_toast('Fit complete')
     def _on_fit_failed(self, scope, message):
+        if self._pages.get('analysis') is None:return
         if scope == 'analysis':
             self._fit_running = False
             self.fit_status.setText(str(message))
@@ -2339,21 +2334,22 @@ class MainWindow(QMainWindow):
                 _set_combo(self.grating_combo, str(int(spectrograph.get('grating'))))
             if spectrograph.get('slit_um') is not None and not self.slit_edit.hasFocus():
                 self.slit_edit.setText(f'{float(spectrograph.get("slit_um")):.6g}')
-            if self._cal_signature is None:
-                self._cal_signature = self._calibration_signature(snapshot)
-            else:
-                signature = self._calibration_signature(snapshot)
-                if signature != self._cal_signature:
-                    self._cal_signature = signature
-                    self._clear_calibration_frame(clear_pixels=True)
-            if source_mode == 'hardware' and self._reference_source != 'measured':
-                if self._cal_lines:
-                    self._cal_lines = []
-                    self._reference_name = 'Import measured reference wavelengths'
-                    self.cal_reference_name.setText(self._reference_name)
-                    self._repopulate_cal_table()
-            elif source_mode == 'simulation' and not self._cal_lines:
-                self._load_demo_reference(silent=True)
+            if self._pages.get('calibration') is not None:
+                if self._cal_signature is None:
+                    self._cal_signature = self._calibration_signature(snapshot)
+                else:
+                    signature = self._calibration_signature(snapshot)
+                    if signature != self._cal_signature:
+                        self._cal_signature = signature
+                        self._clear_calibration_frame(clear_pixels=True)
+                if source_mode == 'hardware' and self._reference_source != 'measured':
+                    if self._cal_lines:
+                        self._cal_lines = []
+                        self._reference_name = 'Import measured reference wavelengths'
+                        self.cal_reference_name.setText(self._reference_name)
+                        self._repopulate_cal_table()
+                elif source_mode == 'simulation' and not self._cal_lines:
+                    self._load_demo_reference(silent=True)
             availability = device_availability(snapshot, getattr(self.controller, 'online', True))
             busy = snapshot.get('busy')
             self.stage_fields.setEnabled(bool(getattr(self.controller, 'online', False) and (stage_connected or availability.get('stage'))) and busy not in ('scan', 'move', 'calibration'))
@@ -2550,8 +2546,26 @@ class MainWindow(QMainWindow):
             duration = 'Estimated ' + format_duration(plan['estimated_seconds'])
         self.remaining.setText(duration + f" · ×{request['speedup']:g} simulation" if self._selected_source == 'simulation' else duration)
     def _flush_labels(self):
+        if self.isMinimized():return
         if self._current_page == 'acquisition':
-            self._update_live_spectrum()
+            snapshot = self._snapshot or {}; dataset = self.controller.acquisition
+            response = snapshot.get('response') or {}; camera = snapshot.get('camera') or {}
+            frame = snapshot.get('latest') or getattr(self, '_live_frame', (None, None))[0]
+            # Qt's dict signals copy nested frames even when compact status has no new data.
+            # Compare their values; a new acquisition version still refreshes identical-count frames for noise statistics.
+            frame_key = None if frame is None else (tuple(frame.get('spectrum') or []),
+                *(frame.get(name) for name in ('record_id','t_start_s','t_end_s','exposure_s','delay_ps','saturated_pixels','source_mode')))
+            key = (frame_key, (snapshot.get('_sync') or {}).get('latest_version'), snapshot.get('worker_session_id'),
+                   snapshot.get('latest') is not None, id(dataset), dataset.revision, self._picked_delay, dataset.wave, dataset.half_window,
+                   current_mode(), self.spectrum_scale.current(), snapshot.get('source_mode'), snapshot.get('device_generation'),
+                   tuple(snapshot.get('live_axis') or []), tuple(response.get('values') or []), tuple(response.get('wavelengths_nm') or []),
+                   tuple((snapshot.get('background') or {}).get('spectrum') or []),
+                   camera.get('full_scale'), camera.get('exposure_s'), camera.get('electrons_per_count'), camera.get('read_noise_e'),
+                   json.dumps(camera.get('readout') or {}, sort_keys=True))
+            if key != getattr(self, '_live_display_key', None):
+                self._update_live_spectrum()
+                self.spectrum_legend.entries['background'].setVisible(not self._live_corrected)
+                self._live_display_key = key
             self._update_header(self._snapshot or {})
         if self._current_page == 'analysis':
             self._update_analysis_labels()
@@ -2560,29 +2574,23 @@ class MainWindow(QMainWindow):
         self._update_output_status()
         self._apply_visual_geometry()
     def _flush_map(self):
-        if self._current_page != 'acquisition':
+        if self._current_page != 'acquisition' or getattr(self, 'isMinimized', lambda: False)():
             return
         dataset = self.controller.acquisition
         scale = self.map_scale.current()
+        axis = dataset.axis
+        if not hasattr(self, '_map_spectrum_cache'):
+            self._map_spectrum_cache = correction.RunSpectrumCache()
+        correction_version = self._map_spectrum_cache.prepare(dataset, axis)
         pins = tuple((pin['key'], pin['wave']) for pin in self._decay_pins)
         key = (id(dataset), dataset.revision, current_mode(), scale, dataset.wave, dataset.half_window, pins, self.decay_normalize.isChecked(),
-               (((dataset.run or {}).get('metadata') or {}).get('calibration') or {}).get('response_id'))
+               correction_version)
         if not self._map_dirty and key == self._map_key:
             return
-        if getattr(self,'_map_dataset',None) is not dataset:
-            self._map_dataset=dataset;self._map_spectra_cache={}
-        for delay,group in dataset.groups.items():
-            cached=self._map_spectra_cache.get(delay)
-            if cached is None or cached[0]!=group.count:
-                self._map_spectra_cache[delay]=(group.count,group.raw)
-        spectra={delay:entry[1] for delay,entry in self._map_spectra_cache.items()}
-        response=self._run_response_on_axis(dataset)
-        if response is not None:
-            background=correction.run_background(dataset.run)
-            spectra={delay:correction.apply(values,response,background) for delay,values in spectra.items()}
+        spectra = self._map_spectrum_cache.spectra(dataset.groups)
         saturated={delay:group.saturated for delay,group in dataset.groups.items() if group.saturated.any()}
         planned=(dataset.run or {}).get('plan',{}).get('delays_ps',[-2,20])
-        vmin, vmax = self.map_plot.set_map(dataset.axis, spectra, scale, planned, saturated, self._map_levels)
+        vmin, vmax = self.map_plot.set_map(axis, spectra, scale, planned, saturated, self._map_levels)
         self.map_saturated_key.setVisible(bool(saturated))
         self.map_color_key.setVisible(bool(spectra))  # a 1–1 colour key before any data is noise
         self.color_min.set_value_text(_format_map_value(vmin))
@@ -2590,11 +2598,11 @@ class MainWindow(QMainWindow):
         self._apply_visual_geometry()  # key width follows the value texts; keep its right edge on the map edge
         if self._selected_delay is None and dataset.delays:
             self._selected_delay = dataset.delays[0]
-        delays, intensities = self._raw_decay_points(dataset)
+        delays, intensities = self._raw_decay_points(dataset, spectra=spectra)
         baseline, basis = self._decay_baseline(dataset, dataset.wave, delays, intensities)
         extra = []
         for pin in self._decay_pins:
-            pin_delays, pin_values = self._raw_decay_points(dataset, pin['wave'])
+            pin_delays, pin_values = self._raw_decay_points(dataset, pin['wave'], spectra=spectra)
             extra.append((pin['key'], pin['label'], pin['color'], pin_delays, pin_values, self._decay_baseline(dataset, pin['wave'], pin_delays, pin_values)[0]))
         self.decay_plot.set_decay(delays, intensities, 'linear', key='decay_main', extra=extra, normalize=self.decay_normalize.isChecked(),
                                   label=f'{float(dataset.wave):.1f} nm' if extra else None, baseline=baseline)
@@ -2655,7 +2663,13 @@ class MainWindow(QMainWindow):
         if response is not None and current is not None and len(current):
             current = correction.apply(current, response, correction.run_background(dataset.run) if picked else bg_array)
             bg_array = None
-        self._live_corrected = response is not None and current is not None
+        corrected = response is not None and current is not None
+        if corrected != getattr(self, '_live_corrected', False):
+            # Corrected and raw counts have different scales. A zoom in the previous scale can hide
+            # the restored raw spectrum; keep the wavelength zoom but release the intensity range.
+            self.spectrum_plot._clear_axis('y')
+            self.spectrum_plot.zoom_group.changed()
+        self._live_corrected = corrected
         self.spectrum_plot.set_spectrum(x, current, bg_array, x_label, self.spectrum_scale.current())
         self._sync_pins()
         averaged = dataset.groups[self._picked_delay].count if picked else 1
@@ -2672,7 +2686,19 @@ class MainWindow(QMainWindow):
             self.spectrum_plot.set_y_label('Corrected counts')
             self.spectrum_legend.set_hint('current', f'{correction.LABEL}: (raw − background) / R(λ); raw counts are kept. The intensity response is installed on the Spectral calibration page.')
         else:
-            self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
+            # Full scale can be 65535 times the ROI row count, flattening a weak spectrum to an
+            # apparent zero line after clearing the response. Fit the actual raw data/background.
+            visible = [np.asarray(values, dtype=float) for values in (current, bg_array) if values is not None and len(values)]
+            finite = np.concatenate(visible) if visible else np.array([], dtype=float)
+            finite = finite[np.isfinite(finite)]
+            if finite.size:
+                if logarithmic:
+                    positive = finite[finite > 0]
+                    self.spectrum_plot.set_axis_bounds('y', 0, math.log10(max(10.0, float(positive.max()) if positive.size else 10.0)) * 1.05)
+                else:
+                    self.spectrum_plot.set_axis_bounds('y', *padded_range(finite))
+            else:
+                self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
             self.spectrum_plot.set_y_label('CCD / counts')  # log axes label decades in counts
             self.spectrum_legend.set_hint('current', '')
         self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(axis) and current is not None)
@@ -2783,12 +2809,12 @@ class MainWindow(QMainWindow):
     def _run_response_on_axis(self, dataset):
         '''The response recorded with this run, on its wavelength axis, or None.'''
         return correction.on(correction.recorded(dataset.run), dataset.axis) if dataset is not None and dataset.axis else None
-    def _raw_decay_points(self, dataset, wave=None, corrected=True):
+    def _raw_decay_points(self, dataset, wave=None, corrected=True, spectra=None):
         axis = dataset.axis
         wave = dataset.wave if wave is None else wave
         half = dataset.half_window
         indices = self._decay_window(dataset, wave)
-        response = self._run_response_on_axis(dataset) if corrected else None
+        response = self._run_response_on_axis(dataset) if corrected and spectra is None else None
         background = correction.run_background(dataset.run) if response is not None else None
         delays = []
         intensities = []
@@ -2796,7 +2822,7 @@ class MainWindow(QMainWindow):
             group = dataset.groups.get(delay)
             if group is None:
                 continue
-            values = group.raw
+            values = spectra[delay] if spectra is not None else group.raw
             if response is not None:
                 values = correction.apply(values, response, background)
             if indices:
@@ -2863,6 +2889,7 @@ class MainWindow(QMainWindow):
         self._map_dirty = True
         self._schedule_refresh()
     def _update_analysis_labels(self):
+        if self._pages.get('analysis') is None or self._current_page != 'analysis' or self.isMinimized():return
         dataset = self.controller.analysis_context
         if getattr(self,'_analysis_dataset',None) is not dataset:
             self._analysis_dataset=dataset;self._spectrum_overlays=[];self._spectrum_initialized=False
@@ -3364,6 +3391,7 @@ class MainWindow(QMainWindow):
             self.show_toast(f'CCD temperature is {label} ({float(temperature):.1f} °C) · these frames are marked unstable and Analysis can leave them out', 'warning')
         self._scan_temperature_state = state
     def _redraw_analysis(self):
+        if self._pages.get('analysis') is None or self._current_page != 'analysis' or self.isMinimized():return
         dataset = self.controller.analysis_context
         if dataset is None:
             return
@@ -4120,7 +4148,10 @@ class MainWindow(QMainWindow):
     def _discard_unfinished_files(self, run):
         '''A failed scan leaves NAME.partial.h5, and one stopped before its first round finished leaves
         NAME.stopped.h5; move it to the Recycle Bin so only usable experiments stay in the data folder. The
-        frames of a failed scan remain in memory and can still be saved from the Analysis page.'''
+        frames of a failed scan remain in a private disk copy and can still be saved from Analysis.'''
+        if run.get('files_removal_blocked'):
+            self.show_toast('Unfinished scan retained at its original path so its data remains available', 'warning')
+            return
         path = run.get('path')
         if not (run.get('saved') or run.get('status') == 'error') or not path:
             return
@@ -4282,6 +4313,7 @@ class MainWindow(QMainWindow):
         name = str(name)
         if name not in self._pages:
             return
+        self._ensure_page(name)
         self._current_page = name
         self.stack.setCurrentWidget(self._pages[name])
         for key, button in self.nav_buttons.items():
@@ -4294,12 +4326,48 @@ class MainWindow(QMainWindow):
             self._analysis_view_changed()
         elif name == 'calibration':
             self._update_cal_plots()
+        self._schedule_refresh()
+
+    def _ensure_page(self, name):
+        if self._pages[name] is not None:return
+        page = self._build_analysis_page() if name == 'analysis' else self._build_calibration_page()
+        self._pages[name] = page
+        setattr(self, '_' + name + '_page', page)
+        self.stack.addWidget(page)
+        HoverReveal(getattr(self, name + '_scroll'))
+        if name == 'analysis':
+            self.fit_model.currentIndexChanged.connect(self._analysis_options_changed)
+            for edit in (self.irf_width,self.fit_start,self.fit_end):
+                edit.editingFinished.connect(self._analysis_options_changed)
+            self._analysis_dirty = True
+        else:
+            self.cal_order.currentIndexChanged.connect(self._invalidate_cal_solution)
+            self.cal_convention.currentIndexChanged.connect(self._invalidate_cal_solution)
+            self.cal_image.sync_x_with(self.cal_spectrum)
+            self._load_demo_reference(silent=True)
+        apply_pointer_cursors(page)
+        self._update_from_snapshot()
+        self._apply_visual_geometry()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and hasattr(self, '_map_timer'):
+            minimized = self.isMinimized()
+            if hasattr(self.controller.bridge, 'set_background'):
+                self.controller.bridge.set_background(minimized)
+            if minimized:
+                self._map_timer.stop(); self._label_timer.stop()
+            else:
+                self._analysis_dirty = True
+                self._update_from_snapshot()
+                if self._current_page == 'calibration':self._update_cal_plots()
+                self._schedule_refresh()
     def _toggle_theme(self):
         mode = 'dark' if current_mode() == 'light' else 'light'
         apply_to_app(mode)
         self._refresh_run_icons()
         self._apply_icons()
-        for plot in (self.spectrum_plot, self.map_plot, self.decay_plot, self.analysis_curve, self.analysis_residual, self.cal_image, self.cal_spectrum, self.cal_mapping, self.cal_residual, self.response_plot):
+        for plot in self._created_plots():
             plot.update_theme()
         self._response_plot_key = None  # redraw its curves in the new colours
         self._map_dirty = True
@@ -4311,8 +4379,12 @@ class MainWindow(QMainWindow):
             apply_to_app('light')
         except Exception:
             pass
-        for plot in (self.spectrum_plot, self.map_plot, self.decay_plot, self.analysis_curve, self.analysis_residual, self.cal_image, self.cal_spectrum, self.cal_mapping, self.cal_residual):
+        for plot in self._created_plots():
             plot.update_theme()
+    def _created_plots(self):
+        names = ('spectrum_plot','map_plot','decay_plot','analysis_curve','analysis_residual',
+                 'cal_image','cal_spectrum','cal_mapping','cal_residual','response_plot')
+        return [getattr(self, name) for name in names if hasattr(self, name)]
     def capture_calibration(self):
         exposure = number_value(self.cal_exposure)
         if exposure is None or exposure <= 0:
@@ -4838,6 +4910,7 @@ class MainWindow(QMainWindow):
         self._refresh_line_widgets()
         self._update_cal_plots()
     def _update_cal_plots(self):
+        if self._pages.get('calibration') is None or self.isMinimized():return
         axis_mode = self.cal_axis.current()
         solution = self._cal_solution
         self.cal_mapping.set_data(self._cal_lines, solution)
@@ -4864,6 +4937,7 @@ class MainWindow(QMainWindow):
         self._update_cal_controls()
         self._update_calibration_state()
     def _update_cal_controls(self):
+        if self._pages.get('calibration') is None:return
         snapshot = self._snapshot or {}
         busy = snapshot.get('busy')
         online = bool(getattr(self.controller, 'online', False))
@@ -4901,6 +4975,7 @@ class MainWindow(QMainWindow):
         else:
             self.cal_connection_note.setText('Backend simulated frame' if snapshot.get('source_mode')=='simulation' else 'CCD connected · SDK2 acquisition')
     def _update_calibration_state(self):
+        if self._pages.get('calibration') is None:return
         snapshot = self._snapshot or {}
         calibration = snapshot.get('calibration') or {}
         warning = snapshot.get('calibration_warning')

@@ -47,3 +47,53 @@ def apply(spectrum, response, background=None):
     if background is not None and len(background) != spectrum.shape[-1]:
         background = None
     return correct(spectrum, response, background)
+
+
+class RunSpectrumCache:
+    '''Display spectra for one run, shared by its map and decay curves.
+
+    Prepare before checking a plot's redraw key: metadata can change without new frames. Compare numeric
+    contents because status snapshots replace their lists, and IDs alone do not detect changed curves.
+    Unchanged groups keep the same array object so MapPlot can reuse its own binning cache.
+    '''
+    def __init__(self):
+        self._dataset = None
+        self._context = None
+        self._entries = {}
+        self.response = None
+        self.background = None
+        self.version = 0
+
+    @staticmethod
+    def _signature(values):
+        return None if values is None else np.asarray(values, dtype=float).tobytes()
+
+    def prepare(self, dataset, axis):
+        curve = recorded(dataset.run)
+        background = run_background(dataset.run) if curve is not None else None
+        context = (self._signature(axis),
+                   None if curve is None else tuple(self._signature(v) for v in curve),
+                   self._signature(background))
+        if self._dataset is not dataset or context != self._context:
+            self._dataset = dataset
+            self._context = context
+            self.response = on(curve, axis)
+            self.background = background
+            self._entries = {}
+            self.version += 1
+        return self.version
+
+    def spectra(self, groups):
+        entries = {}
+        for delay, group in groups.items():
+            previous = self._entries.get(delay)
+            if previous is not None and previous[0] is group and previous[1] == group.count:
+                entries[delay] = previous
+                continue
+            values = group.raw
+            if self.response is not None:
+                values = apply(values, self.response, self.background)
+            entries[delay] = (group, group.count, values)
+        # Replacing the mapping also drops removed delays (e.g. a reset or a truncated scan).
+        self._entries = entries
+        return {delay: entry[2] for delay, entry in entries.items()}

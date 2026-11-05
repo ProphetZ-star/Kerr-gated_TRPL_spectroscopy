@@ -237,7 +237,7 @@ function Initialize-KerrEnvironment([string]$Root, [string]$Requirements = 'requ
         $repair = $false
         if ($markerMatches) {
             Write-KerrSetupStatus 2 'Requirements unchanged; verifying the local runtime' 'checking'
-            $probeExit = Invoke-KerrInstaller -Python $projectPython -Parameters @('-u', $probePath, '--probe', '--requirements', $requirementsPath, '--marker', $markerPath) -IdleTimeoutSeconds 120 -Step 2
+            $probeExit = Invoke-KerrInstaller -Python $projectPython -Parameters @('-u', $probePath, '--probe', '--quick', '--requirements', $requirementsPath, '--marker', $markerPath) -IdleTimeoutSeconds 120 -Step 2
             if ($probeExit -eq 0) {
                 Write-KerrSetupStatus 4 'Dependencies ready' 'ready'
                 return $projectPython

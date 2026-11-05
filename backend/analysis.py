@@ -35,7 +35,7 @@ def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=N
     from .models import FitRequest
     from .processing import kinetics, processing_of
     options=FitRequest(**options.model_dump())
-    curve=kinetics(block,axis,options,background,full_scale,targets_mm,response=response)
+    curve=kinetics(block,axis,options,background,full_scale,targets_mm,response=response,cancel=cancel)
     result=_fit_curve(np.asarray(curve['delays_ps'],dtype=float),np.asarray(curve['values'],dtype=float),options,cancel)
     result.update(processing=dict(processing_of(options),response_corrected=response is not None),rounds_used=curve['rounds_used'],frames_used=curve['counts']['frames_used'],
                   excluded=dict(saturated_points=curve['counts']['saturated_points'] if options.exclude_saturated else 0,
@@ -43,9 +43,8 @@ def fit_run(block, axis, options, background=None, full_scale=None, targets_mm=N
                                 off_position_frames=curve['counts']['off_position_frames']))
     spread={};fits=[]
     if len(curve['rounds_used'])>=2:
-        for r in curve['rounds_used']:
+        for single in curve['per_round']:
             if cancel is not None and cancel.is_set():raise ValueError('Fit cancelled')
-            single=kinetics(block,axis,options,background,full_scale,targets_mm,rounds=[r],response=response)
             try:fits.append(_fit_curve(np.asarray(single['delays_ps'],dtype=float),np.asarray(single['values'],dtype=float),options,cancel)['parameters'])
             except ValueError as exc:
                 if 'cancelled' in str(exc):raise

@@ -92,50 +92,49 @@ def export_csv(
         ]
     )
 
-    spectra = frames.spectra
-    if len(frames) and spectra.shape[1] != n_pixels:
-        raise ValueError(f"spectrum length {spectra.shape[1]} does not match wavelength length {n_pixels}")
-    # Integer counts sum exactly, so this equals adding the included pixels one by one.
-    totals = spectra[:, included].astype("int64").sum(axis=1)
     exposure_s = finite_number(frames.exposure_s, "exposure_s", True)
-    delays = frames.delays
-    if not np.isfinite(delays).all():
-        raise ValueError("delay_ps must be finite")
     background_mean = None if background is None else float(np.asarray(background, dtype=float)[included].sum()) / len(included)
-    saturated = (spectra[:, included] >= full_scale).sum(axis=1) if full_scale is not None else None
-    index = frames.column("index")
-    temperature = frames.column("temperature_c"); state = frames.column("temperature_state")
-    reported = frames.column("stage_reported_mm"); start = frames.column("t_start_s"); end = frames.column("t_end_s")
     targets = None if targets_mm is None else np.asarray(targets_mm, dtype=float)
     def optional(value, digits=None):
         value = float(value)
         return "" if not math.isfinite(value) else (round(value, digits) if digits is not None else value)
-    for row, total in enumerate(totals):
-        mean_counts = float(total) / len(included)
-        point = int(index[row, 1])
-        error = abs(float(reported[row]) - targets[point]) * 1000 if targets is not None and 0 <= point < len(targets) else math.nan
-        code = int(state[row])
-        writer.writerow(
-            [
-                row,
-                int(index[row, 0]),
-                point,
-                int(index[row, 2]),
-                float(delays[row]),
-                center_nm,
-                half_window_nm,
-                mean_counts,
-                exposure_s,
-                "" if background_mean is None else background_mean,
-                "" if background_mean is None else mean_counts - background_mean,
-                "" if saturated is None else int(saturated[row]),
-                optional(temperature[row], 3),
-                TEMPERATURE_STATES[code] if 0 <= code < len(TEMPERATURE_STATES) else "",
-                optional(reported[row]),
-                optional(error, 4),
-                optional(start[row], 6),
-                optional(end[row], 6),
-            ]
-        )
+    from .disk_frames import FrameView
+    for block in FrameView(frames).iter_blocks():
+        spectra = block['spectra']
+        if spectra.shape[1] != n_pixels:
+            raise ValueError(f"spectrum length {spectra.shape[1]} does not match wavelength length {n_pixels}")
+        totals = spectra[:, included].astype('int64').sum(axis=1)
+        delays = block['delay_ps']
+        if not np.isfinite(delays).all():raise ValueError('delay_ps must be finite')
+        saturated = (spectra[:, included] >= full_scale).sum(axis=1) if full_scale is not None else None
+        index = block['index']; temperature = block['temperature_c']; state = block['temperature_state']
+        reported = block['stage_reported_mm']; start = block['t_start_s']; end = block['t_end_s']
+        for row, total in enumerate(totals):
+            mean_counts = float(total) / len(included)
+            point = int(index[row, 1])
+            error = abs(float(reported[row]) - targets[point]) * 1000 if targets is not None and 0 <= point < len(targets) else math.nan
+            code = int(state[row])
+            writer.writerow(
+                [
+                    block['offset'] + row,
+                    int(index[row, 0]),
+                    point,
+                    int(index[row, 2]),
+                    float(delays[row]),
+                    center_nm,
+                    half_window_nm,
+                    mean_counts,
+                    exposure_s,
+                    "" if background_mean is None else background_mean,
+                    "" if background_mean is None else mean_counts - background_mean,
+                    "" if saturated is None else int(saturated[row]),
+                    optional(temperature[row], 3),
+                    TEMPERATURE_STATES[code] if 0 <= code < len(TEMPERATURE_STATES) else "",
+                    optional(reported[row]),
+                    optional(error, 4),
+                    optional(start[row], 6),
+                    optional(end[row], 6),
+                ]
+            )
 
     return buffer.getvalue()

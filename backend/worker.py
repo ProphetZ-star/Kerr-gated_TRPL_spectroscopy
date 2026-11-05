@@ -17,6 +17,7 @@ from .devices import DeviceConnections, serial_ports
 from .drivers.hardware import HardwareError, AcquisitionCancelled, camera_choices
 from .storage.hdf5 import HDFWriter, read_run, append_analysis, store_analyses, delete_analysis
 from .storage.frames import FrameTable
+from .storage.disk_frames import DiskFrames, FrameView, CACHE_BYTES
 from .storage import schema
 from .storage.output import output_info,prepare_output
 from .storage.export import export_csv
@@ -65,7 +66,7 @@ def run_inputs(run,count=None):
     frames=run['frames'];count=len(frames) if count is None else count;metadata=run['metadata']
     background=metadata.get('background') or {}
     full_scale=((metadata.get('instrument') or {}).get('camera') or {}).get('full_scale')
-    return dict(block=frames.block(0,count),axis=copy.deepcopy(metadata['calibration']['wavelengths_nm']),
+    return dict(block=FrameView(frames,count),axis=copy.deepcopy(metadata['calibration']['wavelengths_nm']),
                 background=background.get('spectrum') if background.get('present') else None,
                 full_scale=full_scale,targets_mm=(metadata.get('acquisition') or {}).get('targets_mm'),response=run_response(metadata))
 
@@ -178,7 +179,8 @@ class Engine:
         limits=(self.stage.lower,self.stage.upper) if self.devices.mode=='hardware' and self.devices.connected('stage') else (0.,300.)
         plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision,limits=limits)
         # What the frames would take in memory, and what is free now (the GUI warns before a scan that will not fit).
-        plan['estimated_memory_bytes']=plan['total_frames']*resources.frame_bytes(readout_shape(self.camera.readout)[1])
+        frame_size=resources.frame_bytes(readout_shape(self.camera.readout)[1])
+        plan['estimated_memory_bytes']=(CACHE_BYTES+2128*frame_size if request.autosave else plan['total_frames']*frame_size)
         plan['usable_memory_bytes']=resources.usable_memory()
         if self.devices.mode=='hardware' and self.devices.connected('stage'):
             for target in plan['targets_mm']+[plan['approach_mm']]:self.stage.duration(target)
@@ -384,7 +386,10 @@ class Engine:
         try:
             if request['autosave'] and writer is None:
                 writer=HDFWriter(run['path'],run['metadata'])
-                with self.lock:run['writer']=writer
+                with self.lock:
+                    run['writer']=writer
+                    run['frames']=DiskFrames(writer.partial,0,run['frames'].pixels,run['frames'].exposure_s,
+                                             self.devices.mode,run['run_id'],writer)
             with self.lock:run['status']='running'
             event=transition('running')
             if writer:writer.submit('event',event)
@@ -486,12 +491,18 @@ class Engine:
                     try:writer.call('event',event)
                     except Exception as exc:
                         terminal='error';run['error']=f'Event write failed: {exc}'
-                    run['path']=writer.call('close',dict(status=terminal,ended_utc=ended,completed_rounds=whole))
+                    run['path']=run['frames'].finalize(writer,dict(status=terminal,ended_utc=ended,completed_rounds=whole))
                     run['writer_stats']=dict(writer.stats)
                     run['saved']=True
             except Exception as exc:
                 terminal='error';run['error']=(run['error']+'; ' if run['error'] else '')+f'Finalization failed: {exc}'
                 run['path']=str(writer.partial) if writer else run['path']
+            if terminal=='error' and isinstance(run['frames'],DiskFrames):
+                try:run['frames'].preserve_unfinished()
+                except Exception as exc:
+                    # Never let automatic cleanup remove the sole surviving copy of the raw frames.
+                    run['files_removal_blocked']=True
+                    run['error']=(run['error'] or '')+f'; Original file retained: {exc}'
             with self.lock:
                 run.pop('writer',None);run['status']=terminal;run['step']='idle';run['ended_utc']=ended
                 run['metadata']['root'].update(ended_utc=ended,terminal_status=terminal,completed_rounds=whole)
@@ -797,9 +808,12 @@ class Engine:
                     writer=HDFWriter(path,metadata)
             acquisition=metadata['acquisition']
             per_round=len(plan['delays_ps'])*request.frames_per_point
-            usable=resources.usable_memory();wanted=plan['total_frames'] or per_round
-            if usable is not None:wanted=min(wanted,max(16,usable//(2*resources.frame_bytes(acquisition['pixels']))))
-            frames=FrameTable(acquisition['pixels'],acquisition['exposure_s'],self.devices.mode,capacity=wanted)
+            if writer:
+                frames=DiskFrames(writer.partial,0,acquisition['pixels'],acquisition['exposure_s'],self.devices.mode,run_id,writer)
+            else:
+                usable=resources.usable_memory();wanted=plan['total_frames'] or per_round
+                if usable is not None:wanted=min(wanted,max(16,usable//(2*resources.frame_bytes(acquisition['pixels']))))
+                frames=FrameTable(acquisition['pixels'],acquisition['exposure_s'],self.devices.mode,capacity=wanted)
             run=dict(run_id=run_id,status='preparing',step='preparing',request=data,plan=plan,frames=frames,
                      metadata=metadata,path=str(path) if path else None,saved=False,created_utc=metadata['root']['created_utc'],ended_utc=None,
                      clock_origin=created.timestamp(),
@@ -962,10 +976,12 @@ class Engine:
                             writer.call('close',dict(status='error',ended_utc=ended));raise
                         run['path']=writer.call('close',dict(status=run['status'],ended_utc=ended,completed_rounds=run.get('completed_rounds') or 0))
                         run['saved']=True;run['files_removed']=False
+                        run['frames']=DiskFrames(run['path'],len(frames),frames.pixels,frames.exposure_s,frames.source_mode,
+                                                 run['metadata']['root']['run_id'])
                         for result in run['metadata'].get('analysis',{}).values():result['stored']=True
                         run['analysis_version']=run.get('analysis_version',0)+1;return self.public_run(run)
             if name=='run_files_removed':
-                # The frames stay in memory; the run still counts as handled, so a new scan can start without a prompt.
+                # Failed-run frames have a private disk copy; zero-frame stopped runs need no backing file.
                 run['files_removed']=True;run['path']=None;self.revision+=1;return self.public_run(run)
             if name=='discard':
                 self.idle(devices=False);self.runs={};self.current=None;self.latest=None;self.latest_version+=1;self.latest_axis=self.live_axis();return dict(discarded=True)
@@ -978,7 +994,7 @@ class Engine:
                 if not on_disk and len(run['metadata'].get('analysis',{}))+sum(t['status']=='running' and t.get('run_id')==run['run_id'] for t in self.tasks.values())>=64:
                     raise CommandError('Save this memory-only experiment before creating more than 64 fit results')
                 options=FitRequest(**data['options']);task_id=uuid.uuid4().hex[:16]
-                inputs=run_inputs(run);count=len(inputs['block']['delay_ps'])
+                inputs=run_inputs(run);count=len(inputs['block'])
                 self.tasks[task_id]=dict(status='running',run_id=run['run_id'])
                 cancel=Event();self.task_controls[task_id]=dict(cancel=cancel)
                 def fit():

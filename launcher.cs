@@ -4,8 +4,8 @@ using System.IO;
 using System.Reflection;
 using System.Windows.Forms;
 
-[assembly: AssemblyTitle("TRPL")]
-[assembly: AssemblyProduct("Kerr TRPL Qt")]
+[assembly: AssemblyTitle("Kerr studio")]
+[assembly: AssemblyProduct("Kerr studio")]
 [assembly: AssemblyVersion("1.0.0.0")]
 
 internal static class Launcher
@@ -20,7 +20,7 @@ internal static class Launcher
             "desktop.py",
             "qt_frontend/window.py",
             "backend/worker.py",
-            "assets/TRPL.ico",
+            "assets/Kerr studio.ico",
             "start-app.vbs",
             "runtime_probe.py"
         };
@@ -38,17 +38,17 @@ internal static class Launcher
         {
             if (missing == null)
             {
-                Console.WriteLine("TRPL Qt package OK");
+                Console.WriteLine("Kerr studio package OK");
                 return 0;
             }
-            Console.Error.WriteLine("Missing TRPL runtime file: " + missing);
+            Console.Error.WriteLine("Missing Kerr studio runtime file: " + missing);
             return 2;
         }
         try
         {
             if (missing != null)
             {
-                throw new FileNotFoundException("Extract the complete TRPL folder before opening TRPL.exe.", missing);
+                throw new FileNotFoundException("Extract the complete Kerr studio folder before opening Kerr studio.exe.", missing);
             }
             string script = Path.Combine(root, "start-app.vbs");
             ProcessStartInfo start = new ProcessStartInfo();
@@ -63,7 +63,7 @@ internal static class Launcher
         }
         catch (Exception error)
         {
-            MessageBox.Show(error.Message, "TRPL could not start", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(error.Message, "Kerr studio could not start", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
     }

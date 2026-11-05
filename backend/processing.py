@@ -35,12 +35,8 @@ def _average(delays, values):
     return t, np.bincount(inverse, weights=values, minlength=len(t)) / counts, counts
 
 
-def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=None, delay_range=True, rounds=None, response=None):
-    """Decay curve of a block of frames (FrameTable.block: spectra, delay_ps, index, temperature_state,
-    stage_reported_mm, exposure_s). options is a FitRequest (or anything with the same attributes).
-
-    Returns delays/values/frames (the averaged curve), per_round (the same per repeat round), saturated (the
-    excluded saturated points as delay/value pairs), and counts of what was flagged and what was used."""
+def _frame_values(block, axis, options, background=None, response=None):
+    """Validate one page and calculate its per-frame intensity using the unchanged processing rules."""
     spectra = np.asarray(block['spectra']); delays = np.asarray(block['delay_ps'], dtype=float)
     index = np.asarray(block['index']).reshape(-1, 3); n = len(delays)
     exposure = np.broadcast_to(np.asarray(block['exposure_s'], dtype=float), delays.shape)
@@ -72,6 +68,15 @@ def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=
     else:
         values = window.mean(axis=1) / exposure
     if not np.isfinite(values).all():raise ValueError('Exposure-normalized counts are non-finite')
+    return spectra, delays, index, values, mask
+
+
+def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=None, delay_range=True, rounds=None, response=None, cancel=None):
+    """Decay and per-round curves from either an array block or a bounded, paged frame snapshot."""
+    if hasattr(block, 'iter_blocks'):
+        return _stream_kinetics(block,axis,options,background,full_scale,targets_mm,delay_range,rounds,response,cancel)
+    spectra, delays, index, values, mask = _frame_values(block,axis,options,background,response)
+    n = len(delays)
     keep = np.ones(n, dtype=bool)
     round_index = index[:, 0]
     chosen = rounds if rounds is not None else getattr(options, 'rounds', None)
@@ -121,6 +126,81 @@ def kinetics(block, axis, options, background=None, full_scale=None, targets_mm=
                 rounds_available=[int(r) for r in np.unique(round_index).tolist()],
                 rounds_used=[int(r) for r in np.unique(round_index[used]).tolist()],
                 background_available=background is not None)
+
+
+def _stream_kinetics(source, axis, options, background, full_scale, targets_mm, delay_range, rounds, response, cancel):
+    """Reduce pages into (round, delay) sums, retaining no per-frame spectra or scalar arrays.
+
+    Saturation is combined across page boundaries before applying exclusions: a late saturated frame must
+    reject earlier frames of the same point too. Memory scales with the returned round/delay curves.
+    """
+    groups = {}
+    total = unstable_total = off_total = 0
+    max_error = None
+    chosen = rounds if rounds is not None else getattr(options, 'rounds', None)
+    targets = None if targets_mm is None else np.asarray(targets_mm, dtype=float)
+    tolerance = getattr(options, 'position_tolerance_um', None)
+    for block in source.iter_blocks(cancel=cancel):
+        spectra, delays, index, values, mask = _frame_values(block,axis,options,background,response)
+        n = len(delays); total += n
+        state = np.asarray(block.get('temperature_state',np.full(n,-1)))
+        unstable = np.isin(state,UNSTABLE_STATES); unstable_total += int(unstable.sum())
+        error = np.full(n,np.nan)
+        if targets is not None and 'stage_reported_mm' in block:
+            points = index[:,1]; valid = (points>=0)&(points<len(targets))
+            error[valid] = np.abs(np.asarray(block['stage_reported_mm'])[valid]-targets[points[valid]])*1000
+        finite = error[np.isfinite(error)]
+        if finite.size:max_error = max(float(finite.max()),max_error or 0.)
+        off = np.zeros(n,bool) if tolerance is None else np.nan_to_num(error,nan=0.)>tolerance
+        off_total += int(off.sum())
+        keep = np.ones(n,bool)
+        if chosen:keep &= np.isin(index[:,0],np.asarray(list(chosen)))
+        if getattr(options,'exclude_unstable',False):keep &= ~unstable
+        if tolerance is not None:keep &= ~off
+        hit = (spectra[:,mask]>=full_scale).any(axis=1) if full_scale is not None else np.zeros(n,bool)
+        pairs,inverse = np.unique(np.stack((index[:,0],delays),axis=1),axis=0,return_inverse=True)
+        inverse = inverse.reshape(-1)
+        counts = np.bincount(inverse,weights=keep.astype(float),minlength=len(pairs))
+        sums = np.bincount(inverse,weights=np.where(keep,values,0.),minlength=len(pairs))
+        hits = np.bincount(inverse,weights=hit.astype(float),minlength=len(pairs))>0
+        for i,(round_index,delay) in enumerate(pairs):
+            key = (int(round_index),float(delay))
+            entry = groups.setdefault(key,[0,0.,False])
+            entry[0] += int(counts[i]); entry[1] += float(sums[i]); entry[2] |= bool(hits[i])
+    if total == 0:
+        # Validate the selected window/options even for an empty experiment.
+        mask = window_mask(axis,options.wavelength_nm,options.half_window_nm)
+        _frame_values(dict(spectra=np.empty((0,len(mask)),dtype='i4'),delay_ps=np.empty(0),
+                           index=np.empty((0,3),dtype='i4'),exposure_s=1.),axis,options,background,response)
+    used = {}; saturated = {}; per_round = {}
+    excluded_frames = saturated_points = frames_used = 0
+    available = set()
+    def add(mapping,delay,count,value):
+        entry = mapping.setdefault(delay,[0,0.]); entry[0] += count; entry[1] += value
+    for (round_index,delay),(count,value,hit) in groups.items():
+        available.add(round_index); saturated_points += int(hit)
+        excluded = hit and getattr(options,'exclude_saturated',True)
+        if excluded:excluded_frames += count
+        in_range = not delay_range or ((getattr(options,'min_delay_ps',None) is None or delay>=options.min_delay_ps)
+                                      and (getattr(options,'max_delay_ps',None) is None or delay<=options.max_delay_ps))
+        if not count or not in_range:continue
+        if excluded:
+            add(saturated,delay,count,value)
+        else:
+            add(used,delay,count,value); frames_used += count
+            add(per_round.setdefault(round_index,{}),delay,count,value)
+    def curve(mapping):
+        delays = sorted(mapping)
+        return dict(delays_ps=delays,values=[mapping[d][1]/mapping[d][0] for d in delays])
+    result = curve(used)
+    result.update(frames=[used[d][0] for d in result['delays_ps']],
+                  per_round=[dict(round=r,**curve(per_round[r])) for r in sorted(per_round)],
+                  saturated=curve(saturated),
+                  counts=dict(frames_total=total,frames_used=frames_used,saturated_points=saturated_points,
+                              excluded_saturated_frames=excluded_frames,unstable_frames=unstable_total,
+                              off_position_frames=off_total,position_error_max_um=max_error),
+                  rounds_available=sorted(available),rounds_used=sorted(per_round),background_available=background is not None)
+    return result
 
 
 def processing_of(options):

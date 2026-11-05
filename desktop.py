@@ -7,6 +7,20 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _set_taskbar_identity():
+    """Give the Python-hosted Qt window its own Windows taskbar identity."""
+    if sys.platform != 'win32':
+        return
+    import ctypes
+    shell = ctypes.WinDLL('shell32')
+    set_id = shell.SetCurrentProcessExplicitAppUserModelID
+    set_id.argtypes = [ctypes.c_wchar_p]
+    set_id.restype = ctypes.c_long
+    result = set_id('KerrStudio.NativeDesktop')
+    if result < 0:
+        raise OSError(f'Cannot set taskbar application identity: 0x{result & 0xffffffff:08X}')
+
+
 def _log_exception(root, message=None):
     try:
         data = root / 'data'
@@ -75,6 +89,12 @@ def main():
     if not acquired:
         return 0
     try:
+        # Set this before QApplication creates any native windows. Otherwise Windows can group
+        # the app with pythonw.exe and use the interpreter's icon instead of our window icon.
+        try:
+            _set_taskbar_identity()
+        except OSError:
+            _log_exception(root, 'taskbar identity')
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
         from qt_frontend.theme import apply_to_app
@@ -83,7 +103,7 @@ def main():
         app.setApplicationName('Kerr Studio')
         app.setApplicationDisplayName('Kerr Studio · TRPL Acquisition')
         apply_to_app('light')
-        icon_path = root / 'assets' / 'TRPL.ico'
+        icon_path = root / 'assets' / 'Kerr studio.ico'
         if icon_path.exists():
             app.setWindowIcon(QIcon(str(icon_path)))
         window = MainWindow(auto_start=False)
@@ -96,6 +116,8 @@ def main():
         return result
     except Exception:
         _log_exception(root)
+        try:(root / '.venv' / '.runtime-startup-failed').write_text('Verify dependencies on next launch',encoding='utf-8')
+        except OSError:pass
         return 1
     finally:
         _release(helper)

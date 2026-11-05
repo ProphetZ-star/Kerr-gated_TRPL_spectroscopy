@@ -14,7 +14,7 @@ from . import schema
 from .schema import (SCHEMA_VERSION, ROOT, INSTRUMENT, REQUEST, SEGMENT_COLUMNS, COORDINATES, PLAN_ARRAYS, ACQUISITION,
                      CALIBRATION, BACKGROUND, COLUMNS, TEMPERATURE_CODES, FILE_STATUS, RUN_STATUS, FIT_ARRAYS, FIT_SETTINGS, FIT_SUMMARY,
                      FIT_PROCESSING, FIT_EXCLUDED)
-from .frames import FrameTable, frame_row, validate_record
+from .frames import frame_row, validate_record
 
 TEXT = h5py.string_dtype('utf-8')
 
@@ -239,7 +239,7 @@ class HDFWriter:
             done = False
             while not done:
                 active = [self.tasks.get()]; deadline = time.monotonic() + self.batch_latency
-                while len(active) < self.batch_size and active[-1][0] != 'close':
+                while len(active) < self.batch_size and active[-1][0] not in {'close','read'}:
                     try:active.append(self.tasks.get(timeout=max(.00001, deadline - time.monotonic())))
                     except Empty:break
                     if time.monotonic() >= deadline:break
@@ -289,6 +289,11 @@ class HDFWriter:
                             spectra.resize(count, axis=0)
                             for dataset in columns.values():dataset.resize(count, axis=0)
                             flush(); self.stats['frames'] = count; future.set_result(True)
+                        elif operation == 'read':
+                            start, stop = value
+                            if not 0 <= start <= stop <= int(frame.attrs['committed_frames']):
+                                raise ValueError('Read exceeds committed frames')
+                            future.set_result({name: frame[name][start:stop] for name in ('spectra',) + tuple(n for n, _, _ in COLUMNS)})
                         elif operation == 'close':
                             status = value['status']
                             if status not in FILE_STATUS:raise ValueError('Invalid terminal status')
@@ -309,7 +314,8 @@ class HDFWriter:
                             future.set_result(str(final)); done = True
                         else:raise ValueError('Unknown writer operation: ' + operation)
                     except Exception as exc:
-                        self.failure = str(exc); fail(future, exc)
+                        if operation != 'read':self.failure = str(exc)
+                        fail(future, exc)
                         if operation == 'event':
                             for _, _, ack in active[cursor + 1:]:fail(ack, exc)
                             raise
@@ -338,12 +344,12 @@ def _read_run(path):
             raise ValueError(f'Unsupported experiment file (schema version {version}); this release reads version {SCHEMA_VERSION} only')
         stored = f['frame/spectra']
         count = int(f['frame'].attrs['committed_frames'])
-        from ..resources import usable_memory, frame_bytes, describe
-        need = count * frame_bytes(stored.shape[1] if len(stored.shape) > 1 else 1) * 2  # read buffer and table
-        usable = usable_memory()
-        if usable is not None and need > usable:
-            # Not a damaged file: reported as it is (read_run only rewords file errors).
-            raise MemoryError(f'Opening this file needs about {describe(need)} of memory; {describe(usable)} is free')
+        if stored.ndim != 2 or not 1 <= stored.shape[1] <= 1024 or stored.dtype.kind not in 'iu':
+            raise ValueError('Invalid raw spectra dataset')
+        for name, _, width in COLUMNS:
+            column = f['frame'][name]
+            if column.shape[1:] != ((width,) if width else ()):
+                raise ValueError(f'Frame column {name} has the wrong shape')
         if not 0 <= count <= min([len(stored)] + [len(f['frame'][name]) for name, _, _ in COLUMNS]):
             raise ValueError('Committed frame count exceeds the stored rows')
         metadata = read_metadata(f)
@@ -352,9 +358,8 @@ def _read_run(path):
         if not metadata['acquisition']['delays_ps']:raise ValueError('Missing experiment scan plan')
         exposure = metadata['acquisition']['exposure_s']
         if exposure is None or not exposure > 0:raise ValueError('Invalid exposure time')
-        # Whole columns at once: the rows below committed_frames are the experiment.
-        frames = FrameTable.from_arrays(stored[:count], {name: f['frame'][name][:count] for name, _, _ in COLUMNS},
-                                        exposure, metadata['root']['source_mode'])
+        from .disk_frames import DiskFrames
+        frames = DiskFrames(path, count, stored.shape[1], exposure, metadata['root']['source_mode'], run_id)
         events = f['events']; optional = lambda value: None if not np.isfinite(value) else float(value)
         metadata['events'] = [dict(t_s=optional(t), status=RUN_STATUS.get(str(s), str(s)), message=str(m))
                               for t, s, m in zip(events['t_s'][:], events['status'].asstr()[:], events['message'].asstr()[:])]
@@ -370,7 +375,7 @@ def _read_run(path):
 
 
 def read_run(path):
-    """(metadata, FrameTable, terminal status) of an experiment file."""
+    """(metadata, lazy DiskFrames, terminal status) of an experiment file."""
     if not Path(path).is_file():raise FileNotFoundError('Experiment file does not exist')
     try:return _read_run(path)
     except (OSError, KeyError, IndexError, TypeError, OverflowError, ValueError) as exc:

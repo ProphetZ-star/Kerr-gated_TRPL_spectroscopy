@@ -1,7 +1,7 @@
 """Free memory and disk space, for the acquisition's resource guard.
 
-Frames of a run are held in memory (and written to the file as they come), so the number of frames a run can
-take is set by the machine, not by a fixed limit: a scan stops by itself, keeping every complete point, once
+Memory-only runs retain frames in RAM; autosaved runs keep flushed frames on disk with a bounded page cache.
+A scan stops by itself, keeping every complete point, once
 free physical memory or free disk space falls below a reserve. Physical memory is what counts: Windows pages to
 disk long before an allocation fails, and the acquisition would crawl well before it ran out.
 """

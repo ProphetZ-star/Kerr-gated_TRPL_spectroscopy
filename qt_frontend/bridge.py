@@ -10,6 +10,8 @@ class _Request:
         self.token=token; self.name=name; self.data=data
 class _Retry:
     pass
+class _Wake:
+    pass
 
 class BackendBridge(QThread):
     snapshotReady=Signal(dict)
@@ -24,6 +26,14 @@ class BackendBridge(QThread):
         self._requests=Queue(); self._shutdown_requested=False; self._shutdown_emitted=False
         self._snapshot={}; self._since=None; self._latest_version=0; self._last_full=0.0
         self._ready=False; self._poll_message_at=0.0
+        self._background=False
+    def set_background(self, background):
+        self._background=bool(background)
+        self._requests.put(_Wake())  # Queue wakeup also makes restore refresh immediately.
+    def _poll_interval(self):
+        if not self._ready:return .15
+        if self._snapshot.get('busy'):return .5 if self._background else .15
+        return 3.0 if self._background else 1.0
     def start(self,*args,**kwargs):
         if not self.isRunning() and not self._shutdown_requested:
             super().start(*args,**kwargs)
@@ -103,6 +113,10 @@ class BackendBridge(QThread):
             self._ready=True; self.readyChanged.emit(True)
         self.snapshotReady.emit(dict(self._snapshot))
     def _fail_startup(self,error):
+        try:
+            from pathlib import Path
+            (Path(__file__).resolve().parents[1]/'.venv'/'.runtime-startup-failed').write_text(str(error),encoding='utf-8')
+        except OSError:pass
         message=str(error)
         if time.monotonic()-self._poll_message_at>1.5:
             self._poll_message_at=time.monotonic(); self.readyChanged.emit(False); self.startupFailed.emit(message)
@@ -118,8 +132,8 @@ class BackendBridge(QThread):
                     self._ready=False
                     if time.monotonic()-self._poll_message_at>1.5:
                         self._poll_message_at=time.monotonic(); self.pollFailed.emit(message)
-                next_poll=time.monotonic()+0.15
-            timeout=max(0.0,min(0.15,next_poll-time.monotonic()))
+                next_poll=time.monotonic()+self._poll_interval()
+            timeout=1.0 if manager is None else max(0.0,min(self._poll_interval(),next_poll-time.monotonic()))
             try:
                 request=self._requests.get(timeout=timeout)
             except Empty:
@@ -128,6 +142,9 @@ class BackendBridge(QThread):
                 continue
             if request is None:
                 break
+            if isinstance(request,_Wake):
+                next_poll=time.monotonic()
+                continue
             if isinstance(request,_Retry):
                 if manager is None:
                     try:

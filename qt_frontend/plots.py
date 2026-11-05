@@ -2088,7 +2088,8 @@ class ResponsePlot(EditablePlot):
     '''The intensity response R(lambda): the installed one solid, a preview dashed.'''
     def __init__(self, parent=None):
         super().__init__(parent=parent, grid=True)
-        self.set_plot_margins(40, 10, 8, 36); self.left_axis.divisions = 2; self.bottom_axis.divisions = 3
+        # Tick labels and the wavelength title need 46 px, plus a small bottom gutter.
+        self.set_plot_margins(40, 10, 8, 50); self.left_axis.divisions = 2; self.bottom_axis.divisions = 3
         self._items = []; self.set_x_label('Wavelength / nm'); self.set_y_label('R')
         self.set_curves()
     def set_curves(self, installed=None, preview=None):

@@ -1,7 +1,7 @@
 """Columnar frame storage: the in-memory form of an experiment's frame/ group.
 
-Acquisition appends one frame at a time, the file reader builds a table straight from the stored arrays, and
-analysis, export and the GUI read whole columns or blocks of rows. Row i is record_id i. Exposure and source
+Memory-only acquisition appends one frame at a time; saved runs use DiskFrames instead. Analysis, export and
+the GUI read blocks of rows. Row i is record_id i. Exposure and source
 mode are the same for every frame of a run, so the table holds them once.
 """
 import math
