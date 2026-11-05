@@ -61,8 +61,10 @@ class SimCamera:
 
     rows = 255
     temperature_range = (-100, -10)
-    # The detector model in acquire(): counts = electrons / 2.5 + 320, read noise 5 electrons rms.
-    electrons_per_count = 2.5
+    # The detector model in acquire(): counts = electrons / electrons_per_count + 320, read noise 5 electrons rms;
+    # 2.5 electrons per count at pre-amp gain 1x, fewer at the higher gains (as on the Newton).
+    BASE_ELECTRONS_PER_COUNT = 2.5
+    preamp_gains = [1.0, 2.0, 4.0]
     read_noise_e = 5.0
 
     def __init__(self):
@@ -71,6 +73,17 @@ class SimCamera:
         self.readout = default_readout(self.rows)
         self.cooler_on = True
         self.target_c = -70
+        self.preamp_index = 0
+
+    @property
+    def electrons_per_count(self):
+        return self.BASE_ELECTRONS_PER_COUNT / self.preamp_gains[self.preamp_index]
+
+    def set_preamp_gain(self, index):
+        if not 0 <= index < len(self.preamp_gains):
+            raise ValueError(f'Pre-amp gain index must be 0…{len(self.preamp_gains)-1}')
+        self.preamp_index = int(index)
+        return dict(index=self.preamp_index, gain=self.preamp_gains[self.preamp_index], gains=list(self.preamp_gains))
 
     @property
     def temperature_c(self):
@@ -85,6 +98,8 @@ class SimCamera:
                     cooler_on=self.cooler_on, target_temperature_c=self.target_c, temperature_range_c=list(self.temperature_range),
                     temperature_resolution_c=None, serial_number=None,
                     electrons_per_count=self.electrons_per_count, read_noise_e=self.read_noise_e,
+                    preamp_gains=list(self.preamp_gains), preamp_gain_index=self.preamp_index,
+                    preamp_gain=self.preamp_gains[self.preamp_index],
                     readout=dict(self.readout), position_sensor=False)
 
     def set_cooling(self, enabled, target_c):

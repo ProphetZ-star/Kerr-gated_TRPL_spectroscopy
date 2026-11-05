@@ -1,13 +1,13 @@
 '''Validation facade for native backend commands.'''
 import math
-from backend.models import RunRequest,MoveRequest,CameraConfig,ReadoutRequest,CoolingRequest,VelocityRequest,BackgroundRequest,SpectrographConfig,CalibrationRequest,FitRequest
+from backend.models import RunRequest,MoveRequest,CameraConfig,ReadoutRequest,GainRequest,CoolingRequest,VelocityRequest,BackgroundRequest,SpectrographConfig,CalibrationRequest,FitRequest
 from backend.calibration_models import CaptureRequest,ExtractRequest,MappingRequest,ApplyRequest
 from backend.contracts import ConnectBody,DeviceBody,SDKBody,PIUSBBody,DeviceNameBody
 
 class ValidationError(ValueError):
     pass
 
-COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard run_files_removed export analysis_open analysis_close analysis_store analysis_delete response_import response_measure response_apply response_clear response_stop fit kinetics task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
+COMMANDS=set('status connect device_drivers device_ports device_pi_usb device_cameras device_connect device_disconnect configure camera_readout camera_gain camera_cooling stage_velocity stage_reference move zero stage_stop spectrograph plan run preview_start preview_stop background background_stop pause resume stop get_run records output_check save discard run_files_removed export analysis_open analysis_close analysis_store analysis_delete response_import response_measure response_apply response_clear response_stop fit kinetics task task_cancel calibration_frame calibration_capture calibration_capture_status calibration_stop calibration_extract calibration_fit calibration_solution calibration_apply calibration'.split())
 
 def _pydantic_text(name,error):
     try:
@@ -99,6 +99,8 @@ def validate_command(name,data=None):
         return _model(name,CameraConfig,data)
     if name=='camera_readout':
         return _model(name,ReadoutRequest,data)
+    if name=='camera_gain':
+        return _model(name,GainRequest,data)
     if name=='camera_cooling':
         return _model(name,CoolingRequest,data)
     if name=='stage_velocity':

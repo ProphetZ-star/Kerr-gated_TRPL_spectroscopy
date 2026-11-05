@@ -22,7 +22,7 @@ INSTRUMENT = {
     'camera': (('model', 's'), ('serial_number', 's'), ('detector_rows', 'i'), ('chip_pixels', 'i'), ('bit_depth', 'i'),
                ('full_scale', 'f'), ('cooler_on', 'b'), ('target_temperature_c', 'f'), ('temperature_resolution_c', 'f'),
                # Photoelectrons per count and read noise (electrons rms): the shot-noise limit of the spectra.
-               ('electrons_per_count', 'f'), ('read_noise_e', 'f')),
+               ('electrons_per_count', 'f'), ('read_noise_e', 'f'), ('preamp_gain', 'f')),
     'stage': (('model', 's'), ('controller_model', 's'), ('controller_identity', 's'), ('velocity_mm_s', 'f'),
               ('referenced', 'b'), ('position_source', 's'), ('position_sensor', 'b')),
     'spectrometer': (('driver', 's'), ('model', 's'), ('manual', 'b'), ('identity', 's')),

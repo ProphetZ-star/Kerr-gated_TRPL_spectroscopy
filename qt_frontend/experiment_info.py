@@ -152,6 +152,7 @@ def sections(run, quality=None):
         ('Readout', readout),
         ('Pixels per spectrum', None if acquisition.get('pixels') is None else str(acquisition['pixels'])),
         ('Full scale', number(camera.get('full_scale'), 'counts', 8)),
+        ('Pre-amp gain', None if _finite(camera.get('preamp_gain')) is None else f"{float(camera['preamp_gain']):g}×"),
         ('Sensitivity', number(camera.get('electrons_per_count'), 'e⁻ / count')),
         ('Read noise', number(camera.get('read_noise_e'), 'e⁻ rms')),
         ('Cooling', cooling),

@@ -164,7 +164,7 @@ class Engine:
     def require_operation(self,name):
         needed={'configure':('camera',),'move':('stage',),'zero':('stage',),
                 'preview_start':('camera',),'background':('camera',),
-                'calibration_capture':('camera',),'run':('stage','camera'),'camera_readout':('camera',),'camera_cooling':('camera',),
+                'calibration_capture':('camera',),'run':('stage','camera'),'camera_readout':('camera',),'camera_gain':('camera',),'camera_cooling':('camera',),
                 'stage_velocity':('stage',),'stage_reference':('stage',)}.get(name,())
         self.devices.require(*needed)
         if name in ('move','run') and not getattr(self.stage,'referenced',True):
@@ -652,7 +652,7 @@ class Engine:
             if old!=data:raise ValueError('request_id was already used with different parameters')
             return result
         self.require_operation(name)
-        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph','camera_readout','stage_velocity'} else self._handle(name,data)
+        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph','camera_readout','camera_gain','stage_velocity'} else self._handle(name,data)
         except HardwareError as exc:self.hardware_failure(exc);raise
         if request_id:
             self.commands[key]=(copy.deepcopy(data),result)
@@ -719,6 +719,13 @@ class Engine:
             with self.lock:
                 self.latest=None;self.latest_version+=1;self.background=None;self.latest_axis=self.live_axis();self.revision+=1
             return dict(readout=readout,notes=notes,pixels=readout_shape(readout)[1])
+        if name=='camera_gain':
+            self.idle()
+            result=self.camera.set_preamp_gain(data['index'])
+            # Counts change scale with the gain: the frame on screen and the recorded background no longer match.
+            with self.lock:
+                self.latest=None;self.latest_version+=1;self.background=None;self.revision+=1
+            return result
         if name=='camera_cooling':
             return self.camera.set_cooling(data['enabled'],data['target_c'])
         if name=='stage_velocity':

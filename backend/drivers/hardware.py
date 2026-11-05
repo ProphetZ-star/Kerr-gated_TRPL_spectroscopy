@@ -93,6 +93,12 @@ class AndorSDK2Camera:
             low=ct.c_int();high=ct.c_int();self.call('GetTemperatureRange',ct.byref(low),ct.byref(high));self.temperature_range=(low.value,high.value)
             cooler=ct.c_int();self.call('IsCoolerOn',ct.byref(cooler));self.cooler_on=bool(cooler.value)
             self.target_c=max(low.value,min(high.value,-60))
+            # Fix the readout chain instead of inheriting the SDK's start-up state: this Newton comes up at
+            # pre-amp gain 4x, where full vertical binning of a warm chip overflows (pixels read either bias
+            # or 65535). AD channel 0, conventional amplifier, fastest horizontal speed, pre-amp gain 1x.
+            self.call('SetADChannel',0);self.call('SetOutputAmplifier',0);self.call('SetHSSpeed',0,0)
+            self.preamp_gains=self._preamp_gains();self.preamp_index=0
+            self.call('SetPreAmpGain',0)
             self.electrons_per_count=self._sensitivity()
             self.call('SetAcquisitionMode',1);self.call('SetTriggerMode',0)
             self.call('SetReadMode',0)
@@ -103,14 +109,27 @@ class AndorSDK2Camera:
     def call(self,name,*args):
         with self.lock:sdk_check(self.dll,name,*args)
 
+    def _preamp_gains(self):
+        # Pre-amp gain factors by SDK index (1x, 2x, 4x on the Newton DU920P).
+        count=ct.c_int();self.call('GetNumberPreAmpGains',ct.byref(count));gains=[]
+        for index in range(count.value):
+            value=ct.c_float();self.call('GetPreAmpGain',index,ct.byref(value));gains.append(float(value.value))
+        return gains or [1.0]
+
+    def set_preamp_gain(self,index):
+        if not 0<=index<len(self.preamp_gains):raise ValueError(f'Pre-amp gain index must be 0…{len(self.preamp_gains)-1}')
+        self.call('SetPreAmpGain',int(index));self.preamp_index=int(index)
+        self.electrons_per_count=self._sensitivity()
+        return dict(index=self.preamp_index,gain=self.preamp_gains[self.preamp_index],gains=list(self.preamp_gains))
+
     def _sensitivity(self):
-        # Electrons per count at the readout in use (AD channel 0, horizontal speed 0, conventional amplifier,
-        # pre-amp gain 0: this driver never changes them). Older SDK builds lack GetSensitivity.
+        # Electrons per count at the readout set in __init__ (AD channel 0, horizontal speed 0, conventional
+        # amplifier) and the selected pre-amp gain. Older SDK builds lack GetSensitivity.
         function=getattr(self.dll,'GetSensitivity',None)
         if function is None:return None
         value=ct.c_float()
         try:
-            with self.lock:code=function(0,0,0,0,ct.byref(value))
+            with self.lock:code=function(0,0,0,self.preamp_index,ct.byref(value))
         except Exception:return None
         return float(value.value) if code==20002 and value.value>0 else None
 
@@ -140,7 +159,8 @@ class AndorSDK2Camera:
                     temperature_range_c=list(self.temperature_range),temperature_resolution_c=self.temperature_resolution_c,
                     readout=dict(self.readout),serial_number=str(self.serial_number),
                     # The SDK reports no read noise; the shot-noise limit then counts photon noise only.
-                    electrons_per_count=self.electrons_per_count,read_noise_e=None)
+                    electrons_per_count=self.electrons_per_count,read_noise_e=None,
+                    preamp_gains=list(self.preamp_gains),preamp_gain_index=self.preamp_index,preamp_gain=self.preamp_gains[self.preamp_index])
 
     def set_cooling(self,enabled,target_c):
         low,high=self.temperature_range;target=int(round(max(low,min(high,target_c))))

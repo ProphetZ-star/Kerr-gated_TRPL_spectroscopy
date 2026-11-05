@@ -104,6 +104,11 @@ class ReadoutRequest(_StrictModel):
         return value
 
 
+class GainRequest(_StrictModel):
+    # Index into the camera's pre-amp gain list (capabilities: preamp_gains).
+    index: int = Field(ge=0, le=15)
+
+
 class CoolingRequest(_StrictModel):
     enabled: bool
     target_c: float = Field(ge=-150.0, le=30.0)

@@ -29,6 +29,8 @@ from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
+# Andor: let the chip warm above this before the camera is powered off (a cold chip must not lose power).
+SAFE_POWER_OFF_C = -20.0
 
 
 def payload_message(payload):
@@ -721,11 +723,20 @@ class MainWindow(QMainWindow):
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(6)
         layout.addWidget(self._subheading('Readout and binning'), 0, 0, 1, 2)
+        # Pre-amp gain applies at once (not with Apply readout): it rescales counts, so the frame on screen
+        # and the recorded background are dropped. Labels follow the gains the camera reports.
+        self.gain_toggle = Segmented([('1×', '0'), ('2×', '1'), ('4×', '2')])
+        self.gain_toggle.setObjectName('preampGain')
+        self.gain_toggle.setToolTip('CCD pre-amplifier gain. Higher gain gives more counts per electron (finer steps for weak light) '
+                                    'but reaches 65535 sooner; with full vertical binning of a warm chip use 1×.')
+        self._reg('preampGain', self.gain_toggle, False)
+        self.gain_toggle.changed.connect(self._apply_gain)
+        layout.addWidget(field('Pre-amp gain', self.gain_toggle), 1, 0, 1, 2)
         self.readout_mode = Segmented([('FVB', 'fvb'), ('ROI', 'roi')])
         self.readout_mode.setObjectName('readoutMode')
         self._reg('readoutMode', self.readout_mode, False)
         self.readout_mode.changed.connect(self._on_readout_edited)
-        layout.addWidget(self.readout_mode, 1, 0, 1, 2)
+        layout.addWidget(self.readout_mode, 2, 0, 1, 2)
         def pair(start, end):
             row = QWidget()
             row_layout = QHBoxLayout(row)
@@ -742,8 +753,8 @@ class MainWindow(QMainWindow):
         for name, box_ in (('roiX0', self.roi_x0), ('roiX1', self.roi_x1), ('roiY0', self.roi_y0), ('roiY1', self.roi_y1)):
             box_.setObjectName(name); box_.setButtonSymbols(QSpinBox.NoButtons); self._reg(name, box_, False)
             box_.valueChanged.connect(self._on_readout_edited)
-        layout.addWidget(field('ROI X / px', pair(self.roi_x0, self.roi_x1)), 2, 0)
-        layout.addWidget(field('ROI Y / row', pair(self.roi_y0, self.roi_y1)), 2, 1)
+        layout.addWidget(field('ROI X / px', pair(self.roi_x0, self.roi_x1)), 3, 0)
+        layout.addWidget(field('ROI Y / row', pair(self.roi_y0, self.roi_y1)), 3, 1)
         self.hbin_combo = QComboBox()
         for value in (1, 2, 4, 8, 16):
             self.hbin_combo.addItem(str(value), value)
@@ -753,20 +764,20 @@ class MainWindow(QMainWindow):
         for name, combo in (('hbin', self.hbin_combo), ('vbin', self.vbin_combo)):
             combo.setObjectName(name); self._reg(name, combo, False)
             combo.activated.connect(self._on_readout_edited)
-        layout.addWidget(field('H bin', self.hbin_combo), 3, 0)
-        layout.addWidget(field('V bin', self.vbin_combo), 3, 1)
+        layout.addWidget(field('H bin', self.hbin_combo), 4, 0)
+        layout.addWidget(field('V bin', self.vbin_combo), 4, 1)
         self.readout_info = QLabel('')
         self.readout_info.setObjectName('advancedInfo')
         self.readout_info.setWordWrap(True)
         self._reg('readoutInfo', self.readout_info, False)
-        layout.addWidget(self.readout_info, 4, 0, 1, 2)
+        layout.addWidget(self.readout_info, 5, 0, 1, 2)
         self.readout_apply = QPushButton('Apply readout')
         self._set_icon(self.readout_apply, 'check')
         self.readout_apply.setObjectName('readoutApply')
         self.readout_apply.setProperty('role', 'accent')
         self.readout_apply.clicked.connect(self._apply_readout)
         self._reg('readoutApply', self.readout_apply, False)
-        layout.addWidget(self.readout_apply, 5, 0, 1, 2)
+        layout.addWidget(self.readout_apply, 6, 0, 1, 2)
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         self._sync_readout_inputs()
@@ -2356,7 +2367,7 @@ class MainWindow(QMainWindow):
             camera_ready = bool(getattr(self.controller, 'online', False) and (camera_connected or availability.get('camera')))
             self.exposure_edit.setEnabled(camera_ready and busy in (None, 'preview'))
             self._readout_controls_enabled = camera_ready and busy in (None, 'preview')
-            for widget in (self.readout_mode, self.roi_x0, self.roi_x1, self.hbin_combo, self.readout_apply):
+            for widget in (self.readout_mode, self.roi_x0, self.roi_x1, self.hbin_combo, self.readout_apply, self.gain_toggle):
                 widget.setEnabled(self._readout_controls_enabled)
             self._sync_readout_inputs()
             for widget in (self.cooler_toggle, self.cooling_target):
@@ -4022,6 +4033,14 @@ class MainWindow(QMainWindow):
                 index = combo.findData(readout.get(key))
                 if index >= 0:
                     combo.setCurrentIndex(index)
+        gains = camera.get('preamp_gains') or []
+        for index, button in enumerate(self.gain_toggle.buttons):
+            available = index < len(gains)
+            if available:
+                button.setText(f'{float(gains[index]):g}×')
+            button.setVisible(available or not gains)
+        if camera.get('preamp_gain_index') is not None:
+            self.gain_toggle.set_selected(str(int(camera['preamp_gain_index'])))
         if camera.get('cooler_on') is not None:
             self.cooler_toggle.set_selected('on' if camera.get('cooler_on') else 'off')
         if camera.get('target_temperature_c') is not None and not self.cooling_target.hasFocus():
@@ -4033,7 +4052,12 @@ class MainWindow(QMainWindow):
         else:
             label = {'stabilized': 'stabilized', 'not_reached': 'cooling', 'not_stabilized': 'stabilizing', 'drift': 'drifting', 'off': 'cooler off'}.get(state, state)
             color = {'stabilized': 'success', 'not_reached': 'warning', 'not_stabilized': 'warning', 'drift': 'danger'}.get(state, 'muted')
+            if not camera.get('cooler_on') and float(temperature) < SAFE_POWER_OFF_C:
+                label, color = f'warming · keep the camera powered until above {SAFE_POWER_OFF_C:g} °C', 'warning'
             text = f'<span style="color:{palette()[color]}">●</span> Now {float(temperature):.1f} °C · {label}'
+            if getattr(self, '_warmup_watch', False) and not camera.get('cooler_on') and float(temperature) >= SAFE_POWER_OFF_C:
+                self._warmup_watch = False
+                self.show_toast(f'CCD at {float(temperature):.1f} °C · safe to close Kerr Studio and power the camera off', 'success')
         self.cooling_status.setText(text)
     def _readout_request(self):
         return {'mode': self.readout_mode.current() or 'fvb', 'x0': self.roi_x0.value(), 'x1': self.roi_x1.value(),
@@ -4071,6 +4095,21 @@ class MainWindow(QMainWindow):
                 self.show_toast(f"Readout applied · {result.get('pixels')} px per spectrum", 'success')
             self.controller.request_status()
         self.controller.dispatch('camera_readout', self._readout_request(), success=done, failure=lambda payload: self.show_toast(payload_message(payload), 'error'))
+    def _apply_gain(self, value):
+        if self._updating_controls:
+            return
+        camera = (self._snapshot or {}).get('camera') or {}
+        applied = camera.get('preamp_gain_index')
+        if applied is not None and str(int(applied)) == value:
+            return
+        def done(result):
+            self.show_toast(f"Pre-amp gain {float(result['gain']):g}× · acquire a new background at this gain", 'success')
+            self.controller.request_status()
+        def failed(payload):
+            if applied is not None:
+                self.gain_toggle.set_selected(str(int(applied)))
+            self.show_toast(payload_message(payload), 'error')
+        self.controller.dispatch('camera_gain', {'index': int(value)}, success=done, failure=failed)
     def _apply_cooling(self):
         if self._updating_controls:
             return
@@ -5026,12 +5065,84 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
+        if not self._confirm_ccd_warm():
+            event.ignore()
+            return
         self._closing_started = True
         event.ignore()
         QTimer.singleShot(0, lambda: self.controller.begin_close(self._on_close_ready))
     def _on_close_ready(self):
         self._allow_close = True
         self.close()
+    def _cold_ccd(self):
+        '''(cooler_on, temperature_c) while a connected hardware CCD is cooled or still below the safe
+        power-off temperature; None otherwise.'''
+        snapshot = self._snapshot or {}
+        if snapshot.get('source_mode') != 'hardware' or not ((snapshot.get('devices') or {}).get('camera') or {}).get('connected'):
+            return None
+        camera = snapshot.get('camera') or {}
+        cooler = bool(camera.get('cooler_on'))
+        try:
+            temperature = float(camera.get('temperature_c'))
+        except (TypeError, ValueError):
+            temperature = None
+        if temperature is not None and not math.isfinite(temperature):
+            temperature = None
+        if cooler or (temperature is not None and temperature < SAFE_POWER_OFF_C):
+            return cooler, temperature
+        return None
+    def _ask_exit_choice(self, title, text, info, choices, default):
+        '''choices: [(key, label, role)]; returns the key of the button pressed ('cancel' for Esc).'''
+        box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.NoButton, self)
+        box.setInformativeText(info)
+        keys = {}
+        for key, label, role in choices:
+            button = box.addButton(label, role)
+            keys[button] = key
+            if key == default:
+                box.setDefaultButton(button)
+        box.exec()
+        return keys.get(box.clickedButton(), 'cancel')
+    def _confirm_ccd_warm(self):
+        '''Before closing: remind that a cooled CCD can only be warmed up from this software, and that the
+        camera must stay powered until the chip is above SAFE_POWER_OFF_C. True lets the close go on.'''
+        cold = self._cold_ccd()
+        if cold is None:
+            return True
+        cooler, temperature = cold
+        now = f'{temperature:.1f} °C' if temperature is not None else 'temperature unknown'
+        safe = f'{SAFE_POWER_OFF_C:g} °C'
+        Role = QMessageBox.ButtonRole
+        if cooler:
+            choice = self._ask_exit_choice(
+                'CCD cooling is on', f'The CCD cooler is still on (now {now}).',
+                f'If you close Kerr Studio now the camera keeps cooling, and only this software can warm it up again. '
+                f'Do not switch the camera power off while the chip is below {safe}.\n\n'
+                f'Warm up first switches the cooler off and keeps Kerr Studio open; it tells you when the CCD is above {safe} '
+                'and safe to power off.',
+                [('warm', 'Warm up first', Role.AcceptRole), ('exit', 'Close, keep cooling', Role.DestructiveRole), ('cancel', 'Cancel', Role.RejectRole)],
+                'warm')
+            if choice == 'warm':
+                self._start_warmup()
+            return choice == 'exit'
+        choice = self._ask_exit_choice(
+            'CCD is still cold', f'The CCD is warming up (now {now}).',
+            f'Keep the camera powered until the chip is above {safe}. Kerr Studio tells you when it gets there; '
+            'closing now is fine only if the camera stays switched on.',
+            [('wait', 'Keep open', Role.AcceptRole), ('exit', 'Close anyway', Role.DestructiveRole)],
+            'wait')
+        if choice == 'wait':
+            self._warmup_watch = True
+        return choice == 'exit'
+    def _start_warmup(self):
+        camera = (self._snapshot or {}).get('camera') or {}
+        target = camera.get('target_temperature_c')
+        def done(result):
+            self._warmup_watch = True
+            self.show_toast(f'Cooler off · the CCD is warming; you will be told when it is above {SAFE_POWER_OFF_C:g} °C', 'success')
+            self.controller.request_status()
+        self.controller.dispatch('camera_cooling', {'enabled': False, 'target_c': float(target if target is not None else -60)},
+                                 success=done, failure=lambda payload: self.show_toast(payload_message(payload), 'error'))
     def _has_active_or_unsaved(self):
         snapshot = self._snapshot or {}
         if snapshot.get('busy'):
