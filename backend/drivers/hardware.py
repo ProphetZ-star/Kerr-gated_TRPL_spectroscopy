@@ -67,6 +67,13 @@ def camera_choices(directory=''):
     finally:cookie.close()
 
 
+# Typical values from Andor's Newton CCD specification sheet, used only when the SDK reports no sensitivity (this
+# camera's GetSensitivity returns 0 for every setting). Keyed by head-model prefix. Sensitivity is for pre-amp gain 1x
+# (the 650,000 e- pixel well over the 16-bit range, ~10 e-/count) and scales as 1/gain; read noise is per horizontal
+# readout speed in MHz.
+DATASHEET={'DU920P_BEX2':dict(electrons_per_count_1x=10.0,read_noise_e={3.0:15.0,1.0:12.0,0.05:4.0})}
+
+
 class AndorSDK2Camera:
     pixels=1024
     full_scale=65535
@@ -93,13 +100,19 @@ class AndorSDK2Camera:
             low=ct.c_int();high=ct.c_int();self.call('GetTemperatureRange',ct.byref(low),ct.byref(high));self.temperature_range=(low.value,high.value)
             cooler=ct.c_int();self.call('IsCoolerOn',ct.byref(cooler));self.cooler_on=bool(cooler.value)
             self.target_c=max(low.value,min(high.value,-60))
+            head=ct.create_string_buffer(64)
+            with self.lock:self.dll.GetHeadModel(head)
+            self.head_model=head.value.decode(errors='replace')
+            self.datasheet=next((v for k,v in DATASHEET.items() if self.head_model.upper().startswith(k)),None)
             # Fix the readout chain instead of inheriting the SDK's start-up state: this Newton comes up at
             # pre-amp gain 4x, where full vertical binning of a warm chip overflows (pixels read either bias
             # or 65535). AD channel 0, conventional amplifier, fastest horizontal speed, pre-amp gain 1x.
-            self.call('SetADChannel',0);self.call('SetOutputAmplifier',0);self.call('SetHSSpeed',0,0)
+            self.call('SetADChannel',0);self.call('SetOutputAmplifier',0)
+            self.readout_speeds=self._readout_speeds();self.speed_index=0
+            self.call('SetHSSpeed',0,0)
             self.preamp_gains=self._preamp_gains();self.preamp_index=0
             self.call('SetPreAmpGain',0)
-            self.electrons_per_count=self._sensitivity()
+            self._update_noise_model()
             self.call('SetAcquisitionMode',1);self.call('SetTriggerMode',0)
             self.call('SetReadMode',0)
             self.readout=default_readout(self.rows)
@@ -116,20 +129,56 @@ class AndorSDK2Camera:
             value=ct.c_float();self.call('GetPreAmpGain',index,ct.byref(value));gains.append(float(value.value))
         return gains or [1.0]
 
+    def _readout_speeds(self):
+        # Horizontal readout speeds in MHz by SDK index (3, 1, 0.05 on the Newton DU920P), AD channel 0, conventional amplifier.
+        count=ct.c_int();self.call('GetNumberHSSpeeds',0,0,ct.byref(count));speeds=[]
+        for index in range(count.value):
+            value=ct.c_float();self.call('GetHSSpeed',0,0,index,ct.byref(value));speeds.append(round(float(value.value),4))
+        return speeds or [None]
+
     def set_preamp_gain(self,index):
         if not 0<=index<len(self.preamp_gains):raise ValueError(f'Pre-amp gain index must be 0…{len(self.preamp_gains)-1}')
         self.call('SetPreAmpGain',int(index));self.preamp_index=int(index)
-        self.electrons_per_count=self._sensitivity()
+        self._update_noise_model()
         return dict(index=self.preamp_index,gain=self.preamp_gains[self.preamp_index],gains=list(self.preamp_gains))
 
+    def set_readout_speed(self,index):
+        if not 0<=index<len(self.readout_speeds):raise ValueError(f'Readout speed index must be 0…{len(self.readout_speeds)-1}')
+        self.call('SetHSSpeed',0,int(index));self.speed_index=int(index)
+        # Not every pre-amp gain exists at every speed; keep the selected one if it does, else fall back to 1x.
+        available=ct.c_int()
+        with self.lock:code=self.dll.IsPreAmpGainAvailable(0,0,self.speed_index,self.preamp_index,ct.byref(available))
+        if code==20002 and not available.value:self.call('SetPreAmpGain',0);self.preamp_index=0
+        self._update_noise_model()
+        return dict(index=self.speed_index,mhz=self.readout_speeds[self.speed_index],speeds=list(self.readout_speeds),
+                    gain=self.preamp_gains[self.preamp_index])
+
+    @property
+    def readout_speed_mhz(self):return self.readout_speeds[self.speed_index]
+
+    def _update_noise_model(self):
+        '''Electrons per count and read noise for the selected speed and gain: the SDK's sensitivity when it reports
+        one, else the datasheet's typical values for this head model, else unknown (None).'''
+        measured=self._sensitivity()
+        if measured is not None:
+            self.electrons_per_count,self.sensitivity_source=measured,'sdk'
+        elif self.datasheet is not None:
+            self.electrons_per_count=self.datasheet['electrons_per_count_1x']/self.preamp_gains[self.preamp_index]
+            self.sensitivity_source='datasheet'
+        else:
+            self.electrons_per_count,self.sensitivity_source=None,None
+        noise=(self.datasheet or {}).get('read_noise_e') or {}
+        speed=self.readout_speed_mhz
+        self.read_noise_e=next((v for k,v in noise.items() if speed is not None and abs(k-speed)<1e-3),None)
+
     def _sensitivity(self):
-        # Electrons per count at the readout set in __init__ (AD channel 0, horizontal speed 0, conventional
-        # amplifier) and the selected pre-amp gain. Older SDK builds lack GetSensitivity.
+        # Electrons per count from the SDK at the selected readout (AD channel 0, conventional amplifier, horizontal
+        # speed and pre-amp gain). Older SDK builds lack GetSensitivity; this camera returns 0 (not stored).
         function=getattr(self.dll,'GetSensitivity',None)
         if function is None:return None
         value=ct.c_float()
         try:
-            with self.lock:code=function(0,0,0,self.preamp_index,ct.byref(value))
+            with self.lock:code=function(0,self.speed_index,0,self.preamp_index,ct.byref(value))
         except Exception:return None
         return float(value.value) if code==20002 and value.value>0 else None
 
@@ -158,8 +207,10 @@ class AndorSDK2Camera:
                     temperature_c=temperature,temperature_state=state,cooler_on=self.cooler_on,target_temperature_c=self.target_c,
                     temperature_range_c=list(self.temperature_range),temperature_resolution_c=self.temperature_resolution_c,
                     readout=dict(self.readout),serial_number=str(self.serial_number),
-                    # The SDK reports no read noise; the shot-noise limit then counts photon noise only.
-                    electrons_per_count=self.electrons_per_count,read_noise_e=None,
+                    # The SDK reports no read noise; it comes from the datasheet when this head model is known.
+                    electrons_per_count=self.electrons_per_count,read_noise_e=self.read_noise_e,
+                    sensitivity_source=self.sensitivity_source,head_model=self.head_model,
+                    readout_speeds_mhz=list(self.readout_speeds),readout_speed_index=self.speed_index,readout_speed_mhz=self.readout_speed_mhz,
                     preamp_gains=list(self.preamp_gains),preamp_gain_index=self.preamp_index,preamp_gain=self.preamp_gains[self.preamp_index])
 
     def set_cooling(self,enabled,target_c):

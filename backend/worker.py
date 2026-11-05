@@ -164,7 +164,7 @@ class Engine:
     def require_operation(self,name):
         needed={'configure':('camera',),'move':('stage',),'zero':('stage',),
                 'preview_start':('camera',),'background':('camera',),
-                'calibration_capture':('camera',),'run':('stage','camera'),'camera_readout':('camera',),'camera_gain':('camera',),'camera_cooling':('camera',),
+                'calibration_capture':('camera',),'run':('stage','camera'),'camera_readout':('camera',),'camera_gain':('camera',),'camera_speed':('camera',),'camera_cooling':('camera',),
                 'stage_velocity':('stage',),'stage_reference':('stage',)}.get(name,())
         self.devices.require(*needed)
         if name in ('move','run') and not getattr(self.stage,'referenced',True):
@@ -358,7 +358,8 @@ class Engine:
                                      readout_roi=[readout['x0'],readout['x1'],readout['y0'],readout['y1']],hbin=readout['hbin'],
                                      # V bin "full" (all rows summed on the chip) is stored as the ROI height.
                                      vbin=height if readout['vbin']=='full' else readout['vbin'],pixels=readout_shape(readout)[1],
-                                     center_nm=self.spectrograph['center_nm'],grating=self.spectrograph['grating'],slit_um=self.spectrograph['slit_um']),
+                                     center_nm=self.spectrograph['center_nm'],grating=self.spectrograph['grating'],slit_um=self.spectrograph['slit_um'],
+                                     readout_speed_mhz=getattr(self.camera,'readout_speed_mhz',None)),
                     calibration=self.run_calibration(),background=self.run_background(),events=[])
 
     def run_scan(self,run):
@@ -652,7 +653,7 @@ class Engine:
             if old!=data:raise ValueError('request_id was already used with different parameters')
             return result
         self.require_operation(name)
-        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph','camera_readout','camera_gain','stage_velocity'} else self._handle(name,data)
+        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph','camera_readout','camera_gain','camera_speed','stage_velocity'} else self._handle(name,data)
         except HardwareError as exc:self.hardware_failure(exc);raise
         if request_id:
             self.commands[key]=(copy.deepcopy(data),result)
@@ -719,6 +720,13 @@ class Engine:
             with self.lock:
                 self.latest=None;self.latest_version+=1;self.background=None;self.latest_axis=self.live_axis();self.revision+=1
             return dict(readout=readout,notes=notes,pixels=readout_shape(readout)[1])
+        if name=='camera_speed':
+            self.idle()
+            result=self.camera.set_readout_speed(data['index'])
+            # The bias level and noise change with the readout speed: the frame on screen and the background no longer match.
+            with self.lock:
+                self.latest=None;self.latest_version+=1;self.background=None;self.revision+=1
+            return result
         if name=='camera_gain':
             self.idle()
             result=self.camera.set_preamp_gain(data['index'])

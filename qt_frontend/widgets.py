@@ -153,11 +153,19 @@ class Segmented(QWidget):
     def set_enabled(self,value,enabled):
         button=self.button(value)
         if button: button.setEnabled(enabled)
+class NestedContent(QWidget):
+    '''Body of a CollapsibleSection: indented under its toggle, with a guide line dropping from the toggle's
+    arrow, so the sub-headings inside read as part of that section and not as sections of their own.'''
+    RULE_X=11;INDENT=22
+    def paintEvent(self,event):
+        from .theme import palette
+        p=QPainter(self);p.setPen(crisp_pen(palette()['line']));x=self.RULE_X+.5
+        p.drawLine(QPointF(x,2),QPointF(x,max(2,self.height()-4)))
 class CollapsibleSection(QWidget):
     def __init__(self,title,parent=None):
         super().__init__(parent); self.layout=QVBoxLayout(self); self.layout.setContentsMargins(0,0,0,0); self.layout.setSpacing(0)
         self.button=QPushButton('▸ '+title); self.button.setObjectName('summary'); self.button.setCheckable(True); self.button.toggled.connect(self._toggle); self.layout.addWidget(self.button)
-        self.content=QWidget(); self.content_layout=QVBoxLayout(self.content); self.content_layout.setContentsMargins(0,8,0,0); self.content.setVisible(False); self.layout.addWidget(self.content)
+        self.content=NestedContent(); self.content_layout=QVBoxLayout(self.content); self.content_layout.setContentsMargins(NestedContent.INDENT,8,0,2); self.content.setVisible(False); self.layout.addWidget(self.content)
     def _toggle(self,open):
         self.button.setText(('▾ ' if open else '▸ ')+self.button.text()[2:]); self.content.setVisible(open)
     def set_open(self,open):

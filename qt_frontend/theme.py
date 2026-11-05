@@ -127,7 +127,7 @@ QPushButton[nav=true][active=true]{border-bottom:2px solid %(blue)s;}
 QPushButton#theme{min-width:27px;max-width:27px;min-height:27px;max-height:27px;padding:0;}
 QHeaderView::section{font-size:13px;}
 QTableWidget{font-size:13px;}
-QLabel#advancedInfo{font-size:12px;color:%(muted)s;}QLabel#advancedHeading{font-size:13px;font-weight:600;color:%(text)s;padding-top:8px;border-top:1px solid %(line)s;}QLabel#coolingStatus{font-size:13px;color:%(text)s;}
+QLabel#advancedInfo{font-size:12px;color:%(muted)s;}QLabel#advancedHeading{font-size:12px;font-weight:600;color:%(text)s;padding-top:8px;border-top:1px solid %(line)s;}QLabel#coolingStatus{font-size:13px;color:%(text)s;}
 QPushButton#plotChip{font-size:12px;min-height:20px;max-height:22px;padding:0 9px;border-radius:4px;background:%(btn)s;border:1px solid %(btn_border)s;color:%(text)s;font-weight:400;}QPushButton#plotChip:hover{background:%(btn_hover)s;}
 QLabel#plotReadout{font:11px Consolas;color:%(text)s;background:%(overlay)s;border-radius:4px;padding:3px 7px;}
 QLineEdit#axisEndpointEdit{font:12px 'Segoe UI';min-height:0;padding:0 3px;border:0;border-bottom:1px solid %(blue)s;border-radius:0;background:%(surface)s;color:%(text)s;}

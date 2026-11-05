@@ -29,6 +29,23 @@ def number(value, unit='', digits=6):
     return f'{value:.{digits}g}' + (f' {unit}' if unit else '')
 
 
+def _speed_text(mhz):
+    mhz = _finite(mhz)
+    if mhz is None:
+        return None
+    return f'{mhz:g} MHz' if mhz >= 1 else f'{mhz * 1000:g} kHz'
+
+
+SENSITIVITY_SOURCES = {'sdk': 'reported by the camera', 'datasheet': 'datasheet typical value', 'model': 'simulation model'}
+
+
+def _sourced(text, source):
+    '''A value with where it came from, e.g. "10 e⁻ / count (datasheet typical value)".'''
+    if text is None:
+        return None
+    label = SENSITIVITY_SOURCES.get(source)
+    return f'{text} ({label})' if label else text
+
 def local_time(text):
     try:
         return datetime.fromisoformat(str(text)).astimezone().strftime('%Y-%m-%d %H:%M:%S')
@@ -152,9 +169,10 @@ def sections(run, quality=None):
         ('Readout', readout),
         ('Pixels per spectrum', None if acquisition.get('pixels') is None else str(acquisition['pixels'])),
         ('Full scale', number(camera.get('full_scale'), 'counts', 8)),
+        ('Readout speed', _speed_text(acquisition.get('readout_speed_mhz'))),
         ('Pre-amp gain', None if _finite(camera.get('preamp_gain')) is None else f"{float(camera['preamp_gain']):g}×"),
-        ('Sensitivity', number(camera.get('electrons_per_count'), 'e⁻ / count')),
-        ('Read noise', number(camera.get('read_noise_e'), 'e⁻ rms')),
+        ('Sensitivity', _sourced(number(camera.get('electrons_per_count'), 'e⁻ / count'), camera.get('sensitivity_source'))),
+        ('Read noise', _sourced(number(camera.get('read_noise_e'), 'e⁻ rms'), camera.get('sensitivity_source'))),
         ('Cooling', cooling),
     ]))
     direction = {1: 'delay grows with stage position', -1: 'delay shrinks with stage position'}.get(coordinates.get('delay_sign'))

@@ -104,6 +104,11 @@ class ReadoutRequest(_StrictModel):
         return value
 
 
+class SpeedRequest(_StrictModel):
+    # Index into the camera's horizontal readout speeds (capabilities: readout_speeds_mhz).
+    index: int = Field(ge=0, le=15)
+
+
 class GainRequest(_StrictModel):
     # Index into the camera's pre-amp gain list (capabilities: preamp_gains).
     index: int = Field(ge=0, le=15)

@@ -22,7 +22,9 @@ INSTRUMENT = {
     'camera': (('model', 's'), ('serial_number', 's'), ('detector_rows', 'i'), ('chip_pixels', 'i'), ('bit_depth', 'i'),
                ('full_scale', 'f'), ('cooler_on', 'b'), ('target_temperature_c', 'f'), ('temperature_resolution_c', 'f'),
                # Photoelectrons per count and read noise (electrons rms): the shot-noise limit of the spectra.
-               ('electrons_per_count', 'f'), ('read_noise_e', 'f'), ('preamp_gain', 'f')),
+               ('electrons_per_count', 'f'), ('read_noise_e', 'f'), ('preamp_gain', 'f'),
+               # Where electrons_per_count / read_noise_e come from: 'sdk', 'datasheet' (typical values) or 'model' (simulation).
+               ('sensitivity_source', 's'), ('head_model', 's')),
     'stage': (('model', 's'), ('controller_model', 's'), ('controller_identity', 's'), ('velocity_mm_s', 'f'),
               ('referenced', 'b'), ('position_source', 's'), ('position_sensor', 'b')),
     'spectrometer': (('driver', 's'), ('model', 's'), ('manual', 'b'), ('identity', 's')),
@@ -36,7 +38,7 @@ COORDINATES = (('zero_mm', 'f'), ('path_multiplier', 'f'), ('delay_sign', 'i'))
 PLAN_ARRAYS = ('delays_ps', 'targets_mm')
 PLAN = (('plan_id', 's'), ('approach_mm', 'f'), ('rounds', 'i'), ('total_points', 'i'), ('total_frames', 'i'))
 SETTINGS = (('exposure_s', 'f'), ('readout_mode', 's'), ('readout_roi', 'ia'), ('hbin', 'i'), ('vbin', 'i'), ('pixels', 'i'),
-            ('center_nm', 'f'), ('grating', 'i'), ('slit_um', 'f'))
+            ('center_nm', 'f'), ('grating', 'i'), ('slit_um', 'f'), ('readout_speed_mhz', 'f'))
 ACQUISITION = PLAN + SETTINGS
 # Datasets: wavelengths_nm (the spectra's x axis), coefficients, line_pairs (L, 2) and, only for a calibration
 # without a polynomial whose chip axis differs, chip_wavelengths_nm. The intensity response, when one is installed:

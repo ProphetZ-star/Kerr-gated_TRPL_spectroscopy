@@ -1,5 +1,7 @@
 """Synthetic optical Kerr gate and detector; all performance values are illustrative."""
 import math
+import threading
+import time
 import numpy as np
 from ..readout import default_readout,normalize_readout,readout_shape,spectrum_full_scale,bin_full_spectrum
 
@@ -65,7 +67,18 @@ class SimCamera:
     # 2.5 electrons per count at pre-amp gain 1x, fewer at the higher gains (as on the Newton).
     BASE_ELECTRONS_PER_COUNT = 2.5
     preamp_gains = [1.0, 2.0, 4.0]
-    read_noise_e = 5.0
+    # Horizontal readout speeds (MHz) as on the Newton; slower reads with less noise (same ratios as its datasheet,
+    # scaled to this model's 5 e- at 3 MHz).
+    readout_speeds = [3.0, 1.0, 0.05]
+    READ_NOISE_BY_SPEED = (5.0, 4.0, 1.3)
+    # Thermal model (illustrative, close to an air-cooled Newton): the cooler pulls the chip down at a steady rate,
+    # it reports "not stabilized" for a while after reaching the target, and with the cooler off the chip drifts
+    # back to room temperature more slowly. Room temperature to -60 C takes about 4 minutes; -60 C back above
+    # -20 C about 4 minutes, and to room temperature about 8.
+    AMBIENT_C = 20.0
+    COOL_RATE_C_PER_S = 20.0 / 60
+    WARM_RATE_C_PER_S = 10.0 / 60
+    SETTLE_S = 30.0
 
     def __init__(self):
         self.axis = np.linspace(500, 800, self.pixels)
@@ -74,10 +87,50 @@ class SimCamera:
         self.cooler_on = True
         self.target_c = -70
         self.preamp_index = 0
+        self.speed_index = 0
+        # Starts cooled and stable, as a camera that was left cooling; changes then take time.
+        self._thermal_lock = threading.Lock()
+        self._temperature = float(self.target_c)
+        self._thermal_time = time.monotonic()
+        self._reached_at = self._thermal_time - self.SETTLE_S
+
+    def temperature(self):
+        '''(temperature_c, state) now, advancing the thermal model from the last reading.'''
+        with self._thermal_lock:
+            now = time.monotonic(); elapsed = max(0.0, now - self._thermal_time); self._thermal_time = now
+            goal = float(self.target_c) if self.cooler_on else self.AMBIENT_C
+            value = self._temperature
+            if value > goal:
+                value = max(goal, value - (self.COOL_RATE_C_PER_S if self.cooler_on else self.WARM_RATE_C_PER_S) * elapsed)
+            elif value < goal:
+                value = min(goal, value + self.WARM_RATE_C_PER_S * elapsed)
+            if value == goal and self._temperature != goal:
+                self._reached_at = now
+            self._temperature = value
+            if not self.cooler_on:
+                return value, 'off'
+            if value != goal:
+                return value, 'not_reached'
+            return value, 'stabilized' if now - self._reached_at >= self.SETTLE_S else 'not_stabilized'
 
     @property
     def electrons_per_count(self):
         return self.BASE_ELECTRONS_PER_COUNT / self.preamp_gains[self.preamp_index]
+
+    @property
+    def read_noise_e(self):
+        return self.READ_NOISE_BY_SPEED[self.speed_index]
+
+    @property
+    def readout_speed_mhz(self):
+        return self.readout_speeds[self.speed_index]
+
+    def set_readout_speed(self, index):
+        if not 0 <= index < len(self.readout_speeds):
+            raise ValueError(f'Readout speed index must be 0…{len(self.readout_speeds)-1}')
+        self.speed_index = int(index)
+        return dict(index=self.speed_index, mhz=self.readout_speed_mhz, speeds=list(self.readout_speeds),
+                    gain=self.preamp_gains[self.preamp_index])
 
     def set_preamp_gain(self, index):
         if not 0 <= index < len(self.preamp_gains):
@@ -87,25 +140,32 @@ class SimCamera:
 
     @property
     def temperature_c(self):
-        return float(self.target_c) if self.cooler_on else 20.0
+        return self.temperature()[0]
 
     def capabilities(self):
+        temperature, state = self.temperature()
         return dict(model='Andor Newton DU920P (simulated)', shape=[255,1024],
                     pixels=readout_shape(self.readout)[1], chip_pixels=self.pixels, detector_rows=self.rows,
                     bit_depth=16, full_scale=spectrum_full_scale(self.readout),
                     read_modes=['fvb'], source_mode=self.source_mode,
-                    temperature_c=self.temperature_c, temperature_state='stabilized' if self.cooler_on else 'off',
+                    temperature_c=temperature, temperature_state=state,
                     cooler_on=self.cooler_on, target_temperature_c=self.target_c, temperature_range_c=list(self.temperature_range),
                     temperature_resolution_c=None, serial_number=None,
                     electrons_per_count=self.electrons_per_count, read_noise_e=self.read_noise_e,
                     preamp_gains=list(self.preamp_gains), preamp_gain_index=self.preamp_index,
-                    preamp_gain=self.preamp_gains[self.preamp_index],
+                    preamp_gain=self.preamp_gains[self.preamp_index], sensitivity_source='model', head_model=None,
+                    readout_speeds_mhz=list(self.readout_speeds), readout_speed_index=self.speed_index,
+                    readout_speed_mhz=self.readout_speed_mhz,
                     readout=dict(self.readout), position_sensor=False)
 
     def set_cooling(self, enabled, target_c):
         low, high = self.temperature_range
         target = int(round(max(low, min(high, target_c))))
-        self.cooler_on = bool(enabled); self.target_c = target
+        self.temperature()  # account for the time spent under the previous setting
+        with self._thermal_lock:
+            if self.cooler_on and bool(enabled) and target != self.target_c:
+                self._reached_at = time.monotonic()
+            self.cooler_on = bool(enabled); self.target_c = target
         return dict(enabled=self.cooler_on, target_c=target, requested_c=target_c, clamped=target != round(target_c), range_c=[low, high])
 
     def set_readout(self, data):
