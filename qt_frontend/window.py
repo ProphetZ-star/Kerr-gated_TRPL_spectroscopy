@@ -558,6 +558,7 @@ class MainWindow(QMainWindow):
         stage_layout.addLayout(delay_row)
         self.stage_status = QLabel('● In position')
         self.stage_status.setObjectName('stageStatus')
+        self.stage_status.setWordWrap(True)
         self._reg('stageStatus', self.stage_status, False)
         stage_layout.addWidget(self.stage_status)
         nudge = QWidget()
@@ -718,6 +719,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(field('Target', self.cooling_target, '°C'), 1, 1)
         self.cooling_status = QLabel('Temperature —')
         self.cooling_status.setObjectName('coolingStatus')
+        # Long warming hints wrap instead of widening the sidebar, where the Advanced settings would be clipped.
+        self.cooling_status.setWordWrap(True)
         self.cooling_status.setToolTip('The cooler keeps regulating after a disconnect. Switch it off and let the CCD warm above −20 °C before powering the camera down.')
         self._reg('coolingStatus', self.cooling_status, False)
         layout.addWidget(self.cooling_status, 2, 0, 1, 2)
@@ -927,6 +930,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.repeat_wrap)
         self.validation = QLabel('')
         self.validation.setObjectName('validation')
+        # Validation messages can be a full sentence; wrap them instead of widening the sidebar.
+        self.validation.setWordWrap(True)
         self._reg('validation', self.validation, False)
         layout.addWidget(self.validation)
         self._segment_rows = []
@@ -1211,6 +1216,9 @@ class MainWindow(QMainWindow):
             self._reg(name, box, False)
             note = QLabel('')
             note.setProperty('muted', True)
+            # Large counts ("123,456 frames") wrap under each other instead of widening the sidebar.
+            note.setWordWrap(True)
+            note.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             row_layout.addWidget(box, 1)
             row_layout.addWidget(note)
             layout.addWidget(row)
@@ -3060,8 +3068,9 @@ class MainWindow(QMainWindow):
         if imported is not None:
             # A file opened here: the button writes its new fits back into it.
             unsaved = [fit for fit in ((imported.run or {}).get('metadata') or {}).get('analysis', {}).values() if not fit.get('stored')]
-            self.save_run.setText(f'Save fits to file ({len(unsaved)})' if unsaved else 'Save fits to file')
-            self.save_run.setToolTip('Write the fits made since this file was opened into its /analysis group; the recorded data are not changed')
+            # Short label: it shares a row with Export fit CSV in the sidebar.
+            self.save_run.setText(f'Save fits ({len(unsaved)})' if unsaved else 'Save fits')
+            self.save_run.setToolTip('Save fits to file: write the fits made since this file was opened into its /analysis group; the recorded data are not changed')
             self.save_run.setEnabled(bool(unsaved))
         else:
             self.save_run.setText('Save HDF5'); self.save_run.setToolTip('')
@@ -3408,8 +3417,11 @@ class MainWindow(QMainWindow):
         for note, value in ((self.proc_saturated_note, counts.get('saturated_points')), (self.proc_unstable_note, counts.get('unstable_frames'))):
             set_prop(note, 'warning', bool(value))
         if counts:
-            self.processing_summary.setText(f"{counts['frames_used']:,} of {counts['frames_total']:,} frames")
-            self.processing_summary.setToolTip('Frames that go into the decay curve with the choices below')
+            used, total = int(counts['frames_used']), int(counts['frames_total'])
+            # The heading row has one line; millions are shortened so the count never widens the sidebar.
+            short = lambda n: f'{n / 1e6:.3g} M' if n >= 1_000_000 else f'{n:,}'
+            self.processing_summary.setText(f'{short(used)} of {short(total)} frames')
+            self.processing_summary.setToolTip(f'{used:,} of {total:,} frames go into the decay curve with the choices below')
         elif result is None:
             self.processing_summary.setText('')
         spectrum = self.analysis_view.currentData() == 'spectrum'
@@ -4183,7 +4195,10 @@ class MainWindow(QMainWindow):
                 label, color = f'warming · keep the camera powered until above {SAFE_POWER_OFF_C:g} °C', 'warning'
             elif not camera.get('cooler_on') and self._ccd_still_warming(float(temperature)):
                 label, color = 'warming · dark current still changing', 'warning'
+            label, _, hint = label.partition(' · ')
             text = f'<span style="color:{palette()[color]}">●</span> Now {float(temperature):.1f} °C · {label}'
+            if hint:
+                text += f'<br>{hint[:1].upper()}{hint[1:]}'
             if getattr(self, '_warmup_watch', False) and not camera.get('cooler_on') and float(temperature) >= SAFE_POWER_OFF_C:
                 self._warmup_watch = False
                 self.show_toast(f'CCD at {float(temperature):.1f} °C · safe to close Kerr Studio and power the camera off', 'success')
