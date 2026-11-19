@@ -1280,8 +1280,11 @@ class SpectrumPlot(PinnedLines, EditablePlot):
         xs = np.asarray(x, dtype=float)[:len(sigma)]; ys = np.asarray(sigma, dtype=float)[:len(xs)]
         log = scale == 'log'; colors = palette()
         def show(item, values, pen):
+            # Pixels too weak to give a meaningful ratio are NaN; with a weak spectrum they come every few pixels and
+            # a line that breaks at each one shows as scattered dots. Draw through the pixels that have a value.
             item.setPen(pen); item.setLogMode(False, log)
-            item.setData(xs, np.where(values > 0, values, np.nan) if log else values)
+            keep = np.isfinite(values) & (values > 0 if log else True)
+            item.setData(xs[keep], values[keep])
         show(self._noise_item, ys, pg.mkPen(colors['noise'], width=1.2))
         if limit is not None:
             limit = np.asarray(limit, dtype=float)[:len(xs)]
