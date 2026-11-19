@@ -220,6 +220,19 @@ class Engine:
 
     def to_mm(self,delay_ps):return delay_to_mm(delay_ps,self.zero,self.delay_sign)
 
+    def stage_limits(self):
+        return (self.stage.lower,self.stage.upper) if self.devices.mode=='hardware' and self.devices.connected('stage') else (0.,300.)
+
+    def reach_text(self):
+        '''The stage travel in mm and, with the present t0 and direction, in ps: the range the user works in.'''
+        low,high=self.stage_limits();first,last=sorted((self.to_delay(low),self.to_delay(high)))
+        return f'{low:g}–{high:g} mm, which at the present t₀ is {first:+.1f} to {last:+.1f} ps'
+
+    def check_reach(self,target_mm,delay_ps):
+        low,high=self.stage_limits()
+        if not low<=target_mm<=high:
+            raise ValueError(f'{delay_ps:+.3f} ps is at stage position {round(target_mm,3)+0.0:.3f} mm, outside the stage travel {self.reach_text()}')
+
     @property
     def stage(self):return self.devices.stage
 
@@ -275,8 +288,20 @@ class Engine:
         except AcquisitionCancelled:raise Cancelled()
 
     def make_scan_plan(self,request):
-        limits=(self.stage.lower,self.stage.upper) if self.devices.mode=='hardware' and self.devices.connected('stage') else (0.,300.)
-        plan=make_plan(request,self.to_delay(self.stage.position_mm),self.zero,self.delay_sign,revision=self.revision,limits=limits)
+        limits=self.stage_limits()
+        try:plan=make_plan(request,self.to_delay(self.stage.position_mm),self.zero,self.delay_sign,revision=self.revision,limits=limits)
+        except ValueError as exc:
+            if 'soft limits' not in str(exc):raise
+            # The plan checks stage positions in mm; say which delays do not fit, in ps.
+            if request.mode=='single':
+                delays=[self.to_delay(self.stage.position_mm)]
+            else:
+                delays=[float(segment.start) for segment in request.segments]+[float(segment.end) for segment in request.segments]
+            outside=[d for d in delays if not limits[0]<=self.to_mm(d)<=limits[1]]
+            span=f'{min(delays):+g} to {max(delays):+g} ps'
+            detail=(f' ({", ".join(f"{d:+g} ps at {round(self.to_mm(d),3)+0.0:.3f} mm" for d in sorted(set(outside))[:3])} outside)' if outside else
+                    ' (only the 0.01 mm run-up before the first point is outside)')
+            raise ValueError(f'The scan {span} does not fit the stage travel {self.reach_text()}{detail}') from None
         # What the frames would take in memory, and what is free now (the GUI warns before a scan that will not fit).
         frame_size=resources.frame_bytes(readout_shape(self.camera.readout)[1])
         plan['estimated_memory_bytes']=(CACHE_BYTES+2128*frame_size if request.autosave else plan['total_frames']*frame_size)
@@ -648,7 +673,8 @@ class Engine:
         try:
             if name=='move':
                 current=self.to_delay(self.stage.position_mm)
-                target=self.to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'])
+                wanted=current+data['delay_ps'] if data['relative'] else data['delay_ps']
+                target=self.to_mm(wanted);self.check_reach(target,wanted)
                 self.stage.duration(target);self.preview_moving=True
                 self.launch('preview',self.preview_move,target)
                 return dict(accepted=True)
@@ -849,7 +875,8 @@ class Engine:
             self.launch('move',self.reference_stage);return dict(accepted=True)
         if name=='move':
             current=self.to_delay(self.stage.position_mm)
-            target=self.to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'])
+            wanted=current+data['delay_ps'] if data['relative'] else data['delay_ps']
+            target=self.to_mm(wanted);self.check_reach(target,wanted)
             self.stage.duration(target);self.launch('move',self.move,target);return dict(accepted=True)
         if name=='delay_direction':
             self.idle()
