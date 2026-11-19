@@ -62,8 +62,19 @@ class _SpinEditorGeometry:
         if event.type() in (QEvent.EnabledChange,QEvent.StyleChange,QEvent.FontChange,QEvent.PaletteChange):
             # The box is the timer's context: a box deleted meanwhile (a closed dialog) is never called.
             self._place_editor();QTimer.singleShot(0,self,self._place_editor)
-class NativeSpinBox(_SpinEditorGeometry,QSpinBox):pass
-class NativeDoubleSpinBox(_SpinEditorGeometry,QDoubleSpinBox):
+class _ClickToWheel:
+    '''A number box the wheel changes only after it has been clicked into: over an unfocused box the wheel scrolls the
+    page instead (scrolling the sidebar used to change background frames, repeats, ROI and the like in passing).'''
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        # Qt's default for spin boxes is WheelFocus, which gives focus to the box under the wheel first.
+        self.setFocusPolicy(Qt.StrongFocus)
+    def wheelEvent(self,event):
+        if not self.hasFocus():
+            event.ignore();return
+        super().wheelEvent(event)
+class NativeSpinBox(_ClickToWheel,_SpinEditorGeometry,QSpinBox):pass
+class NativeDoubleSpinBox(_ClickToWheel,_SpinEditorGeometry,QDoubleSpinBox):
     def textFromValue(self,value):
         text=super().textFromValue(value);decimal=self.locale().decimalPoint()
         return text.rstrip('0').rstrip(decimal) if decimal in text else text
