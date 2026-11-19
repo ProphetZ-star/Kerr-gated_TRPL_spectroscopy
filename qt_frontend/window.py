@@ -31,7 +31,8 @@ from backend.readout import normalize_readout, readout_shape, describe as descri
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 # Window settings kept between sessions (instrument settings are kept by the worker in instrument-settings.json).
 UI_SETTINGS_FILE = 'ui-settings.json'
-ACQUISITION_SETTINGS = ('frames_input', 'background_frames', 'autosave', 'spectrum_scale', 'map_scale', 'decay_normalize')
+ACQUISITION_SETTINGS = ('frames_input', 'background_frames', 'autosave', 'spectrum_scale', 'map_scale', 'decay_normalize',
+                        'subtract_background')
 ANALYSIS_SETTINGS = ('analysis_view', 'proc_background', 'proc_saturated', 'proc_unstable', 'proc_position', 'proc_tolerance',
                      'proc_show_rounds', 'fit_model', 'irf_width', 'analysis_window', 'analysis_unit', 'analysis_scale')
 CALIBRATION_SETTINGS = ('cal_exposure', 'cal_readout', 'cal_row_start', 'cal_row_end', 'cal_convention', 'cal_order',
@@ -1016,6 +1017,13 @@ class MainWindow(QMainWindow):
         legend.add('Shot-noise limit', dashed=True, color='muted', key='shot').hide()
         self.spectrum_legend = legend
         panel.add_tool(legend)
+        # Display only: the spectrum is drawn minus the background; frames are always stored as raw counts.
+        self.subtract_background = QCheckBox('Subtract background')
+        self.subtract_background.setObjectName('subtractBackground'); self.subtract_background.setMinimumHeight(24)
+        self.subtract_background.setEnabled(False)
+        self.subtract_background.toggled.connect(self._subtract_background_toggled)
+        self._reg('subtractBackground', self.subtract_background, False)
+        panel.add_tool(self.subtract_background)
         self.spectrum_scale = Segmented([('Linear', 'linear'), ('Log Y', 'log')])
         self.spectrum_scale.set_selected('linear')
         self.spectrum_scale.changed.connect(lambda value: self._schedule_refresh())
@@ -1964,7 +1972,7 @@ class MainWindow(QMainWindow):
         self.controller.dispatch('response_clear', {}, success=lambda result: (self.controller.request_status(), self.show_toast('Intensity response cleared')),
                                  failure=lambda payload: self.show_toast(payload_message(payload)))
     def _update_response_controls(self, snapshot):
-        self.spectrum_legend.entries['background'].setVisible(not getattr(self, '_live_corrected', False))
+        self.spectrum_legend.entries['background'].setVisible(not getattr(self, '_live_corrected', False) and not getattr(self, '_live_subtracted', False))
         if self._pages.get('calibration') is None:return
         installed = snapshot.get('response') or {}; candidate = snapshot.get('response_candidate') or {}
         progress = snapshot.get('response_progress') or {}; busy = snapshot.get('busy')
@@ -2808,7 +2816,7 @@ class MainWindow(QMainWindow):
                    json.dumps(camera.get('readout') or {}, sort_keys=True))
             if key != getattr(self, '_live_display_key', None):
                 self._update_live_spectrum()
-                self.spectrum_legend.entries['background'].setVisible(not self._live_corrected)
+                self.spectrum_legend.entries['background'].setVisible(not self._live_corrected and not getattr(self, '_live_subtracted', False))
                 self._live_display_key = key
             self._update_header(self._snapshot or {})
         if self._current_page == 'analysis':
@@ -2908,6 +2916,24 @@ class MainWindow(QMainWindow):
             current = correction.apply(current, response, correction.run_background(dataset.run) if picked else bg_array)
             bg_array = None
         corrected = response is not None and current is not None
+        # Subtract background: the recorded background (a picked run spectrum: the one stored with its run). With an
+        # intensity response the corrected spectrum already has it taken off, so the option has nothing to do then.
+        own_background = correction.run_background(dataset.run) if picked else bg_array
+        can_subtract = not corrected and current is not None and own_background is not None and len(own_background) == len(current)
+        toggle = getattr(self, 'subtract_background', None)  # absent in views built without the panel (tests)
+        if toggle is not None:
+            toggle.setEnabled(can_subtract)
+            toggle.setToolTip(
+                'Draw the spectrum minus the recorded background (display only; the frames stay raw counts)' if can_subtract else
+                'The intensity-corrected spectrum already has the background taken off' if corrected else
+                'Record a background first (Acquisition › Background)')
+        subtracted = bool(can_subtract and toggle is not None and toggle.isChecked())
+        if subtracted:
+            current = np.asarray(current, dtype=float) - np.asarray(own_background, dtype=float)
+            bg_array = None
+        if subtracted != getattr(self, '_live_subtracted', False):
+            self.spectrum_plot._clear_axis('y'); self.spectrum_plot.zoom_group.changed()
+        self._live_subtracted = subtracted
         if corrected != getattr(self, '_live_corrected', False):
             # Corrected and raw counts have different scales. A zoom in the previous scale can hide
             # the restored raw spectrum; keep the wavelength zoom but release the intensity range.
@@ -2943,14 +2969,17 @@ class MainWindow(QMainWindow):
                     self.spectrum_plot.set_axis_bounds('y', *padded_range(finite))
             else:
                 self.spectrum_plot.set_axis_bounds('y',0,math.log10(full_scale)*1.05 if logarithmic else _nice_ceiling(full_scale*1.02))
-            self.spectrum_plot.set_y_label('CCD / counts')  # log axes label decades in counts
-            self.spectrum_legend.set_hint('current', '')
+            self.spectrum_plot.set_y_label('CCD / counts − background' if subtracted else 'CCD / counts')  # log axes label decades in counts
+            self.spectrum_legend.set_hint('current', 'Background subtracted (display only; the frames stay raw counts)' if subtracted else '')
         self.spectrum_plot.set_marker(dataset.wave,dataset.half_window,visible=bool(axis) and current is not None)
         if saturated > 0:
             self.saturation.setText(f'⚠ {saturated} saturated pixels')
             self.saturation.show()
         else:
             self.saturation.hide()
+    def _subtract_background_toggled(self, checked):
+        self._live_display_key = None  # redraw now, even with no new frame
+        self._schedule_refresh()
     def _update_live_noise(self, snapshot, frame, latest, current, x, picked, averaged=1):
         '''Noise on the Live spectrum's right axis: the scatter of each pixel over repeated preview frames, or a
         single-frame estimate for scan frames (each at a new delay) and picked run spectra.'''
