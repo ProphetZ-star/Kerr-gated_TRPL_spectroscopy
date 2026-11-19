@@ -491,6 +491,7 @@ def fmt_value(value,digits=4):
     try: value=float(value)
     except Exception: return '—'
     if not math.isfinite(value): return '—'
+    if value==0: value=0.0  # never "-0"
     if value!=0 and (abs(value)>=100000 or abs(value)<0.001): return f'{value:.2e}'
     text=f'{value:.{digits}g}'
     return text

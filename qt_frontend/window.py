@@ -11,9 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import get_args
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QVariantAnimation, QEasingCurve, QFile, QEvent
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker, QSize, QPoint, QPropertyAnimation, QVariantAnimation, QEasingCurve, QFile, QEvent, QByteArray
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QMenu
+from PySide6.QtWidgets import QGraphicsDropShadowEffect, QMenu, QAbstractButton, QAbstractSpinBox
 from .icons import icon_box, line_icon
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea, QFrame, QStackedWidget, QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDoubleSpinBox, QSpinBox, QFileDialog, QMessageBox, QInputDialog, QApplication
 from .widgets import ArrowComboBox as QComboBox,CheckBox as QCheckBox,WaveLogo,ThemeButton,NativeSpinBox as QSpinBox,NativeDoubleSpinBox as QDoubleSpinBox
@@ -29,6 +29,49 @@ from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
+# Window settings kept between sessions (instrument settings are kept by the worker in instrument-settings.json).
+UI_SETTINGS_FILE = 'ui-settings.json'
+ACQUISITION_SETTINGS = ('frames_input', 'background_frames', 'autosave', 'spectrum_scale', 'map_scale', 'decay_normalize')
+ANALYSIS_SETTINGS = ('analysis_view', 'proc_background', 'proc_saturated', 'proc_unstable', 'proc_position', 'proc_tolerance',
+                     'proc_show_rounds', 'fit_model', 'irf_width', 'analysis_window', 'analysis_unit', 'analysis_scale')
+CALIBRATION_SETTINGS = ('cal_exposure', 'cal_readout', 'cal_row_start', 'cal_row_end', 'cal_convention', 'cal_order',
+                        'response_frames', 'cal_axis')
+
+
+def _ui_settings_path():
+    return Path(os.environ.get('KERR_STATE_DIR', Path(__file__).resolve().parents[1] / 'data')) / UI_SETTINGS_FILE
+
+
+def _widget_value(widget):
+    if isinstance(widget, Segmented):
+        return widget.current()
+    if isinstance(widget, QAbstractButton):
+        return bool(widget.isChecked())
+    if isinstance(widget, QAbstractSpinBox):
+        return widget.value()
+    if isinstance(widget, QComboBox):
+        return widget.currentText()
+    return widget.text()
+
+
+def _set_widget_value(widget, value):
+    '''Restore one control as if the user had set it (its own change handlers run).'''
+    if isinstance(widget, Segmented):
+        if widget.button(str(value)) is not None:
+            widget.set_selected(str(value), emit=True)
+    elif isinstance(widget, QAbstractButton):
+        widget.setChecked(bool(value))
+    elif isinstance(widget, QAbstractSpinBox):
+        widget.setValue(value)
+    elif isinstance(widget, QComboBox):
+        index = widget.findText(str(value))
+        if index >= 0:
+            widget.setCurrentIndex(index)
+            widget.activated.emit(index)
+    else:
+        widget.setText(str(value))
+        if hasattr(widget, 'editingFinished'):
+            widget.editingFinished.emit()
 # Andor: let the chip warm above this before the camera is powered off (a cold chip must not lose power).
 SAFE_POWER_OFF_C = -20.0
 # With the cooler off the SDK only reports "off", so whether the chip is still warming is judged from its readings:
@@ -101,7 +144,7 @@ def _model_payload(module_name, model_name, candidate, nested=()):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, controller=None, auto_start=False):
+    def __init__(self, controller=None, auto_start=False, remember=False):
         super().__init__()
         self.setObjectName('MainWindow')
         self.setWindowTitle('Kerr Studio · TRPL Acquisition')
@@ -168,6 +211,12 @@ class MainWindow(QMainWindow):
         self._cal_timer.timeout.connect(self._poll_calibration_capture)
         self._apply_theme()
         self._apply_visual_geometry()
+        # Window settings from the last session (only for the real application, not for windows built in tests).
+        self._remember = bool(remember); self._ui_saved = {}; self._ui_written = None
+        if self._remember:
+            self._restore_ui_settings()
+            self._ui_save_timer = QTimer(self); self._ui_save_timer.setInterval(10000)
+            self._ui_save_timer.timeout.connect(self._save_ui_settings); self._ui_save_timer.start()
         self._schedule_refresh()
         if auto_start:
             QTimer.singleShot(0, self.start_backend)
@@ -2343,7 +2392,9 @@ class MainWindow(QMainWindow):
                 delay = stage.get('controller_reported_delay_ps')
             # A typed target stays until it is sent; status polls must not replace it with the current position.
             if delay is not None and not self.delay_edit.hasFocus() and not self._delay_edited:
-                self.delay_edit.setText(f'{float(delay):.3f}')
+                text = f'{float(delay):.3f}'
+                # A delay that rounds to zero (e.g. -0.0004 ps from the stage's step) reads 0.000, not -0.000.
+                self.delay_edit.setText('0.000' if text == '-0.000' else text)
             moving = bool(stage.get('moving'))
             if self._referencing and snapshot.get('busy') != 'move':
                 self._referencing = False
@@ -2441,6 +2492,10 @@ class MainWindow(QMainWindow):
             self._update_background_status(snapshot, busy)
             self._check_pending_scan(snapshot, busy)
             self._update_header(snapshot)
+            warning = snapshot.get('settings_warning')
+            if warning and warning != getattr(self, '_settings_warning_shown', None):
+                self.show_toast(warning, 'warning')
+            self._settings_warning_shown = warning
             self._update_cal_controls()
             self._update_response_controls(snapshot)
             self._update_output_status()
@@ -3656,7 +3711,7 @@ class MainWindow(QMainWindow):
         nearest = min(observed, key=lambda item: abs(item[0] - float(delay)))
         self.analysis_curve.set_marker(nearest[0])
         self.analysis_residual.set_marker(nearest[0])
-        self.analysis_point.setText(f'{nearest[0]:.4g} ps · {nearest[1]:.4g}')
+        self.analysis_point.setText(f'{nearest[0] + 0.0:.4g} ps · {nearest[1] + 0.0:.4g}')  # + 0.0 turns -0.0 into 0
         self.analysis_point.show()
     def _fit_curve_points(self, fit):
         if not isinstance(fit, dict):
@@ -4579,6 +4634,8 @@ class MainWindow(QMainWindow):
             self.cal_image.sync_x_with(self.cal_spectrum)
             self._load_demo_reference(silent=True)
         apply_pointer_cursors(page)
+        if getattr(self, '_remember', False):
+            self._restore_page_settings(name)
         self._update_from_snapshot()
         self._apply_visual_geometry()
 
@@ -4595,6 +4652,87 @@ class MainWindow(QMainWindow):
                 self._update_from_snapshot()
                 if self._current_page == 'calibration':self._update_cal_plots()
                 self._schedule_refresh()
+    def _collect_ui_settings(self):
+        '''Everything the window keeps for the next session; a page not opened this time keeps its saved values.
+        The output folder and file name are not kept: each experiment gets its own.'''
+        def values(names):
+            return {name: _widget_value(getattr(self, name)) for name in names if hasattr(self, name)}
+        acquisition = values(ACQUISITION_SETTINGS)
+        forever = self.repeat_forever.isChecked()
+        acquisition.update(
+            segments=[[row['start'].text(), row['end'].text(), row['step'].text()] for row in self._segment_rows],
+            mode=self.mode_seg.current(), repeat_forever=forever,
+            repeats=int(getattr(self, '_repeats_before', 3) or 3) if forever else self.repeats_input.value(),
+            exposure_unit=self._exposure_unit,
+            detection_advanced=self.advanced.button.isChecked(), stage_advanced=self.stage_advanced.button.isChecked())
+        settings = dict(version=1, theme=current_mode(), acquisition=acquisition,
+                        window=dict(geometry=bytes(self.saveGeometry().toBase64()).decode('ascii')))
+        for page, names in (('analysis', ANALYSIS_SETTINGS), ('calibration', CALIBRATION_SETTINGS)):
+            settings[page] = values(names) if self._pages.get(page) is not None else self._ui_saved.get(page, {})
+        return settings
+    def _save_ui_settings(self):
+        if not getattr(self, '_remember', False):
+            return
+        try:
+            text = json.dumps(self._collect_ui_settings(), indent=1, ensure_ascii=False)
+        except Exception:
+            return
+        if text == self._ui_written:
+            return
+        path = _ui_settings_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix('.tmp'); temporary.write_text(text, encoding='utf-8'); os.replace(temporary, path)
+            self._ui_written = text
+        except OSError:
+            pass
+    def _restore_ui_settings(self):
+        try:
+            saved = json.loads(_ui_settings_path().read_text(encoding='utf-8'))
+            if not isinstance(saved, dict) or saved.get('version') != 1:
+                return
+        except (OSError, ValueError):
+            return
+        self._ui_saved = saved
+        acquisition = saved.get('acquisition') or {}
+        def guarded(action):
+            try:action()
+            except Exception:pass
+        geometry = (saved.get('window') or {}).get('geometry')
+        if geometry:
+            guarded(lambda: self.restoreGeometry(QByteArray.fromBase64(geometry.encode('ascii'))))
+        if saved.get('theme') == 'dark' and current_mode() != 'dark':
+            guarded(self._toggle_theme)
+        segments = [row for row in acquisition.get('segments') or [] if isinstance(row, list) and len(row) == 3]
+        if segments:
+            def rebuild():
+                for record in list(self._segment_rows):
+                    record['widget'].setParent(None); record['widget'].deleteLater()
+                self._segment_rows = []
+                for start, end, step in segments:
+                    self._add_segment_row(str(start), str(end), str(step))
+            guarded(rebuild)
+        if acquisition.get('mode') in ('scan', 'single', 'repeat'):
+            guarded(lambda: self.select_mode(acquisition['mode']))
+        if isinstance(acquisition.get('repeats'), int):
+            guarded(lambda: self.repeats_input.setValue(max(1, acquisition['repeats'])))
+        if acquisition.get('repeat_forever') is True:
+            guarded(lambda: self.repeat_forever.setChecked(True))
+        for name in ACQUISITION_SETTINGS:
+            if name in acquisition and hasattr(self, name):
+                guarded(lambda name=name: _set_widget_value(getattr(self, name), acquisition[name]))
+        if acquisition.get('exposure_unit') in ('ms', 's'):
+            self._exposure_unit = acquisition['exposure_unit']; self.exposure_unit.set_selected(self._exposure_unit)
+        if acquisition.get('detection_advanced'):
+            self.advanced.set_open(True)
+        if acquisition.get('stage_advanced'):
+            self.stage_advanced.set_open(True)
+    def _restore_page_settings(self, page):
+        saved = self._ui_saved.get(page) or {}
+        for name in ANALYSIS_SETTINGS if page == 'analysis' else CALIBRATION_SETTINGS:
+            if name in saved and hasattr(self, name):
+                try:_set_widget_value(getattr(self, name), saved[name])
+                except Exception:pass
     def _toggle_theme(self):
         mode = 'dark' if current_mode() == 'light' else 'light'
         apply_to_app(mode)
@@ -5249,6 +5387,7 @@ class MainWindow(QMainWindow):
         self._update_cal_plots()
     def closeEvent(self, event):
         if self._allow_close:
+            self._save_ui_settings()
             event.accept()
             return
         if self._closing_started:

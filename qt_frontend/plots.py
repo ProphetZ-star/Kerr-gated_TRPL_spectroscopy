@@ -23,6 +23,8 @@ def fmt(value, digits=4):
         return '-'
     if not math.isfinite(value):
         return '-'
+    if value == 0:
+        value = 0.0  # never "-0"
     if value != 0 and (abs(value) >= 100000 or abs(value) < 0.0001):
         return f'{value:.3e}'
     return f'{value:.{digits}g}'

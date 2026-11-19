@@ -6,6 +6,7 @@ from threading import Event, RLock, Thread
 import copy
 import hashlib
 import json
+import math
 import time
 import traceback
 import uuid
@@ -31,21 +32,42 @@ from . import response as response_maths
 DEVICE_LOG=Path(os.environ.get('KERR_STATE_DIR',Path(__file__).resolve().parents[1]/'data'))/'device-errors.log'
 
 
-def _stage_settings_path():
-    return Path(os.environ.get('KERR_STATE_DIR',Path(__file__).resolve().parents[1]/'data'))/'stage-settings.json'
+def _state_dir():
+    return Path(os.environ.get('KERR_STATE_DIR',Path(__file__).resolve().parents[1]/'data'))
 
 
-def load_delay_sign():
-    '''Saved delay direction of the real stage: +1 when the delay grows with the stage position, -1 when it shrinks
-    (the stage sits in the other beam). It belongs to the optical layout, so it survives restarts.'''
-    try:return -1 if json.loads(_stage_settings_path().read_text(encoding='utf-8')).get('delay_sign')==-1 else 1
-    except (OSError,ValueError,AttributeError):return 1
+# Commands whose result is an instrument setting kept for the next session (instrument-settings.json).
+REMEMBERED={'configure','camera_readout','camera_gain','camera_speed','camera_cooling','stage_velocity','zero','delay_direction'}
 
 
-def save_delay_sign(sign):
-    path=_stage_settings_path();path.parent.mkdir(parents=True,exist_ok=True)
-    temporary=path.with_suffix('.tmp');temporary.write_text(json.dumps(dict(version=1,delay_sign=int(sign))),encoding='utf-8')
+def load_settings():
+    '''Instrument settings from the last session, one set per source: t0, delay direction, stage speed and the CCD's
+    exposure, readout, gain, readout speed and cooling target. (Spectrometer settings are kept with the calibration.)'''
+    try:
+        payload=json.loads((_state_dir()/'instrument-settings.json').read_text(encoding='utf-8'))
+        modes={mode:dict(values) for mode,values in (payload.get('modes') or {}).items() if mode in ('hardware','simulation') and isinstance(values,dict)}
+    except (OSError,ValueError,AttributeError,TypeError):
+        modes={}
+    # The delay direction was first kept on its own (stage-settings.json).
+    if 'delay_sign' not in modes.get('hardware',{}):
+        try:
+            if json.loads((_state_dir()/'stage-settings.json').read_text(encoding='utf-8')).get('delay_sign')==-1:
+                modes.setdefault('hardware',{})['delay_sign']=-1
+        except (OSError,ValueError,AttributeError):pass
+    return modes
+
+
+def save_settings(modes):
+    path=_state_dir()/'instrument-settings.json';path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(dict(version=1,modes=modes),indent=1,allow_nan=False),encoding='utf-8')
     os.replace(temporary,path)
+
+
+def _number(value,default=None):
+    try:value=float(value)
+    except (TypeError,ValueError):return default
+    return value if math.isfinite(value) else default
 
 def log_device_error(device,message,link):
     '''Timestamped record of every device error, so an unstable connection can be told apart from rejected commands.'''
@@ -115,8 +137,11 @@ class Cancelled(Exception):
 class Engine:
     def __init__(self, events, device_factories=None):
         self.events=events;self.lock=RLock();self.seq=0;self.session=uuid.uuid4().hex
-        self.devices=DeviceConnections(device_factories);self.zero=150.0;self.zero_version=1
-        self.delay_sign=load_delay_sign();self.mode_signs={'hardware':self.delay_sign}
+        self.devices=DeviceConnections(device_factories);self.zero_version=1
+        self.saved=load_settings();self.settings_warning=None
+        hardware=self.saved.get('hardware',{})
+        self.zero=_number(hardware.get('zero_mm'),150.0)
+        self.delay_sign=-1 if hardware.get('delay_sign')==-1 else 1;self.mode_signs={'hardware':self.delay_sign}
         self.revision=0;self.busy=None;self.latest=None;self.background=None;self.background_progress=None
         self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
         self.latest_axis=None
@@ -143,7 +168,55 @@ class Engine:
     @property
     def camera(self):return self.devices.camera
 
-    def to_delay(self,position_mm):return mm_to_delay(position_mm,self.zero,self.delay_sign)
+    def remember(self):
+        '''Keep the current source's settings for the next session. Settings of a device that is not connected keep
+        their last saved values.'''
+        mode=self.devices.mode;entry=dict(self.saved.get(mode,{}))
+        entry.update(zero_mm=self.zero,delay_sign=self.delay_sign)
+        if self.devices.connected('camera'):
+            camera=self.camera
+            entry.update(exposure_s=camera.exposure_s,readout=dict(camera.readout),target_c=camera.target_c,
+                         preamp_index=getattr(camera,'preamp_index',0),speed_index=getattr(camera,'speed_index',0))
+        if self.devices.connected('stage') and _number(getattr(self.stage,'velocity_mm_s',None)):
+            entry['velocity_mm_s']=self.stage.velocity_mm_s
+        self.saved[mode]=entry
+        try:save_settings(self.saved);self.settings_warning=None
+        except (OSError,ValueError) as exc:self.settings_warning=f'Settings not saved: {exc}'
+
+    def apply_saved(self,device):
+        '''Put a just-connected device back to its saved settings. A value the device refuses is skipped (reported
+        by the caller through report_skipped); the cooler is never switched on or off, only its target is restored.'''
+        saved=self.saved.get(self.devices.mode,{});skipped=[]
+        def attempt(label,action):
+            try:action()
+            except HardwareError:raise
+            except Exception as exc:skipped.append(f'{label} ({exc})')
+        if device=='camera' and self.devices.connected('camera'):
+            camera=self.camera
+            if isinstance(saved.get('speed_index'),int) and hasattr(camera,'set_readout_speed'):
+                attempt('readout speed',lambda:camera.set_readout_speed(saved['speed_index']))
+            if isinstance(saved.get('preamp_index'),int) and hasattr(camera,'set_preamp_gain'):
+                attempt('pre-amp gain',lambda:camera.set_preamp_gain(saved['preamp_index']))
+            if isinstance(saved.get('readout'),dict):
+                attempt('readout',lambda:camera.set_readout(saved['readout']))
+            if _number(saved.get('exposure_s')):
+                attempt('exposure',lambda:self.set_exposure(_number(saved['exposure_s'])))
+            if _number(saved.get('target_c')) is not None:
+                attempt('cooling target',lambda:camera.set_cooling(camera.cooler_on,_number(saved['target_c'])))
+            with self.lock:
+                self.latest=None;self.latest_version+=1;self.background=None;self.latest_axis=self.live_axis();self.revision+=1
+        if device=='stage' and self.devices.connected('stage') and _number(saved.get('velocity_mm_s')):
+            attempt('stage speed',lambda:self.stage.set_velocity(_number(saved['velocity_mm_s'])))
+            with self.lock:self.revision+=1
+        return skipped
+
+    def report_skipped(self,skipped):
+        self.settings_warning=('Some saved settings were not restored: '+'; '.join(skipped)) if skipped else None
+
+    def to_delay(self,position_mm):
+        # Float noise around t0 (and -0.0 with a reversed direction) would show as "-0.000"; below an attosecond is 0.
+        delay=mm_to_delay(position_mm,self.zero,self.delay_sign)
+        return 0.0 if abs(delay)<1e-6 else delay
 
     def to_mm(self,delay_ps):return delay_to_mm(delay_ps,self.zero,self.delay_sign)
 
@@ -257,7 +330,7 @@ class Engine:
                    id(self.latest_axis),id(self.background),self.calibration_workbench.warning)
             token=hashlib.sha256(repr(stamp).encode()).hexdigest()
             full=since!=token
-            state=dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,worker_session_id=self.session,seq=self.seq,revision=self.revision,
+            state=dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,settings_warning=self.settings_warning,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,worker_session_id=self.session,seq=self.seq,revision=self.revision,
                        stage=self.stage_state(run),
                        camera=self.camera.capabilities()|dict(exposure_s=self.camera.exposure_s),
                        background_progress=copy.deepcopy(self.background_progress),response_progress=copy.deepcopy(self.response_progress),
@@ -275,7 +348,7 @@ class Engine:
 
     def status(self):
         with self.lock:
-            return dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,
+            return dict(source_mode=self.devices.mode,device_generation=self.device_generation,connected=self.connected,settings_warning=self.settings_warning,devices=self.devices.status(),available=self.devices.available(),busy=self.busy,
                         worker_session_id=self.session,seq=self.seq,revision=self.revision,
                         stage=self.stage_state(self.runs.get(self.current)),
                         camera=self.camera.capabilities()|dict(exposure_s=self.camera.exposure_s),
@@ -677,6 +750,7 @@ class Engine:
         self.require_operation(name)
         try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','delay_direction','spectrograph','camera_readout','camera_gain','camera_speed','stage_velocity'} else self._handle(name,data)
         except HardwareError as exc:self.hardware_failure(exc);raise
+        if name in REMEMBERED:self.remember()
         if request_id:
             self.commands[key]=(copy.deepcopy(data),result)
             if len(self.commands)>1000:self.commands.pop(next(iter(self.commands)))
@@ -695,8 +769,10 @@ class Engine:
                 self.mode_zeros[self.devices.mode]=self.zero;self.mode_spectrographs[self.devices.mode]=self.spectrograph.copy()
                 self.mode_signs[self.devices.mode]=self.delay_sign
                 self.devices.switch(mode)
-                self.zero=self.mode_zeros.get(mode,150.0);self.zero_version+=1
-                self.delay_sign=self.mode_signs.get(mode,1)
+                saved=self.saved.get(mode,{})
+                self.zero=self.mode_zeros.get(mode,_number(saved.get('zero_mm'),150.0));self.zero_version+=1
+                self.delay_sign=self.mode_signs.get(mode,-1 if saved.get('delay_sign')==-1 else 1)
+                if mode=='simulation':self.report_skipped(self.apply_saved('camera')+self.apply_saved('stage'))
                 self.spectrograph=self.mode_spectrographs.get(mode,dict(center_nm=600.0,grating=300,slit_um=200.0)).copy()
                 self.calibration_workbench.set_mode(mode)
                 self.response=copy.deepcopy(self.mode_responses.get(mode) or self.calibration_workbench.restore_response(self.spectrograph) or dict(EMPTY_RESPONSE))
@@ -722,7 +798,9 @@ class Engine:
             before=self.devices.status()
             old_spec=copy.deepcopy(self.devices.links['spectrometer']['config'])
             try:
-                if name=='device_connect':self.devices.connect(data['device'],{k:v for k,v in data.items() if k!='device'})
+                if name=='device_connect':
+                    self.devices.connect(data['device'],{k:v for k,v in data.items() if k!='device'})
+                    self.report_skipped(self.apply_saved(data['device']))
                 else:self.devices.disconnect(data['device'])
             finally:
                 spec=self.devices.links['spectrometer'];optics_changed=spec.get('reported_settings') is not None and spec['reported_settings']!=self.spectrograph
@@ -773,7 +851,6 @@ class Engine:
             self.idle()
             sign=-1 if int(data['sign'])<0 else 1
             if sign!=self.delay_sign:
-                if self.devices.mode=='hardware':save_delay_sign(sign)
                 # t0 stays at the same stage position; every delay on the other side of it changes sign.
                 self.delay_sign=sign;self.zero_version+=1;self.revision+=1
             return self.status()

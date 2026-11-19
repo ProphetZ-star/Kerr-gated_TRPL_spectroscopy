@@ -106,7 +106,7 @@ def main():
         icon_path = root / 'assets' / 'Kerr studio.ico'
         if icon_path.exists():
             app.setWindowIcon(QIcon(str(icon_path)))
-        window = MainWindow(auto_start=False)
+        window = MainWindow(auto_start=False, remember=True)
         if icon_path.exists():
             window.setWindowIcon(QIcon(str(icon_path)))
         window.show()
