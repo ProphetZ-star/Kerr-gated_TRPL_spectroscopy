@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 
-from PySide6.QtCore import Qt, QCoreApplication, QEvent
+from PySide6.QtCore import Qt, QCoreApplication, QEvent, QTimer
 from PySide6.QtWidgets import QApplication
 
 import runtime_probe
@@ -40,23 +40,38 @@ class LazyPageTests(unittest.TestCase):
     def setUp(self):
         self.errors=[]
         hook=patch.object(sys,'excepthook',lambda kind,value,tb:self.errors.append(value));hook.start();self.addCleanup(hook.stop)
-        self.bridge=NoDeviceBridge();self.controller=Controller(bridge=self.bridge)
-        self.window=MainWindow(controller=self.controller,auto_start=False)
-        self.window._auto_connect_started=True
         self.temp=TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.env=patch.dict(os.environ,KERR_STATE_DIR=self.temp.name);self.env.start();self.addCleanup(self.env.stop)
         self.engine=Engine(Queue());self.addCleanup(lambda:shutdown_engine(self.engine))
         self.engine.handle('connect',dict(mode='simulation'))
+        self.bridge=NoDeviceBridge();self.controller=Controller(bridge=self.bridge)
+        self.bridge.setParent(self.controller)
+        self.window=MainWindow(controller=self.controller,auto_start=False)
+        self.controller.setParent(self.window)
+        self.addCleanup(self._dispose_window)
+        self.window._auto_connect_started=True
         self.snapshot=self.engine.status()
         self.snapshot.update(latest=dict(spectrum=[100,200,600,300,100],source_mode='simulation',saturated_pixels=0),
                              live_axis=[500,525,550,575,600])
         self.controller._on_snapshot(self.snapshot)
 
-    def tearDown(self):
-        self.window._allow_close=True
-        for timer in (self.window._map_timer,self.window._label_timer,self.window._cal_timer):timer.stop()
-        self.window.close();self.window.deleteLater()
-        QCoreApplication.sendPostedEvents(None,QEvent.DeferredDelete)
+    def _dispose_window(self):
+        window = self.window
+        for timer in window.findChildren(QTimer):
+            timer.stop()
+        window._allow_close = True
+        window.close()
+        # PlotWidget.close() releases scenes and their unparented menus. MainWindow's
+        # QObject destructor alone can leave them alive until cyclic garbage collection.
+        plots = window._created_plots()
+        for plot in plots:
+            plot.hide()
+            plot.close()
+            plot.deleteLater()
+        for plot in plots:
+            QCoreApplication.sendPostedEvents(plot, QEvent.DeferredDelete)
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(window, QEvent.DeferredDelete)
         self.assertEqual(self.errors,[],f'Qt slot errors: {self.errors}')
 
     def test_initial_page_only_and_first_switch_hydrates_current_state(self):

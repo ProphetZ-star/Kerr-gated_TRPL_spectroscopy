@@ -1211,7 +1211,7 @@ class MainWindow(QMainWindow):
         open_layout.addWidget(self.open_path, 1)
         open_layout.addWidget(self.open_run)
         layout.addWidget(open_row)
-        self.open_file = QLineEdit('')
+        self.open_file = QLineEdit(open_row)
         self.open_file.setObjectName('openFile')
         self.open_file.hide()
         self._reg('openFile', self.open_file, False)
