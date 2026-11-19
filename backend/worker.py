@@ -687,7 +687,13 @@ class Engine:
             try:self.stage.reference(self.stop)
             except AcquisitionCancelled:raise Cancelled()
         else:
-            self.wait(4,1)
+            # Like the PI stage (FPL): drive to the positive limit and stay there. A cancelled reference leaves the
+            # stage where it stopped and unreferenced, as on hardware.
+            with self.lock:self.stage.referenced=False
+            started=time.monotonic()
+            self.move(self.stage.upper)
+            # Short moves would finish at once at the simulation speed-up; keep the referencing visible briefly.
+            self.wait(max(0.,1.5-(time.monotonic()-started)),1)
             with self.lock:self.stage.referenced=True
         with self.lock:self.revision+=1
         self.emit('stage.position',self.stage_state())

@@ -343,20 +343,66 @@ class PIStage:
             self.send(f'SVO {self.axis} 1')
             if self.query('ERR?')!='0':raise HardwareError('stage','PI could not activate the motor',link=False)
         self.motor_on=True;self.referenced=False
-        # This setup references against the positive limit switch (FPL), not the middle reference switch (FRF).
-        self.send(f'FPL {self.axis}')
-        if self.query('ERR?')!='0':raise HardwareError('stage','PI rejected the reference move',link=False)
-        deadline=time.monotonic()+self.travel_timeout(self.upper-self.lower)
+        deadline=time.monotonic()+self.reference_timeout()
+        failed=True
         try:
+            # This setup references against the positive limit switch (FPL), not the middle reference switch (FRF).
+            self.send(f'FPL {self.axis}')
+            if self.query('ERR?')!='0':raise HardwareError('stage','PI rejected the reference move',link=False)
+            last=self.value('POS?');still_since=time.monotonic()
             while True:
-                if stop.is_set():raise AcquisitionCancelled()
-                time.sleep(.05);self.position_mm=self.value('POS?')
+                if stop.wait(.05):raise AcquisitionCancelled()
+                self.position_mm=self.value('POS?')
+                now=time.monotonic()
+                if abs(self.position_mm-last)>self.STILL_MM:last=self.position_mm;still_since=now
                 if self.value('FRF?'):break
-                if time.monotonic()>deadline:raise HardwareError('stage','PI reference move timed out',link=False)
-        except AcquisitionCancelled:
-            self.send(f'HLT {self.axis}');self.query('ERR?');self.position_mm=self.value('POS?');raise
-        self.lower=self.value('TMN?');self.upper=self.value('TMX?')
-        self.position_mm=self.value('POS?');self.referenced=True
+                # Not moving and not referenced: the controller gave up (no limit switch, motion error). Say so now
+                # instead of waiting for the timeout.
+                if now-still_since>self.STALL_S:
+                    error=self.query('ERR?')
+                    raise HardwareError('stage',f'PI reference move stopped at {self.position_mm:.3f} mm without completing'
+                                        +(f' (controller error {error})' if error!='0' else ''),link=False)
+                if now>deadline:raise HardwareError('stage','PI reference move timed out',link=False)
+            # FRF? can report the reference before the axis has come to rest; read the position once it is still.
+            self.position_mm=self.settled_position(stop,deadline)
+            self.lower=self.value('TMN?');self.upper=self.value('TMX?')
+            failed=False
+        # HardwareError is an OSError: without this, every error above was re-reported as a serial failure.
+        except HardwareError:raise
+        except OSError as exc:raise HardwareError('stage','PI serial connection failed: '+str(exc)) from exc
+        finally:
+            if failed:
+                # Stop the axis whatever went wrong (Stop, timeout, controller or link error); it stays unreferenced.
+                try:
+                    self.send(f'HLT {self.axis}');self.query('ERR?');self.position_mm=self.value('POS?')
+                except Exception:pass
+        self.referenced=True
+
+    # Position change (mm) still counted as standing still, and how long a reference move may stand still.
+    STILL_MM=1e-4
+    STALL_S=5.0
+    # PI parameter "velocity for reference moves": referencing does not run at VEL.
+    REFERENCE_VELOCITY_PARAMETER=0x50
+
+    def reference_timeout(self):
+        '''Time for a reference move over the whole travel, at the slower of VEL and the reference velocity. Without a
+        readable reference velocity, allow ten minutes rather than risk a timeout halfway.'''
+        try:reference_velocity=self.parameter(self.REFERENCE_VELOCITY_PARAMETER)
+        except HardwareError:reference_velocity=None
+        # An unknown parameter leaves an error code behind; clear it so FPL's own ERR? check is not misread.
+        self.query('ERR?')
+        travel=max(self.upper-self.lower,1.)
+        if reference_velocity is None:return max(600.,self.travel_timeout(travel))
+        return 30+1.5*travel/max(min(reference_velocity,self.velocity_mm_s),1e-3)
+
+    def settled_position(self,stop,deadline):
+        '''POS? once three readings 50 ms apart agree.'''
+        readings=[self.value('POS?')]
+        while len(readings)<3 or max(readings[-3:])-min(readings[-3:])>self.STILL_MM:
+            if stop.wait(.05):raise AcquisitionCancelled()
+            if time.monotonic()>deadline:raise HardwareError('stage','PI axis did not come to rest after referencing',link=False)
+            readings.append(self.value('POS?'))
+        return readings[-1]
 
     def query(self,command):
         # Queries are side-effect free, so one transient USB/serial glitch is retried before the link is declared lost.
