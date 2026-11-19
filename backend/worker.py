@@ -30,6 +30,23 @@ from . import response as response_maths
 
 DEVICE_LOG=Path(os.environ.get('KERR_STATE_DIR',Path(__file__).resolve().parents[1]/'data'))/'device-errors.log'
 
+
+def _stage_settings_path():
+    return Path(os.environ.get('KERR_STATE_DIR',Path(__file__).resolve().parents[1]/'data'))/'stage-settings.json'
+
+
+def load_delay_sign():
+    '''Saved delay direction of the real stage: +1 when the delay grows with the stage position, -1 when it shrinks
+    (the stage sits in the other beam). It belongs to the optical layout, so it survives restarts.'''
+    try:return -1 if json.loads(_stage_settings_path().read_text(encoding='utf-8')).get('delay_sign')==-1 else 1
+    except (OSError,ValueError,AttributeError):return 1
+
+
+def save_delay_sign(sign):
+    path=_stage_settings_path();path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=path.with_suffix('.tmp');temporary.write_text(json.dumps(dict(version=1,delay_sign=int(sign))),encoding='utf-8')
+    os.replace(temporary,path)
+
 def log_device_error(device,message,link):
     '''Timestamped record of every device error, so an unstable connection can be told apart from rejected commands.'''
     try:
@@ -99,6 +116,7 @@ class Engine:
     def __init__(self, events, device_factories=None):
         self.events=events;self.lock=RLock();self.seq=0;self.session=uuid.uuid4().hex
         self.devices=DeviceConnections(device_factories);self.zero=150.0;self.zero_version=1
+        self.delay_sign=load_delay_sign();self.mode_signs={'hardware':self.delay_sign}
         self.revision=0;self.busy=None;self.latest=None;self.background=None;self.background_progress=None
         self.calibration=dict(calibration_id=None,source=None,wavelengths_nm=None)
         self.latest_axis=None
@@ -125,6 +143,10 @@ class Engine:
     @property
     def camera(self):return self.devices.camera
 
+    def to_delay(self,position_mm):return mm_to_delay(position_mm,self.zero,self.delay_sign)
+
+    def to_mm(self,delay_ps):return delay_to_mm(delay_ps,self.zero,self.delay_sign)
+
     @property
     def stage(self):return self.devices.stage
 
@@ -145,8 +167,8 @@ class Engine:
                     controller_reported_mm=self.stage.position_mm if connected else None,
                     position_source='simulated_controller' if simulated else getattr(self.stage,'position_source','controller') if connected else 'unavailable',
                     position_sensor=bool(getattr(self.stage,'position_sensor',False)),
-                    delay_ps=mm_to_delay(self.stage.position_mm,self.zero) if connected else None,
-                    zero_mm=self.zero,zero_version=self.zero_version,
+                    delay_ps=self.to_delay(self.stage.position_mm) if connected else None,
+                    zero_mm=self.zero,zero_version=self.zero_version,delay_sign=self.delay_sign,
                     moving=self.preview_moving or self.busy=='move' or bool(self.busy=='scan' and run and run['step']=='moving'))
 
     @staticmethod
@@ -177,7 +199,7 @@ class Engine:
 
     def make_scan_plan(self,request):
         limits=(self.stage.lower,self.stage.upper) if self.devices.mode=='hardware' and self.devices.connected('stage') else (0.,300.)
-        plan=make_plan(request,mm_to_delay(self.stage.position_mm,self.zero),self.zero,revision=self.revision,limits=limits)
+        plan=make_plan(request,self.to_delay(self.stage.position_mm),self.zero,self.delay_sign,revision=self.revision,limits=limits)
         # What the frames would take in memory, and what is free now (the GUI warns before a scan that will not fit).
         frame_size=resources.frame_bytes(readout_shape(self.camera.readout)[1])
         plan['estimated_memory_bytes']=(CACHE_BYTES+2128*frame_size if request.autosave else plan['total_frames']*frame_size)
@@ -308,7 +330,7 @@ class Engine:
             self.emit('stage.position',dict(moving=False,controller_reported_mm=self.stage.position_mm,stopped=True))
             raise
         with self.lock:self.stage.position_mm=target
-        self.emit('stage.position',dict(moving=False,controller_reported_mm=target,delay_ps=mm_to_delay(target,self.zero)))
+        self.emit('stage.position',dict(moving=False,controller_reported_mm=target,delay_ps=self.to_delay(target)))
 
     def run_calibration(self):
         # Runs store the axis of their own binned pixels. A fitted mapping keeps its polynomial, from which the
@@ -529,7 +551,7 @@ class Engine:
         index=0
         while not self.stop.is_set():
             if self.devices.mode=='simulation':self.wait(self.camera.exposure_s,50)
-            counts,saturated=self.acquire_counts(mm_to_delay(self.stage.position_mm,self.zero),101,index,self.camera.exposure_s,self.spectrograph['center_nm'])
+            counts,saturated=self.acquire_counts(self.to_delay(self.stage.position_mm),101,index,self.camera.exposure_s,self.spectrograph['center_nm'])
             with self.lock:
                 self.latest=dict(spectrum=counts,saturated_pixels=saturated,delay_ps=self.stage_state()['delay_ps'],exposure_s=self.camera.exposure_s,source_mode=self.devices.mode)
                 self.latest_axis=self.live_axis();self.latest_version+=1
@@ -548,8 +570,8 @@ class Engine:
         if self.job.is_alive():raise CommandError('Preview did not stop; retry after stopping it')
         try:
             if name=='move':
-                current=mm_to_delay(self.stage.position_mm,self.zero)
-                target=delay_to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'],self.zero)
+                current=self.to_delay(self.stage.position_mm)
+                target=self.to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'])
                 self.stage.duration(target);self.preview_moving=True
                 self.launch('preview',self.preview_move,target)
                 return dict(accepted=True)
@@ -653,7 +675,7 @@ class Engine:
             if old!=data:raise ValueError('request_id was already used with different parameters')
             return result
         self.require_operation(name)
-        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','spectrograph','camera_readout','camera_gain','camera_speed','stage_velocity'} else self._handle(name,data)
+        try:result=self.edit_preview(name,data) if self.busy=='preview' and name in {'configure','move','zero','delay_direction','spectrograph','camera_readout','camera_gain','camera_speed','stage_velocity'} else self._handle(name,data)
         except HardwareError as exc:self.hardware_failure(exc);raise
         if request_id:
             self.commands[key]=(copy.deepcopy(data),result)
@@ -671,8 +693,10 @@ class Engine:
                 self.mode_calibrations[self.devices.mode]=copy.deepcopy(self.calibration)
                 self.mode_responses[self.devices.mode]=copy.deepcopy(self.response)
                 self.mode_zeros[self.devices.mode]=self.zero;self.mode_spectrographs[self.devices.mode]=self.spectrograph.copy()
+                self.mode_signs[self.devices.mode]=self.delay_sign
                 self.devices.switch(mode)
                 self.zero=self.mode_zeros.get(mode,150.0);self.zero_version+=1
+                self.delay_sign=self.mode_signs.get(mode,1)
                 self.spectrograph=self.mode_spectrographs.get(mode,dict(center_nm=600.0,grating=300,slit_um=200.0)).copy()
                 self.calibration_workbench.set_mode(mode)
                 self.response=copy.deepcopy(self.mode_responses.get(mode) or self.calibration_workbench.restore_response(self.spectrograph) or dict(EMPTY_RESPONSE))
@@ -742,9 +766,17 @@ class Engine:
         if name=='stage_reference':
             self.launch('move',self.reference_stage);return dict(accepted=True)
         if name=='move':
-            current=mm_to_delay(self.stage.position_mm,self.zero)
-            target=delay_to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'],self.zero)
+            current=self.to_delay(self.stage.position_mm)
+            target=self.to_mm(current+data['delay_ps'] if data['relative'] else data['delay_ps'])
             self.stage.duration(target);self.launch('move',self.move,target);return dict(accepted=True)
+        if name=='delay_direction':
+            self.idle()
+            sign=-1 if int(data['sign'])<0 else 1
+            if sign!=self.delay_sign:
+                if self.devices.mode=='hardware':save_delay_sign(sign)
+                # t0 stays at the same stage position; every delay on the other side of it changes sign.
+                self.delay_sign=sign;self.zero_version+=1;self.revision+=1
+            return self.status()
         if name=='zero':
             self.idle()
             if self.devices.mode=='hardware':self.stage.position_mm=self.stage.value('POS?')

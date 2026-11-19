@@ -104,6 +104,11 @@ class ReadoutRequest(_StrictModel):
         return value
 
 
+class DirectionRequest(_StrictModel):
+    # +1: the delay grows with the stage position; -1: it shrinks (the stage is in the other beam).
+    sign: Literal[1, -1]
+
+
 class SpeedRequest(_StrictModel):
     # Index into the camera's horizontal readout speeds (capabilities: readout_speeds_mhz).
     index: int = Field(ge=0, le=15)

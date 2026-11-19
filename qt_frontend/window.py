@@ -617,6 +617,15 @@ class MainWindow(QMainWindow):
         reference_layout.addWidget(reference_caption)
         reference_layout.addWidget(self.reference_button)
         motion_layout.addWidget(reference_box, 0, 1)
+        # Which way the delay runs depends on which beam the stage sits in, so it can be reversed. t0 stays where it is.
+        self.direction_toggle = Segmented([('Normal', '1'), ('Reversed', '-1')])
+        self.direction_toggle.setObjectName('delayDirection')
+        self.direction_toggle.setToolTip('Normal: the delay grows as the stage moves to larger positions. Reversed: it shrinks, '
+                                         'for a stage placed in the other beam. t₀ stays at the same stage position; delays and '
+                                         '±ps steps change direction. Saved for the real stage.')
+        self._reg('delayDirection', self.direction_toggle, False)
+        self.direction_toggle.changed.connect(self._apply_direction)
+        motion_layout.addWidget(field('Delay direction', self.direction_toggle), 1, 0, 1, 2)
         motion_layout.setColumnStretch(0, 1)
         motion_layout.setColumnStretch(1, 1)
         self.stage_advanced.add(motion)
@@ -2346,6 +2355,9 @@ class MainWindow(QMainWindow):
                 self.velocity_edit.setText(f"{float(stage['velocity_mm_s']):g}")
             if stage.get('max_velocity_mm_s') is not None:
                 self.velocity_edit.setToolTip(f"Stage velocity (max {float(stage['max_velocity_mm_s']):g} mm/s); press Enter to apply")
+            reversed_delay = stage.get('delay_sign') == -1
+            if stage.get('delay_sign') in (1, -1):
+                self.direction_toggle.set_selected(str(int(stage['delay_sign'])))
             if moving and self._referencing:
                 self.stage_status.setText('● Referencing…')
                 self.stage_status.setStyleSheet('color:'+palette()['warning']+';')
@@ -2361,6 +2373,11 @@ class MainWindow(QMainWindow):
             else:
                 self.stage_status.setText('○ Stage disconnected')
                 self.stage_status.setStyleSheet('color:'+palette()['muted']+';')
+            # A reversed delay is easy to forget once Advanced settings is folded, so the status line says it.
+            if reversed_delay:
+                self.stage_status.setText(self.stage_status.text() + ' · <span style="color:' + palette()['warning'] + '">⇄ delay reversed</span>')
+            self.stage_status.setToolTip('Delay direction reversed: the delay shrinks as the stage moves to larger positions '
+                                         '(Advanced settings › Delay direction)' if reversed_delay else '')
             camera = snapshot.get('camera') or {}
             exposure = camera.get('exposure_s')
             if exposure is not None and not self.exposure_edit.hasFocus():
@@ -4115,6 +4132,22 @@ class MainWindow(QMainWindow):
             self.show_toast('Enter a finite delay')
             return
         self.move_stage(value, relative=False)
+    def _apply_direction(self, value):
+        if self._updating_controls:
+            return
+        stage = (self._snapshot or {}).get('stage') or {}
+        applied = stage.get('delay_sign')
+        if applied is not None and str(int(applied)) == value:
+            return
+        def done(result):
+            self.show_toast('Delay direction reversed · t₀ unchanged, delays now grow toward smaller stage positions' if value == '-1'
+                            else 'Delay direction normal · delays grow toward larger stage positions', 'success')
+            self.controller.request_status()
+        def failed(payload):
+            if applied is not None:
+                self.direction_toggle.set_selected(str(int(applied)))
+            self.show_toast(payload_message(payload), 'error')
+        self.controller.dispatch('delay_direction', {'sign': int(value)}, success=done, failure=failed)
     def set_zero(self):
         self.controller.dispatch('zero', {}, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
     def _exposure_text(self, seconds):
