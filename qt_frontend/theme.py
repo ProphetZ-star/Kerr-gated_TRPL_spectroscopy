@@ -108,7 +108,7 @@ QPushButton#summary{font-size:13px;border:0;border-radius:4px;min-height:32px;ba
 Segmented{background:%(track)s;border:0;border-radius:5px;}
 Segmented QPushButton{font-size:13px;min-height:23px;max-height:25px;padding:0 8px;border:0;border-radius:4px;background:transparent;color:%(muted)s;}
 Segmented QPushButton:hover,Segmented QPushButton:pressed{background:transparent;color:%(text)s;}
-Segmented QPushButton[selected=true],Segmented QPushButton[selected=true]:hover{background:%(chip)s;color:%(chip_text)s;font-weight:600;}
+Segmented QPushButton[selected=true],Segmented QPushButton[selected=true]:hover{background:%(chip)s;color:%(chip_text)s;}
 Segmented QPushButton:disabled{background:transparent;color:%(border_hover)s;}
 QWidget#panelHead QPushButton{font-size:13px;min-height:27px;max-height:27px;padding:0 8px;}
 QWidget#panelHead Segmented QPushButton{min-height:23px;max-height:23px;padding:0 8px;}
