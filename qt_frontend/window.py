@@ -952,11 +952,14 @@ class MainWindow(QMainWindow):
         # Spectra per delay position: taken back to back at each delay before the stage moves on.
         frames_wrap = QWidget(); frames_layout = QHBoxLayout(frames_wrap)
         frames_layout.setContentsMargins(0, 6, 0, 0); frames_layout.setSpacing(10)
-        frames_label = QLabel('Frames / point'); frames_label.setProperty('muted', True)
+        frames_label = QLabel('Exposures per delay'); frames_label.setProperty('muted', True)
         frames_layout.addWidget(frames_label); frames_layout.addStretch(1)
         self.frames_input = int_spin(1, 1, 1_000_000, 1)
         self.frames_input.setObjectName('framesPerPoint'); self.frames_input.setFixedSize(96, 30)
-        self.frames_input.setToolTip('Spectra taken one after another at each delay position; they are stored as separate frames and averaged in the decay')
+        frames_label.setToolTip('Spectra recorded one after another at each delay before the stage moves on')
+        self.frames_input.setToolTip('Spectra recorded one after another at each delay before the stage moves on, each with its '
+                                     'own exposure and readout. They are saved as separate frames and averaged in the decay. '
+                                     'Repeat count is different: it runs the whole scan again.')
         self.frames_input.valueChanged.connect(lambda value: self._update_point_estimate())
         self._reg('framesPerPoint', self.frames_input, False)
         frames_layout.addWidget(self.frames_input)
@@ -983,7 +986,7 @@ class MainWindow(QMainWindow):
         repeat_layout.addWidget(self.repeats_input)
         self.repeat_wrap.hide()
         layout.addWidget(self.scan_params)
-        # Frames / point applies to every mode (Single too), so it sits outside the scan segments; Repeat count below it.
+        # Exposures per delay applies to every mode (Single too), so it sits outside the scan segments; Repeat count below it.
         layout.addWidget(frames_wrap)
         layout.addWidget(self.repeat_wrap)
         self.validation = QLabel('')
@@ -2572,11 +2575,16 @@ class MainWindow(QMainWindow):
                 self.progress_text.setText('Live preview')
             elif busy == 'calibration':
                 self.progress_text.setText('Calibration acquisition')
+            elif busy == 'move':
+                self.progress_text.setText('Referencing delay stage' if self._referencing else 'Moving delay stage')
             elif busy:
                 self.progress_text.setText(str(busy).capitalize())
             else:
                 self.progress_text.setText('Ready to start') if not getattr(self,'_plan_display_key',None) else None
-            if online:
+            if busy == 'move':
+                # A manual move has no scan time; the next scan's estimate returns when the stage stops.
+                self.remaining.setText('')
+            elif online:
                 self._update_point_estimate()
             else:
                 self.remaining.setText('111 points')
@@ -2697,6 +2705,8 @@ class MainWindow(QMainWindow):
                     values.append(round(start + index * step, 9))
             unique = len(set(values))
             repeats = self._repeat_count()
+            if (self._snapshot or {}).get('busy') == 'move':
+                return  # the bar shows the move, not the next scan
             self.remaining.setText(f'{unique} points / round' if repeats == 0 else f'{unique * repeats} points')
             if hasattr(self,'save_path') and self.controller.online:
                 request=self.collect_run_request();identity=dict(request);identity.pop('request_id',None)
@@ -2735,9 +2745,38 @@ class MainWindow(QMainWindow):
         # Points done in the round shown (a point counts once all its frames are in).
         in_round = max(0, min(points, completed - max(0, shown - 1) * points))
         self.progress_text.setText(f'{label} · {in_round} / {points} points')
-        self.remaining.setText(str(run.get('step') if busy == 'scan' else status))
+        step = str(run.get('step') if busy == 'scan' else status)
+        left = self._scan_time_left(run, plan, busy, status, points, rounds, until, completed, in_round)
+        self.remaining.setText(step if left is None else f'{step} · {format_duration(left)} left' + (' in round' if until else ''))
+    def _scan_time_left(self, run, plan, busy, status, points, rounds, until, completed, in_round):
+        '''Seconds left in the scan (or in the round, for a scan repeated until stopped), or None when not running.
+        Before the first point it is the plan's estimate; then the measured time per point, paused time excluded.'''
+        now = time.monotonic(); run_id = run.get('run_id')
+        timing = getattr(self, '_scan_timing', None)
+        if timing is None or timing['run'] != run_id:
+            timing = self._scan_timing = dict(run=run_id, active=0.0, last=now, first_done=completed)
+        running = busy == 'scan' and status not in ('paused', 'stopping', 'finalizing')
+        if running:
+            timing['active'] += now - timing['last']
+        timing['last'] = now
+        if not running and status != 'paused':
+            return None
+        left_points = max(0, points - in_round) if until else max(0, points * rounds - completed)
+        measured = completed - timing['first_done']
+        if measured >= 1 and timing['active'] > 0:
+            per_point = timing['active'] / measured
+        else:
+            total = plan.get('round_seconds') if until else plan.get('estimated_seconds')
+            if not total:
+                return None
+            per_point = float(total) / max(1, points if until else points * rounds)
+            if (self._snapshot or {}).get('source_mode') == 'simulation':
+                per_point /= float((run.get('request') or {}).get('speedup') or 1)  # the plan is in real seconds
+        return left_points * per_point
     def _show_plan(self, plan, request):
         '''The idle progress bar: what the next scan will do.'''
+        if (self._snapshot or {}).get('busy') == 'move':
+            return
         points = len(plan['delays_ps'])
         if plan.get('until_stopped'):
             self.progress_text.setText(f'{points} points / round · repeats until stopped')

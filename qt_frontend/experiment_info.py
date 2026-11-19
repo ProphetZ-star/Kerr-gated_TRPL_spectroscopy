@@ -149,7 +149,7 @@ def sections(run, quality=None):
         ('Segments', segments_text(request.get('segments')) if request.get('mode') != 'single' else (f'{float(delays[0]):g} ps' if delays else None)),
         ('Delay points', str(len(delays)) if delays else None),
         ('Rounds', rounds),
-        ('Frames per point', None if request.get('frames_per_point') is None else str(request['frames_per_point'])),
+        ('Exposures per delay', None if request.get('frames_per_point') is None else str(request['frames_per_point'])),
         ('Frames recorded', frames),
         ('Exposure', exposure),
         ('Settle time', number(request.get('settle_s'), 's')),
