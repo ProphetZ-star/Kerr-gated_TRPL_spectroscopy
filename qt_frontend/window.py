@@ -2410,6 +2410,10 @@ class MainWindow(QMainWindow):
             if stage.get('max_velocity_mm_s') is not None:
                 self.velocity_edit.setToolTip(f"Stage velocity (max {float(stage['max_velocity_mm_s']):g} mm/s); press Enter to apply")
             reversed_delay = stage.get('delay_sign') == -1
+            if stage.get('zero_mm') is not None:
+                where = f"t₀ is at {float(stage['zero_mm']):.6f} mm (saved for the next session)"
+                self.zero_button.setToolTip('Make the current stage position the new t₀ · ' + where)
+                self.return_zero.setToolTip('Move the stage to t₀ · ' + where)
             if stage.get('delay_sign') in (1, -1):
                 self.direction_toggle.set_selected(str(int(stage['delay_sign'])))
             if moving and self._referencing:
@@ -4243,7 +4247,27 @@ class MainWindow(QMainWindow):
             self.show_toast(payload_message(payload), 'error')
         self.controller.dispatch('delay_direction', {'sign': int(value)}, success=done, failure=failed)
     def set_zero(self):
-        self.controller.dispatch('zero', {}, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
+        '''Make the current stage position t0. It sits next to Go to t0 and replaces a calibrated t0 at once, so a
+        position away from the present t0 is confirmed first (Cancel is the default).'''
+        stage = (self._snapshot or {}).get('stage') or {}
+        delay, zero = stage.get('delay_ps'), stage.get('zero_mm')
+        shift = float(delay) if delay is not None else None
+        if shift is not None and zero is not None and abs(shift) >= 0.0005:
+            box = QMessageBox(QMessageBox.Icon.Question, 'Set t₀ here?', 'Make the current stage position the new time zero?', QMessageBox.StandardButton.NoButton, self)
+            box.setInformativeText(f'The present t₀ is at {float(zero):.6f} mm. This position is {shift:+.3f} ps from it, so every delay '
+                                   f'will shift by {-shift:+.3f} ps.\n\nTo go back to the present t₀ instead, use Go to t₀.')
+            confirm = box.addButton('Set t₀ here', QMessageBox.ButtonRole.AcceptRole)
+            cancel = box.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(cancel); box.setEscapeButton(cancel)
+            box.exec()
+            if box.clickedButton() is not confirm:
+                return
+        def done(result):
+            new_zero = ((result or {}).get('stage') or {}).get('zero_mm')
+            if new_zero is not None:
+                self.show_toast(f't₀ set at {float(new_zero):.6f} mm' + (f' · delays shifted by {-shift:+.3f} ps' if shift else ''), 'success')
+            self.controller.request_status()
+        self.controller.dispatch('zero', {}, success=done, failure=lambda payload: self.show_toast(payload_message(payload)))
     def _exposure_text(self, seconds):
         return f'{seconds * 1000:.6g}' if self._exposure_unit == 'ms' else f'{seconds:.6g}'
     def _exposure_seconds(self):

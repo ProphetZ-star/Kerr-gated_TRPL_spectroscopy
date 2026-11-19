@@ -264,6 +264,10 @@ class Engine:
         self.devices.require(*needed)
         if name in ('move','run') and not getattr(self.stage,'referenced',True):
             raise CommandError('Reference the delay stage before moving it')
+        # Before referencing, the stage's step counter is not its real position: a t0 set then would replace the saved one
+        # with a meaningless value.
+        if name=='zero' and not getattr(self.stage,'referenced',True):
+            raise CommandError('Reference the delay stage before setting t0')
 
     def acquire_counts(self,delay,seed,index,exposure,center,fault='none',**options):
         if self.devices.mode=='simulation':return self.camera.acquire(delay,seed,index,exposure,center,fault,**options)
