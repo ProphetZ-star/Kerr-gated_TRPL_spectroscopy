@@ -39,7 +39,8 @@ def prescan_issues(snapshot, request, plan=None):
     state = camera.get('temperature_state')
     now = '' if temperature is None else f' (now {temperature:.1f} °C' + ('' if target is None else f', target {target:g} °C') + ')'
     if camera.get('cooler_on') is False:
-        issues.append(('temperature', 'CCD cooling is off', f'The chip runs warm{now}, so its dark current is higher than with the cooler on.'))
+        warm = '' if temperature is None else f' (now {temperature:.1f} °C)'  # no target: the cooler is off
+        issues.append(('temperature', 'CCD cooling is off', f'The chip runs warm{warm}, so its dark current is higher than with the cooler on.'))
     elif state in UNSETTLED:
         issues.append(('temperature', 'CCD temperature not stable',
                        f'The chip is {UNSETTLED[state]}{now}. Frames taken before it settles are marked as unstable; Analysis can leave them out.'))

@@ -162,7 +162,8 @@ def sections(run, quality=None):
         readout += f'\ncolumns {roi[0]}–{roi[1]}, H bin {acquisition.get("hbin")}; {rows}'
     cooling = None
     if camera.get('cooler_on') is not None:
-        cooling = ('On' if camera['cooler_on'] else 'Off') + (f" · target {float(camera['target_temperature_c']):g} °C" if _finite(camera.get('target_temperature_c')) is not None else '')
+        # A target is reported only for a cooler that was on; with it off there was no target.
+        cooling = 'Off' if not camera['cooler_on'] else 'On' + (f" · target {float(camera['target_temperature_c']):g} °C" if _finite(camera.get('target_temperature_c')) is not None else '')
     out.append(('CCD camera', [
         ('Model', camera.get('model')),
         ('Serial number', camera.get('serial_number')),
