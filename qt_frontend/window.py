@@ -775,9 +775,8 @@ class MainWindow(QMainWindow):
         self._reg('coolingTarget', self.cooling_target, False)
         self.cooling_target.editingFinished.connect(self._apply_cooling)
         layout.addWidget(field('Cooler', self.cooler_toggle), 1, 0)
-        # The target only matters while cooling: shown with the cooler on, kept (and used) when it is switched on again.
+        # Shown with the cooler off too, so the target can be set before switching it on.
         self.cooling_target_field = field('Target', self.cooling_target, '°C')
-        self.cooling_target_field.setVisible(False)
         layout.addWidget(self.cooling_target_field, 1, 1)
         self.cooling_status = QLabel('Temperature —')
         self.cooling_status.setObjectName('coolingStatus')
@@ -4365,7 +4364,6 @@ class MainWindow(QMainWindow):
             self.speed_toggle.set_selected(str(int(camera['readout_speed_index'])))
         if camera.get('cooler_on') is not None:
             self.cooler_toggle.set_selected('on' if camera.get('cooler_on') else 'off')
-        self.cooling_target_field.setVisible(bool(camera.get('cooler_on')))
         if camera.get('target_temperature_c') is not None and not self.cooling_target.hasFocus():
             self.cooling_target.setText(f"{float(camera['target_temperature_c']):g}")
         temperature = camera.get('temperature_c')
@@ -4466,12 +4464,15 @@ class MainWindow(QMainWindow):
         camera = (self._snapshot or {}).get('camera') or {}
         if camera.get('cooler_on') == enabled and camera.get('target_temperature_c') is not None and float(camera['target_temperature_c']) == round(target):
             return
+        # Editing only the target while the cooler stays off changes nothing yet, so it needs no toast.
+        target_only = not enabled and camera.get('cooler_on') is False
         def done(result):
             low, high = result.get('range_c') or (None, None)
-            if not result.get('enabled'):
-                self.show_toast('Cooler off', 'success')
-            elif result.get('clamped'):
+            if result.get('clamped'):
                 self.show_toast(f"{float(result['requested_c']):g} °C is outside the CCD range {low}…{high} °C — target set to {result['target_c']} °C", 'warning')
+            elif not result.get('enabled'):
+                if not target_only:
+                    self.show_toast('Cooler off', 'success')
             else:
                 self.show_toast(f"Cooler on · target {result['target_c']} °C", 'success')
             self.controller.request_status()

@@ -160,10 +160,15 @@ def sections(run, quality=None):
         height = roi[3] - roi[2] + 1; vbin = acquisition.get('vbin')
         rows = f'rows {roi[2]}–{roi[3]} ' + ('summed' if vbin in (None, height) else f'binned by {vbin}')
         readout += f'\ncolumns {roi[0]}–{roi[1]}, H bin {acquisition.get("hbin")}; {rows}'
+    # The CCD temperature over the recorded frames (one value when it held within 0.005 °C).
+    t_low, t_high = quality.get('temperature_min'), quality.get('temperature_max')
+    temperature = None
+    if t_low is not None:
+        temperature = f'{t_low:.2f} °C' if abs(t_high - t_low) < 5e-3 else f'{t_low:.2f} to {t_high:.2f} °C'
     cooling = None
     if camera.get('cooler_on') is not None:
-        # A target is reported only for a cooler that was on; with it off there was no target.
-        cooling = 'Off' if not camera['cooler_on'] else 'On' + (f" · target {float(camera['target_temperature_c']):g} °C" if _finite(camera.get('target_temperature_c')) is not None else '')
+        # The temperature the CCD had, not the target it was set to.
+        cooling = ('On' if camera['cooler_on'] else 'Off') + (f' · {temperature}' if temperature else '')
     out.append(('CCD camera', [
         ('Model', camera.get('model')),
         ('Serial number', camera.get('serial_number')),
@@ -229,10 +234,6 @@ def sections(run, quality=None):
         ('Acquired', local_time(background.get('acquired_utc'))),
         ('CCD temperature', number(background.get('temperature_c'), '°C', 4)),
     ] if present else [])))
-    t_low, t_high = quality.get('temperature_min'), quality.get('temperature_max')
-    temperature = None
-    if t_low is not None:
-        temperature = f'{t_low:.2f} °C' if abs(t_high - t_low) < 5e-3 else f'{t_low:.2f} to {t_high:.2f} °C'
     unstable = quality.get('unstable_frames')
     error = quality.get('position_error_max_mm')
     out.append(('Recorded frames', [
