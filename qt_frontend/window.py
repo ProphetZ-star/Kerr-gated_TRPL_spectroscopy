@@ -2520,7 +2520,9 @@ class MainWindow(QMainWindow):
             self._updating_controls = False
     def _calibration_signature(self, snapshot):
         try:
-            return (snapshot.get('worker_session_id'), snapshot.get('device_generation'), snapshot.get('source_mode'), json.dumps(snapshot.get('spectrograph') or {}, sort_keys=True))
+            # The slit width does not move wavelengths on the CCD, so a slit change keeps the captured frame and lines.
+            optics = {k: v for k, v in (snapshot.get('spectrograph') or {}).items() if k != 'slit_um'}
+            return (snapshot.get('worker_session_id'), snapshot.get('device_generation'), snapshot.get('source_mode'), json.dumps(optics, sort_keys=True))
         except Exception:
             return (snapshot.get('worker_session_id'), snapshot.get('device_generation'), snapshot.get('source_mode'))
     def _update_header(self, snapshot):

@@ -899,7 +899,14 @@ class Engine:
             self.idle()
             if data!=self.spectrograph:
                 if self.devices.mode=='hardware':self.devices.check_spectrometer_update(self.spectrograph,data)
-                self.clear_wavelength_calibration()  # Invalidate before any physical setting can change.
+                # The slit width changes resolution and throughput, not where wavelengths fall on the CCD: a slit-only
+                # change keeps the wavelength calibration but drops what carries the old throughput (background below,
+                # measured response further down).
+                slit_only={k for k in data if data[k]!=self.spectrograph.get(k)}<={'slit_um'}
+                if slit_only:
+                    self.background=None;self.revision+=1
+                else:
+                    self.clear_wavelength_calibration()  # Invalidate before any physical setting can change.
                 if self.devices.mode=='hardware':
                     try:applied=self.devices.configure_spectrometer(self.spectrograph,data)
                     except Exception as exc:raise HardwareError('spectrometer',str(exc)) from exc
