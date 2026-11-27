@@ -28,7 +28,7 @@ from .guards import confirm_calibration_loss
 from . import correction
 from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
-from backend.line_matching import match_lines
+from backend.line_matching import match_lines, locate_centre
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 # Window settings kept between sessions (instrument settings are kept by the worker in instrument-settings.json).
@@ -5107,14 +5107,34 @@ class MainWindow(QMainWindow):
             return 0
         strength = getattr(self, '_cal_peak_strength', {}) or {}
         width = int(((self._cal_frame or {}).get('shape') or [1, 1024])[-1])
+        # A saved calibration with this grating tells roughly the dispersion and which way wavelength runs.
+        hint = self._snapshot.get('dispersion_hint')
+        hint = float(hint) if isinstance(hint, (int, float)) and math.isfinite(hint) and hint else None
+        wavelengths = [float(line['wavelength_nm']) for line in free_lines]
+        strengths = [strength.get(peak, 1.0) for peak in free_peaks]
         try:
-            match = match_lines(free_peaks, [float(line['wavelength_nm']) for line in free_lines], float(centre),
-                                [strength.get(peak, 1.0) for peak in free_peaks], fixed=fixed, width=width)
+            match = match_lines(free_peaks, wavelengths, float(centre), strengths, fixed=fixed, width=width, dispersion_hint=hint)
         except Exception as error:  # a pairing failure must not break Find peaks
             match = {'pairs': [], 'reason': f'pairing failed ({error})'}
         if match.get('ambiguous'):
             # Two different pairings fit about equally well: fill in neither rather than a possibly wrong one.
             match = dict(match, pairs=[], reason='ambiguous')
+        if not match.get('pairs') and not fixed:
+            # Nothing pairs near the set centre: on a manual spectrometer the dial may have been turned without the
+            # setting in the software. Where do the lines put the centre?
+            try:
+                located = locate_centre(free_peaks, wavelengths, float(centre), strengths, width=width, dispersion_hint=hint)
+            except Exception:
+                located = None
+            if located is not None and abs(located - float(centre)) > 10:
+                match = dict(match, located_nm=located, set_nm=float(centre))
+            elif hint is not None:
+                # Or the reference list hardly covers the range this frame should show.
+                half = abs(hint) * width / 2
+                low, high = float(centre) - half, float(centre) + half
+                covered = sum(1 for value in wavelengths if low <= value <= high)
+                if covered < 5:
+                    match = dict(match, coverage=(covered, low, high))
         self._cal_match = match
         by_wavelength = {round(float(line['wavelength_nm']), 6): line for line in free_lines}
         for pixel, wavelength in match.get('pairs') or []:
@@ -5137,6 +5157,13 @@ class MainWindow(QMainWindow):
         if not match:
             return ''
         if not match.get('pairs'):
+            if match.get('coverage') is not None:
+                covered, low, high = match['coverage']
+                return (f' · the reference list has only {covered} line(s) in the ≈{low:.0f}–{high:.0f} nm this frame should show: '
+                        'import reference wavelengths for this range, or type the pixel of lines you recognise')
+            if match.get('located_nm') is not None:
+                return (f" · the lines fit a centre wavelength near {match['located_nm']:.0f} nm, not the {match['set_nm']:g} nm set in "
+                        "the software: set Center wavelength to the spectrometer's setting and acquire the frame again")
             why = ('several pairings fit about equally well' if match.get('reason') == 'ambiguous'
                    else 'the peaks could not be paired with the reference lines automatically')
             return f' · {why}: check the centre wavelength, or type the pixel of one or two lines you recognise and Find peaks again'

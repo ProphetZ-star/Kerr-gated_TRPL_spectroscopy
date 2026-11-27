@@ -379,6 +379,7 @@ class Engine:
                        _sync=dict(full=full,token=token,latest_version=self.latest_version))
             if full:
                 state.update(calibration=serial(self.calibration),spectrograph=self.spectrograph.copy(),calibration_warning=self.calibration_workbench.warning,
+                             dispersion_hint=self.calibration_workbench.dispersion_hint(self.spectrograph),
                              live_axis=serial(self.latest_axis),background=serial(self.background),
                              response=serial(self.response),response_candidate=serial(self.response_candidate))
                 if run:
@@ -395,6 +396,7 @@ class Engine:
                         camera=self.camera.capabilities()|dict(exposure_s=self.camera.exposure_s),
                         calibration=copy.deepcopy(self.calibration),spectrograph=self.spectrograph.copy(),
                         calibration_warning=self.calibration_workbench.warning,
+                        dispersion_hint=self.calibration_workbench.dispersion_hint(self.spectrograph),
                         latest=serial(self.latest),live_axis=self.latest_axis,background=serial(self.background),
                         run=self.public_run(self.runs[self.current]) if self.current else None)
 

@@ -21,6 +21,8 @@ DISPERSION_NM_PER_PX = (0.03, 1.5)
 ANCHOR_PEAKS = 10              # strongest peaks used to form guesses
 REFINE_CANDIDATES = 24
 MIN_PAIRS = 3
+HINT_RANGE = 0.25              # dispersion within +-25 % of an earlier calibration's (it varies with the centre wavelength)
+WIDE_SLACK_NM = 600.0          # search width when looking for where the spectrometer really is
 
 
 def _nearest(lines: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -59,11 +61,15 @@ def _assign(coefficients, peaks, weights, lines, tolerance):
     return pairs
 
 
-def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: int = 1024) -> dict:
+def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: int = 1024, dispersion_hint=None,
+                centre_slack: float = CENTRE_SLACK_NM) -> dict:
     '''Pair peak pixels with reference wavelengths.
 
     peaks: pixels of the found peaks (not counting the pixels of `fixed`); strengths: their prominences (optional).
     wavelengths: reference lines still free to pair. fixed: (pixel, wavelength) pairs typed or picked by hand.
+    dispersion_hint: nm per pixel (signed) of an earlier calibration with this grating: the dispersion is then looked
+    for within HINT_RANGE of it, in the same direction (far fewer chance pairings). centre_slack: how far the chip
+    centre may be from centre_nm.
     Returns dict(pairs=[(pixel, wavelength)], coefficients, dispersion_nm_per_px, chip_nm=(at pixel 0, at last pixel),
     rms_nm, ambiguous, reason). pairs is empty when no convincing pairing exists (reason says why).'''
     peaks = np.asarray(list(peaks), float)
@@ -78,6 +84,10 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
     weights = 1.0 + np.log10(1.0 + strengths / np.median(strengths)) / 2.0
     fixed_px = np.array([p for p, _ in fixed]); fixed_nm = np.array([w for _, w in fixed])
     low, high = DISPERSION_NM_PER_PX
+    sign = 0.0
+    if dispersion_hint is not None and math.isfinite(dispersion_hint) and dispersion_hint != 0:
+        low, high = abs(dispersion_hint) * (1 - HINT_RANGE), abs(dispersion_hint) * (1 + HINT_RANGE)
+        sign = math.copysign(1.0, dispersion_hint)
 
     # 1. Linear guesses from two anchor peaks and two lines (or from the hand-typed pairs).
     if len(fixed) >= 2:
@@ -97,7 +107,7 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
             span1 = peaks - fixed_px[0]; span1 = span1[np.abs(span1) >= 3]
             b1 = (lines[None, :] - fixed_nm[0]) / span1[:, None]
             b = np.concatenate([b, b1.ravel()]); c = np.concatenate([c, (fixed_nm[0] - b1 * (fixed_px[0] - ORIGIN)).ravel()])
-        ok = (np.abs(b) >= low) & (np.abs(b) <= high) & (np.abs(c - centre_nm) <= CENTRE_SLACK_NM)
+        ok = (np.abs(b) >= low) & (np.abs(b) <= high) & (np.abs(c - centre_nm) <= centre_slack) & (b * sign >= 0)
         guesses = np.unique(np.round(np.stack([b[ok], c[ok]], axis=1), 6), axis=0)
     if not len(guesses):
         return empty | dict(reason='no pairing fits the centre wavelength')
@@ -144,9 +154,11 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
         rms = float(np.sqrt(np.mean(residual ** 2)))
         ends = _model(coefficients, [0, width - 1])
         derivative = np.polyval(np.polyder(coefficients), np.linspace(-1, 1, 64)) / ORIGIN
-        if abs(np.mean(ends) - centre_nm) > CENTRE_SLACK_NM * 1.5 or not (np.all(derivative > 0) or np.all(derivative < 0)):
+        if abs(np.mean(ends) - centre_nm) > centre_slack * 1.5 or not (np.all(derivative > 0) or np.all(derivative < 0)):
             continue
         if fixed and np.any(np.abs(fixed_nm - _model(coefficients, fixed_px)) > 1.5 * abs(b)):
+            continue
+        if sign and (b * sign < 0 or not low * 0.9 <= abs(b) <= high * 1.1):
             continue
         # Explain more peaks, closely; less what chance gives: a peak lands within 1 px of some line with probability
         # 2 x (lines per pixel), which grows with the dispersion (a coarse grating packs more lines onto the chip).
@@ -170,3 +182,15 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
     pairs = sorted((float(peaks[k]), float(lines[l])) for k, l in best['pairs'].items())
     return dict(pairs=pairs, coefficients=[float(v) for v in best['coefficients']], dispersion_nm_per_px=float(best['b']),
                 chip_nm=(float(best['ends'][0]), float(best['ends'][1])), rms_nm=best['rms'], ambiguous=ambiguous, reason='')
+
+
+def locate_centre(peaks, wavelengths, centre_nm, strengths=None, width: int = 1024, dispersion_hint=None):
+    '''Where the lines say the chip centre is, searched far from centre_nm (only with a dispersion hint: without one a
+    wide search pairs too much by chance). Returns the chip-centre wavelength of a confident pairing, or None.'''
+    if dispersion_hint is None:
+        return None
+    match = match_lines(peaks, wavelengths, centre_nm, strengths, width=width, dispersion_hint=dispersion_hint,
+                        centre_slack=WIDE_SLACK_NM)
+    if not match['pairs'] or match['ambiguous'] or len(match['pairs']) < 5:
+        return None
+    return float(np.mean(match['chip_nm']))

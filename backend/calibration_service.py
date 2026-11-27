@@ -67,6 +67,32 @@ class CalibrationWorkbench:
             temporary = self.library_path.with_suffix('.tmp')
             temporary.write_text(json.dumps(dict(version=1, entries=entries), ensure_ascii=False, allow_nan=False), encoding='utf-8')
             os.replace(temporary, self.library_path)
+            self._hint_cache = None
+
+    def dispersion_hint(self, spectrograph):
+        '''nm per pixel (signed, at the chip centre) of the saved calibration for this spectrometer and grating whose
+        centre wavelength is closest to this one; None when there is none. Line pairing uses it to know roughly the
+        dispersion and its direction. Cached until the saved calibrations change.'''
+        key = (self.library_path, self.instrument.get('driver'), self.instrument.get('model'), int(spectrograph['grating']), float(spectrograph['center_nm']))
+        cache = getattr(self, '_hint_cache', None)
+        if cache and cache[0] == key:
+            return cache[1]
+        best = None
+        for entry in self._read_library().values():
+            try:
+                if entry.get('instrument') != self.instrument or int(entry['grating']) != int(spectrograph['grating']):
+                    continue
+                axis = entry['calibration']['wavelengths_nm']
+                middle = len(axis) // 2
+                slope = (float(axis[middle + 10]) - float(axis[middle - 10])) / 20.0
+                distance = abs(float(entry['center_nm']) - float(spectrograph['center_nm']))
+                if slope and (best is None or distance < best[0]):
+                    best = (distance, slope)
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        hint = None if best is None else best[1]
+        self._hint_cache = (key, hint)
+        return hint
 
     def recall(self, spectrograph):
         '''The calibration saved for this spectrometer, centre wavelength and grating, with when it was installed; or None.'''
