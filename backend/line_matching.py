@@ -118,6 +118,11 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
     tolerance = 3.0 * np.abs(guesses[:, 0:1])
     near = distance.reshape(predicted.shape) / tolerance
     score = np.sum(np.where(near < 1, weights[None, :] * (1 - near ** 2), 0.0), axis=1)
+    # Less what chance gives: a coarse dispersion puts many lines on the chip, and a random peak then lands within
+    # 3 px of one with probability ~6 x lines-per-pixel (each such hit scoring 2/3 on average).
+    half = np.abs(guesses[:, 0]) * width / 2
+    on_chip = np.searchsorted(lines, guesses[:, 1] + half) - np.searchsorted(lines, guesses[:, 1] - half)
+    score -= np.minimum(1.0, 4.0 * on_chip / width) * weights.sum()
     if len(fixed):
         fixed_miss = np.abs(guesses[:, 1:2] + guesses[:, 0:1] * (fixed_px[None, :] - ORIGIN) - fixed_nm[None, :]) / tolerance
         score += np.sum(np.where(fixed_miss < 1, 3.0 * (1 - fixed_miss ** 2), -5.0), axis=1)
