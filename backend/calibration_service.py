@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import numpy as np
 import os
 import tempfile
 import uuid
@@ -70,29 +71,41 @@ class CalibrationWorkbench:
             self._hint_cache = None
 
     def dispersion_hint(self, spectrograph):
-        '''nm per pixel (signed, at the chip centre) of the saved calibration for this spectrometer and grating whose
-        centre wavelength is closest to this one; None when there is none. Line pairing uses it to know roughly the
-        dispersion and its direction. Cached until the saved calibrations change.'''
+        """What the saved calibrations for this spectrometer and grating say about the pixel -> wavelength shape at this
+        centre wavelength: dict(dispersion_nm_per_px (signed, at the chip centre), curvature_nm (x^2 coefficient, x =
+        (pixel - 511.5) / 511.5), range (relative search range for the dispersion), calibrations), or None.
+        One saved calibration: its own values, dispersion within +-25 %. Two or more at different centre wavelengths:
+        the dispersion interpolated (or extrapolated) linearly in centre wavelength, within +-6 %; the curvature is
+        the median. Line pairing uses this. Cached until the saved calibrations change."""
         key = (self.library_path, self.instrument.get('driver'), self.instrument.get('model'), int(spectrograph['grating']), float(spectrograph['center_nm']))
         cache = getattr(self, '_hint_cache', None)
         if cache and cache[0] == key:
-            return cache[1]
-        best = None
+            return deepcopy(cache[1])
+        shapes = []
         for entry in self._read_library().values():
             try:
                 if entry.get('instrument') != self.instrument or int(entry['grating']) != int(spectrograph['grating']):
                     continue
-                axis = entry['calibration']['wavelengths_nm']
-                middle = len(axis) // 2
-                slope = (float(axis[middle + 10]) - float(axis[middle - 10])) / 20.0
-                distance = abs(float(entry['center_nm']) - float(spectrograph['center_nm']))
-                if slope and (best is None or distance < best[0]):
-                    best = (distance, slope)
+                axis = np.asarray(entry['calibration']['wavelengths_nm'], float)
+                x = (np.arange(len(axis)) - (len(axis) - 1) / 2) / ((len(axis) - 1) / 2)
+                q, s, _ = np.polyfit(x, axis, 2)
+                if np.isfinite(q) and np.isfinite(s) and s:
+                    shapes.append((float(entry['center_nm']), float(s) / ((len(axis) - 1) / 2), float(q)))
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
-        hint = None if best is None else best[1]
+        hint = None
+        if shapes:
+            centre = float(spectrograph['center_nm'])
+            centres = sorted({c for c, _, _ in shapes})
+            if len(centres) >= 2:
+                a, b = np.polyfit([c for c, _, _ in shapes], [d for _, d, _ in shapes], 1)
+                dispersion, spread = float(a * centre + b), 0.06
+            else:
+                dispersion, spread = shapes[0][1], 0.25
+            hint = dict(dispersion_nm_per_px=dispersion, curvature_nm=float(np.median([q for _, _, q in shapes])), range=spread,
+                        calibrations=len(shapes))
         self._hint_cache = (key, hint)
-        return hint
+        return deepcopy(hint)
 
     def recall(self, spectrograph):
         '''The calibration saved for this spectrometer, centre wavelength and grating, with when it was installed; or None.'''

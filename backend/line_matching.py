@@ -21,6 +21,9 @@ DISPERSION_NM_PER_PX = (0.03, 1.5)
 ANCHOR_PEAKS = 10              # strongest peaks used to form guesses
 REFINE_CANDIDATES = 24
 MIN_PAIRS = 3
+LINE_SIGMA_NM = 0.05           # how well a paired line sits on the fit
+CURVATURE_SIGMA_NM = 0.5       # how far the curvature may stray from earlier calibrations'
+EXTEND_PX = 6.0                # how far a strong unpaired peak may be from a line to try pairing it
 HINT_RANGE = 0.25              # dispersion within +-25 % of an earlier calibration's (it varies with the centre wavelength)
 WIDE_SLACK_NM = 600.0          # search width when looking for where the spectrometer really is
 
@@ -37,9 +40,17 @@ def _model(coefficients: np.ndarray, pixels) -> np.ndarray:
     return np.polyval(coefficients, (np.asarray(pixels, float) - ORIGIN) / ORIGIN)
 
 
-def _fit(pixels, wavelengths, degree):
+def _fit(pixels, wavelengths, degree, curvature=None):
+    '''Polynomial in x = (pixel - ORIGIN) / ORIGIN. With an expected curvature (the x^2 coefficient of earlier
+    calibrations) a quadratic is fitted with the curvature pulled towards it (it varies by ~+-0.5 nm between centre
+    wavelengths): a few lines, often all at one end of the chip, then still give a sensible shape across it.'''
     x = (np.asarray(pixels, float) - ORIGIN) / ORIGIN
-    return np.polyfit(x, np.asarray(wavelengths, float), degree)
+    y = np.asarray(wavelengths, float)
+    if curvature is not None:
+        rows = np.vstack([np.column_stack([x ** 2, x, np.ones_like(x)]) / LINE_SIGMA_NM, [[1.0 / CURVATURE_SIGMA_NM, 0, 0]]])
+        rhs = np.concatenate([y / LINE_SIGMA_NM, [curvature / CURVATURE_SIGMA_NM]])
+        return np.linalg.lstsq(rows, rhs, rcond=None)[0]
+    return np.polyfit(x, y, degree)
 
 
 def _degree(count: int) -> int:
@@ -61,15 +72,53 @@ def _assign(coefficients, peaks, weights, lines, tolerance):
     return pairs
 
 
+def _extend(coefficients, pairs, peaks, weights, lines, fixed_px, fixed_nm, qc):
+    '''Grow a pairing past where its fit is reliable: try a strong unpaired peak on a line within EXTEND_PX of the
+    prediction, refit, re-pair; keep the trial that pairs the most lines with every residual under 0.6 px. Lines at one
+    end of the chip predict the other end only roughly, so a line there is found this way rather than by the 1 px
+    tolerance. Repeats while it helps.'''
+    b = float(np.polyval(np.polyder(coefficients), 0.0)) / ORIGIN
+    for _ in range(8):
+        predicted = _model(coefficients, peaks)
+        used = set(pairs.values()); best = None
+        unpaired = [k for k in np.argsort(-weights) if k not in pairs][:10]
+        for k in unpaired:
+            index = np.where(np.abs(lines - predicted[k]) <= EXTEND_PX * abs(b))[0]
+            for l in index:
+                if int(l) in used:
+                    continue
+                trial = dict(pairs); trial[int(k)] = int(l)
+                px = [peaks[a] for a in trial] + list(fixed_px); nm = [lines[c] for c in trial.values()] + list(fixed_nm)
+                cf = _fit(px, nm, min(_degree(len(px)), len(px) - 2) if len(px) > 2 else 1, curvature=qc if qc and len(px) < 9 else None)
+                slope = float(np.polyval(np.polyder(cf), 0.0)) / ORIGIN
+                new = _assign(cf, peaks, weights, lines, 1.0 * abs(slope))
+                if len(new) <= len(pairs) or int(k) not in new:
+                    continue
+                px = [peaks[a] for a in new] + list(fixed_px); nm = [lines[c] for c in new.values()] + list(fixed_nm)
+                cf = _fit(px, nm, min(_degree(len(px)), len(px) - 2) if len(px) > 2 else 1, curvature=qc if qc and len(px) < 9 else None)
+                miss = np.abs(np.asarray(nm) - _model(cf, px)) / abs(slope)
+                if miss.max() > 0.6:
+                    continue
+                key = (len(new), -float(np.sqrt(np.mean(miss ** 2))))
+                if best is None or key > best[0]:
+                    best = (key, cf, new)
+        if best is None:
+            break
+        _, coefficients, pairs = best
+        b = float(np.polyval(np.polyder(coefficients), 0.0)) / ORIGIN
+    return coefficients, pairs, b
+
+
 def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: int = 1024, dispersion_hint=None,
-                centre_slack: float = CENTRE_SLACK_NM) -> dict:
+                centre_slack: float = CENTRE_SLACK_NM, curvature=None, hint_range: float = HINT_RANGE) -> dict:
     '''Pair peak pixels with reference wavelengths.
 
     peaks: pixels of the found peaks (not counting the pixels of `fixed`); strengths: their prominences (optional).
     wavelengths: reference lines still free to pair. fixed: (pixel, wavelength) pairs typed or picked by hand.
     dispersion_hint: nm per pixel (signed) of an earlier calibration with this grating: the dispersion is then looked
-    for within HINT_RANGE of it, in the same direction (far fewer chance pairings). centre_slack: how far the chip
-    centre may be from centre_nm.
+    for within hint_range of it, in the same direction (far fewer chance pairings). curvature: the x^2 coefficient (nm)
+    of earlier calibrations with this grating; guesses include it, and with fewer than 9 pairs it is kept fixed.
+    centre_slack: how far the chip centre may be from centre_nm.
     Returns dict(pairs=[(pixel, wavelength)], coefficients, dispersion_nm_per_px, chip_nm=(at pixel 0, at last pixel),
     rms_nm, ambiguous, reason). pairs is empty when no convincing pairing exists (reason says why).'''
     peaks = np.asarray(list(peaks), float)
@@ -86,12 +135,14 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
     low, high = DISPERSION_NM_PER_PX
     sign = 0.0
     if dispersion_hint is not None and math.isfinite(dispersion_hint) and dispersion_hint != 0:
-        low, high = abs(dispersion_hint) * (1 - HINT_RANGE), abs(dispersion_hint) * (1 + HINT_RANGE)
+        low, high = abs(dispersion_hint) * (1 - hint_range), abs(dispersion_hint) * (1 + hint_range)
         sign = math.copysign(1.0, dispersion_hint)
+    qc = float(curvature) if curvature is not None and math.isfinite(curvature) else 0.0
+    xq = lambda px: qc * ((np.asarray(px, float) - ORIGIN) / ORIGIN) ** 2   # the curvature term at these pixels
 
     # 1. Linear guesses from two anchor peaks and two lines (or from the hand-typed pairs).
     if len(fixed) >= 2:
-        c = np.polyfit(fixed_px - ORIGIN, fixed_nm, 1)
+        c = np.polyfit(fixed_px - ORIGIN, fixed_nm - xq(fixed_px), 1)
         guesses = np.array([[c[0], c[1]]])
     else:
         anchors = np.argsort(-strengths)[:ANCHOR_PEAKS]
@@ -99,21 +150,24 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
         pi, span = peaks[anchors[i]], peaks[anchors[j]] - peaks[anchors[i]]
         keep = np.abs(span) >= 3
         pi, span = pi[keep], span[keep]
-        # Peak i on line k, peak j on line l: b[n, k, l] in nm per pixel, c = wavelength at the chip centre.
-        b = (lines[None, :] - lines[:, None])[None, :, :] / span[:, None, None]
-        c = lines[None, :, None] - b * (pi[:, None, None] - ORIGIN)
+        # Peak i on line k, peak j on line l: b[n, k, l] in nm per pixel, c = wavelength at the chip centre (the
+        # curvature term taken off both lines first).
+        bend = (xq(pi + span) - xq(pi)) / span
+        b = (lines[None, :] - lines[:, None])[None, :, :] / span[:, None, None] - bend[:, None, None]
+        c = lines[None, :, None] - xq(pi)[:, None, None] - b * (pi[:, None, None] - ORIGIN)
         b, c = b.ravel(), c.ravel()
         if len(fixed) == 1:  # also: the typed pair plus any peak on any line
-            span1 = peaks - fixed_px[0]; span1 = span1[np.abs(span1) >= 3]
-            b1 = (lines[None, :] - fixed_nm[0]) / span1[:, None]
-            b = np.concatenate([b, b1.ravel()]); c = np.concatenate([c, (fixed_nm[0] - b1 * (fixed_px[0] - ORIGIN)).ravel()])
+            others = peaks[np.abs(peaks - fixed_px[0]) >= 3]; span1 = others - fixed_px[0]
+            b1 = ((lines[None, :] - xq(others)[:, None]) - (fixed_nm[0] - xq(fixed_px)[0])) / span1[:, None]
+            c1 = fixed_nm[0] - xq(fixed_px)[0] - b1 * (fixed_px[0] - ORIGIN)
+            b = np.concatenate([b, b1.ravel()]); c = np.concatenate([c, c1.ravel()])
         ok = (np.abs(b) >= low) & (np.abs(b) <= high) & (np.abs(c - centre_nm) <= centre_slack) & (b * sign >= 0)
         guesses = np.unique(np.round(np.stack([b[ok], c[ok]], axis=1), 6), axis=0)
     if not len(guesses):
         return empty | dict(reason='no pairing fits the centre wavelength')
 
     # 2. Score the guesses: weighted peaks within 3 px of a line.
-    predicted = guesses[:, 1:2] + guesses[:, 0:1] * (peaks[None, :] - ORIGIN)
+    predicted = guesses[:, 1:2] + guesses[:, 0:1] * (peaks[None, :] - ORIGIN) + xq(peaks)[None, :]
     _, distance = _nearest(lines, predicted.ravel())
     tolerance = 3.0 * np.abs(guesses[:, 0:1])
     near = distance.reshape(predicted.shape) / tolerance
@@ -124,7 +178,7 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
     on_chip = np.searchsorted(lines, guesses[:, 1] + half) - np.searchsorted(lines, guesses[:, 1] - half)
     score -= np.minimum(1.0, 4.0 * on_chip / width) * weights.sum()
     if len(fixed):
-        fixed_miss = np.abs(guesses[:, 1:2] + guesses[:, 0:1] * (fixed_px[None, :] - ORIGIN) - fixed_nm[None, :]) / tolerance
+        fixed_miss = np.abs(guesses[:, 1:2] + guesses[:, 0:1] * (fixed_px[None, :] - ORIGIN) + xq(fixed_px)[None, :] - fixed_nm[None, :]) / tolerance
         score += np.sum(np.where(fixed_miss < 1, 3.0 * (1 - fixed_miss ** 2), -5.0), axis=1)
     order = np.argsort(-score)[:REFINE_CANDIDATES * 8]
 
@@ -135,7 +189,7 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
         if any(abs(b - b2) < 0.02 * abs(b) and abs(c0 - c2) < 2 * abs(b) for b2, c2 in seen):
             continue
         seen.append((b, c0))
-        coefficients = np.array([b * ORIGIN, c0])
+        coefficients = np.array([qc, b * ORIGIN, c0])
         pairs = {}
         # Each tolerance is repeated until the pairs stop changing: a curved mapping is picked up from the centre outwards.
         for pixels_tolerance in (3.0, 2.0, 1.5, 1.0):
@@ -144,7 +198,8 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
                 px = [peaks[k] for k in found] + list(fixed_px); nm = [lines[l] for l in found.values()] + list(fixed_nm)
                 if len(px) < MIN_PAIRS:
                     break
-                coefficients = _fit(px, nm, min(_degree(len(px)), len(px) - 2) if len(px) > 2 else 1)
+                coefficients = _fit(px, nm, min(_degree(len(px)), len(px) - 2) if len(px) > 2 else 1,
+                                    curvature=qc if qc and len(px) < 9 else None)
                 b = float(np.polyval(np.polyder(coefficients), 0.0)) / ORIGIN
                 if found == pairs:
                     break
@@ -154,6 +209,7 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
         pairs = _assign(coefficients, peaks, weights, lines, 1.0 * abs(b))
         if len(pairs) + len(fixed) < MIN_PAIRS:
             continue
+        coefficients, pairs, b = _extend(coefficients, pairs, peaks, weights, lines, fixed_px, fixed_nm, qc)
         px = np.array([peaks[k] for k in pairs] + list(fixed_px)); nm = np.array([lines[l] for l in pairs.values()] + list(fixed_nm))
         residual = nm - _model(coefficients, px)
         rms = float(np.sqrt(np.mean(residual ** 2)))
@@ -189,13 +245,14 @@ def match_lines(peaks, wavelengths, centre_nm, strengths=None, fixed=(), width: 
                 chip_nm=(float(best['ends'][0]), float(best['ends'][1])), rms_nm=best['rms'], ambiguous=ambiguous, reason='')
 
 
-def locate_centre(peaks, wavelengths, centre_nm, strengths=None, width: int = 1024, dispersion_hint=None):
+def locate_centre(peaks, wavelengths, centre_nm, strengths=None, width: int = 1024, dispersion_hint=None, curvature=None,
+                  hint_range: float = HINT_RANGE):
     '''Where the lines say the chip centre is, searched far from centre_nm (only with a dispersion hint: without one a
     wide search pairs too much by chance). Returns the chip-centre wavelength of a confident pairing, or None.'''
     if dispersion_hint is None:
         return None
     match = match_lines(peaks, wavelengths, centre_nm, strengths, width=width, dispersion_hint=dispersion_hint,
-                        centre_slack=WIDE_SLACK_NM)
+                        centre_slack=WIDE_SLACK_NM, curvature=curvature, hint_range=hint_range)
     if not match['pairs'] or match['ambiguous'] or len(match['pairs']) < 5:
         return None
     return float(np.mean(match['chip_nm']))

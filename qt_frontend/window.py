@@ -5109,12 +5109,20 @@ class MainWindow(QMainWindow):
         strength = getattr(self, '_cal_peak_strength', {}) or {}
         width = int(((self._cal_frame or {}).get('shape') or [1, 1024])[-1])
         # A saved calibration with this grating tells roughly the dispersion and which way wavelength runs.
-        hint = self._snapshot.get('dispersion_hint')
+        # Saved calibrations with this grating: dispersion (and its direction), curvature, and how wide to search.
+        shape = self._snapshot.get('dispersion_hint')
+        if isinstance(shape, (int, float)):
+            shape = dict(dispersion_nm_per_px=shape)
+        shape = shape if isinstance(shape, dict) else {}
+        hint = shape.get('dispersion_nm_per_px')
         hint = float(hint) if isinstance(hint, (int, float)) and math.isfinite(hint) and hint else None
+        curvature = shape.get('curvature_nm') if isinstance(shape.get('curvature_nm'), (int, float)) else None
+        spread = float(shape.get('range') or 0.25)
         wavelengths = [float(line['wavelength_nm']) for line in free_lines]
         strengths = [strength.get(peak, 1.0) for peak in free_peaks]
         try:
-            match = match_lines(free_peaks, wavelengths, float(centre), strengths, fixed=fixed, width=width, dispersion_hint=hint)
+            match = match_lines(free_peaks, wavelengths, float(centre), strengths, fixed=fixed, width=width, dispersion_hint=hint,
+                                curvature=curvature, hint_range=spread)
         except Exception as error:  # a pairing failure must not break Find peaks
             match = {'pairs': [], 'reason': f'pairing failed ({error})'}
         if match.get('ambiguous'):
@@ -5124,7 +5132,8 @@ class MainWindow(QMainWindow):
             # Nothing pairs near the set centre: on a manual spectrometer the dial may have been turned without the
             # setting in the software. Where do the lines put the centre?
             try:
-                located = locate_centre(free_peaks, wavelengths, float(centre), strengths, width=width, dispersion_hint=hint)
+                located = locate_centre(free_peaks, wavelengths, float(centre), strengths, width=width, dispersion_hint=hint,
+                                        curvature=curvature, hint_range=spread)
             except Exception:
                 located = None
             if located is not None and abs(located - float(centre)) > 10:
