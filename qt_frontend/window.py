@@ -24,6 +24,7 @@ from .plots import padded_range, ResponsePlot, SpectrumPlot, MapPlot, DecayPlot,
 from .dialogs import DeviceDialog, DetectorDialog
 from .experiment_info import ExperimentInfoDialog
 from .prescan import PrescanDialog, prescan_issues
+from .guards import confirm_calibration_loss
 from . import correction
 from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
@@ -4499,7 +4500,42 @@ class MainWindow(QMainWindow):
         if center is None or center <= 0 or slit is None or slit <= 0:
             self.show_toast('Center wavelength and slit must be positive')
             return
-        self.controller.dispatch('spectrograph', {'center_nm': float(center), 'grating': grating, 'slit_um': float(slit)}, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
+        request = {'center_nm': float(center), 'grating': grating, 'slit_um': float(slit)}
+        if getattr(self, '_spectrograph_asking', False):
+            return  # the field loses focus to the question below and reports editingFinished again
+        snapshot = self._snapshot or {}; current = snapshot.get('spectrograph') or {}
+        changes = []
+        for key, label, unit in (('center_nm', 'Center wavelength', 'nm'), ('grating', 'Grating', 'g/mm'), ('slit_um', 'Slit', 'µm')):
+            old = current.get(key)
+            if old is not None and abs(float(old) - float(request[key])) > 1e-9:
+                changes.append(f'{label} {float(old):g} → {float(request[key]):g} {unit}')
+        if not current:
+            changes = None  # setting in use not known yet: send the edit as it is
+        elif not changes:
+            return  # nothing changed (e.g. focus left a field without an edit)
+        if changes is None:
+            self.controller.dispatch('spectrograph', request, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
+            return
+        self._spectrograph_asking = True
+        try:
+            # The worker keeps the wavelength calibration for a slit-only change (it drops only what carries the old
+            # throughput); a new centre wavelength or grating removes it.
+            slit_only = all(change.startswith('Slit') for change in changes)
+            go = confirm_calibration_loss(self, snapshot, 'Changing the ' + '; '.join(changes).replace('Center', 'center', 1).replace('Grating', 'grating', 1).replace('Slit', 'slit', 1),
+                                          keeps_calibration=slit_only)
+        finally:
+            self._spectrograph_asking = False
+        if not go:
+            # Put the fields back to the setting in use.
+            self._updating_controls = True
+            try:
+                self.center_edit.setText(f'{float(current["center_nm"]):.6g}')
+                _set_combo(self.grating_combo, str(int(current['grating'])))
+                self.slit_edit.setText(f'{float(current["slit_um"]):.6g}')
+            finally:
+                self._updating_controls = False
+            return
+        self.controller.dispatch('spectrograph', request, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
     def _choose_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Save folder', str(self.output_dir))
         if folder:

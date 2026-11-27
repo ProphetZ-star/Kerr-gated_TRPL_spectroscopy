@@ -6,6 +6,7 @@ USB scanning is the primary path; serial / DLL overrides live under "Advanced".'
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QDialog, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QLineEdit, QStackedWidget
 from .widgets import Segmented, CollapsibleSection, ArrowComboBox as QComboBox
+from .guards import confirm_calibration_loss
 
 
 def payload_message(payload):
@@ -323,6 +324,15 @@ class DeviceCard(QWidget):
         except Exception as error:
             self._show_message(str(error), error=True)
             return
+        if self.family == 'spectrometer':
+            # Another spectrometer (driver, port or baud rate) removes the wavelength calibration and every
+            # installed intensity response; the same one reconnected keeps them.
+            config = self._link().get('config') or {}
+            different = any(key in data and config.get(key) not in (None, '') and str(config.get(key)) != str(data[key])
+                            for key in ('driver', 'port', 'baudrate'))
+            if different and not confirm_calibration_loss(self, self._snapshot(), 'Connecting another spectrometer',
+                                                          measured_response_only=False):
+                return
         self.connect_button.setEnabled(False)
         self._show_message('Connecting…')
         self._request('device_connect', data, self._connected_ok, self._connect_failed)
