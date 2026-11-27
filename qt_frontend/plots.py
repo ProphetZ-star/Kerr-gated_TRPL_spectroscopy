@@ -404,6 +404,21 @@ class InlineAxis(pg.AxisItem):
                 return
         super().mouseClickEvent(ev)
 
+def ascending(x, y):
+    '''(x, y) with x running upwards. A calibrated wavelength axis may fall with pixel number (the spectrum runs either
+    way across the CCD), and pyqtgraph's clip-to-view and auto-downsampling assume rising x: zoomed in, a falling
+    curve is clipped to nothing and vanishes. A curve that falls throughout is drawn reversed, which looks the same.'''
+    try:
+        xa = np.asarray(x, dtype=float); ya = np.asarray(y)
+    except Exception:
+        return x, y
+    if xa.ndim != 1 or ya.ndim != 1 or len(xa) < 2 or len(xa) != len(ya):
+        return x, y
+    finite = xa[np.isfinite(xa)]
+    if len(finite) >= 2 and finite[0] > finite[-1] and np.all(np.diff(finite) <= 0):
+        return xa[::-1], ya[::-1]
+    return x, y
+
 class EditablePlot(pg.PlotWidget):
     pointPicked = Signal(float, float)
     def __init__(self, parent=None, grid=True, invert_y=False, **kwargs):
@@ -440,6 +455,15 @@ class EditablePlot(pg.PlotWidget):
         self.plotItem.setMouseEnabled(x=True, y=True)
         self.plotItem.setDownsampling(auto=True,mode='peak')
         self.plotItem.setClipToView(True)
+        # Every curve goes in with rising x (see ascending): clip-to-view would otherwise hide a falling one when zoomed.
+        plot = self.plotItem.plot
+        def plot_ascending(*args, **kwargs):
+            if len(args) >= 2:
+                args = ascending(args[0], args[1]) + tuple(args[2:])
+            elif 'x' in kwargs and 'y' in kwargs:
+                kwargs['x'], kwargs['y'] = ascending(kwargs['x'], kwargs['y'])
+            return plot(*args, **kwargs)
+        self.plotItem.plot = plot_ascending
         if self._invert_y:
             try:
                 self.plotItem.invertY(True)
@@ -1284,7 +1308,7 @@ class SpectrumPlot(PinnedLines, EditablePlot):
             # a line that breaks at each one shows as scattered dots. Draw through the pixels that have a value.
             item.setPen(pen); item.setLogMode(False, log)
             keep = np.isfinite(values) & (values > 0 if log else True)
-            item.setData(xs[keep], values[keep])
+            item.setData(*ascending(xs[keep], values[keep]))
         show(self._noise_item, ys, pg.mkPen(colors['noise'], width=1.2))
         if limit is not None:
             limit = np.asarray(limit, dtype=float)[:len(xs)]
