@@ -28,6 +28,7 @@ from .guards import confirm_calibration_loss
 from . import correction
 from .noise import LiveNoise, relative_noise, shot_limit, SIGNAL_FLOOR
 from backend.readout import normalize_readout, readout_shape, describe as describe_readout
+from backend.line_matching import match_lines
 
 DEFAULT_SAMPLE_NAME = 'Sample 01 TRPL'
 # Window settings kept between sessions (instrument settings are kept by the worker in instrument-settings.json).
@@ -2025,6 +2026,31 @@ class MainWindow(QMainWindow):
         self.cal_frame_state.setObjectName('calFrameState')
         self._reg('calFrameState', self.cal_frame_state, False)
         panel.add_tool(self.cal_frame_state)
+        # Contrast: counts drawn darkest / brightest. Auto follows the frame (1st–99.5th percentile).
+        contrast = QWidget(); contrast_layout = QHBoxLayout(contrast)
+        contrast_layout.setContentsMargins(0, 0, 0, 0); contrast_layout.setSpacing(6)
+        contrast_label = QLabel('Display'); contrast_label.setProperty('muted', True)
+        self.cal_display_min = InlineValueEdit('–'); self.cal_display_max = InlineValueEdit('–')
+        for end, edit_ in ((0, self.cal_display_min), (1, self.cal_display_max)):
+            # Keeps its objectName ('inlineValue'): the theme styles inline values by it.
+            edit_.setToolTip('Click to type the counts drawn ' + ('darkest' if end == 0 else 'brightest') + ' (k accepted) · empty = auto')
+            edit_.committed.connect(lambda text, end=end: self._cal_display_edited(end, text))
+            self._reg('calDisplayMin' if end == 0 else 'calDisplayMax', edit_, False)
+        dash = QLabel('–'); dash.setProperty('muted', True)
+        self.cal_display_auto = QPushButton('Auto'); self.cal_display_auto.setObjectName('calDisplayAuto')
+        self.cal_display_auto.setToolTip('Fit the contrast to this frame again')
+        self.cal_display_auto.clicked.connect(self._cal_display_auto); self.cal_display_auto.hide()
+        self._reg('calDisplayAuto', self.cal_display_auto, False)
+        for widget in (contrast_label, self.cal_display_min, dash, self.cal_display_max, self.cal_display_auto):
+            contrast_layout.addWidget(widget)
+        panel.add_tool(contrast)
+        self.cal_export_image = QPushButton('Export image…'); self.cal_export_image.setObjectName('calExportImage')
+        self.cal_export_image.setToolTip('Save the raw CCD frame (counts) as CSV or 16-bit TIFF, with its exposure, readout and settings')
+        self._set_icon(self.cal_export_image, 'download'); self.cal_export_image.setEnabled(False)
+        self.cal_export_image.clicked.connect(self._cal_export_image)
+        self._reg('calExportImage', self.cal_export_image, False)
+        panel.add_tool(self.cal_export_image)
+        self._cal_display_manual = None  # (low, high) typed by the user; None = auto
         self.cal_image = CalibrationImagePlot()
         self.cal_image.setObjectName('calImage')
         self._reg('calImage', self.cal_image, False)
@@ -2045,6 +2071,7 @@ class MainWindow(QMainWindow):
         panel.title_layout.addWidget(self.cal_spectrum_axis)
         legend = Legend()
         legend.add('CCD', key='ccd')
+        legend.add('Found peaks', color='amber', key='peaks')
         legend.add('Reference lines', dashed=True, key='references')
         self.cal_legend = legend
         panel.add_tool(legend)
@@ -2084,6 +2111,17 @@ class MainWindow(QMainWindow):
         self.cal_add_line.setObjectName('calAddLine')
         self.cal_add_line.clicked.connect(self._cal_add_line)
         self._reg('calAddLine', self.cal_add_line, False)
+        # Peak-first: one row per found peak, its pixel filled in, the wavelength typed by hand (for a lamp whose lines
+        # are identified by eye, or with no reference file at hand).
+        self.cal_use_peaks = QPushButton('Use found peaks')
+        self._set_icon(self.cal_use_peaks, 'target')
+        self.cal_use_peaks.setObjectName('calUsePeaks')
+        self.cal_use_peaks.setToolTip('One row per found peak with its pixel filled in; type the wavelength of each line you recognise. '
+                                      'Rows left without a wavelength are not used in the fit.')
+        self.cal_use_peaks.clicked.connect(self._cal_use_found_peaks)
+        self.cal_use_peaks.setEnabled(False)
+        self._reg('calUsePeaks', self.cal_use_peaks, False)
+        table_panel.add_tool(self.cal_use_peaks)
         table_panel.add_tool(self.cal_add_line)
         self.cal_table = QTableWidget(0, 5)
         self.cal_table.setObjectName('calPairs');self.cal_table.setShowGrid(False)
@@ -2102,6 +2140,7 @@ class MainWindow(QMainWindow):
         self._reg('calPairs', self.cal_table, False)
         table_panel.add_body(self.cal_table, 1)
         note=QLabel('Δ = reference − model · Demo lines are illustrative.');note.setProperty('muted',True);note.setFixedHeight(28);note.setContentsMargins(12,0,8,0);note.setStyleSheet('font-size:11px;');table_panel.add_body(note)
+        self.cal_table_note = note
         layout.addWidget(table_panel, 19)
         mapping_panel = Panel('Pixel → wavelength');mapping_panel.header.setFixedHeight(46)
         mapping_panel.add_tool(QLabel('Mapping & residuals'))
@@ -4519,10 +4558,11 @@ class MainWindow(QMainWindow):
         self._spectrograph_asking = True
         try:
             # The worker keeps the wavelength calibration for a slit-only change (it drops only what carries the old
-            # throughput); a new centre wavelength or grating removes it.
+            # throughput); a new centre wavelength or grating takes it out of use, saved for its setting (the
+            # calibration saved for the new setting, if any, comes back). A measured response is lost either way.
             slit_only = all(change.startswith('Slit') for change in changes)
             go = confirm_calibration_loss(self, snapshot, 'Changing the ' + '; '.join(changes).replace('Center', 'center', 1).replace('Grating', 'grating', 1).replace('Slit', 'slit', 1),
-                                          keeps_calibration=slit_only)
+                                          keeps_calibration=slit_only, calibration_saved=not slit_only)
         finally:
             self._spectrograph_asking = False
         if not go:
@@ -4535,7 +4575,12 @@ class MainWindow(QMainWindow):
             finally:
                 self._updating_controls = False
             return
-        self.controller.dispatch('spectrograph', request, success=lambda result: self.controller.request_status(), failure=lambda payload: self.show_toast(payload_message(payload)))
+        def applied(result):
+            note = result.get('calibration_note') if isinstance(result, dict) else None
+            if note:
+                self.show_toast(note)
+            self.controller.request_status()
+        self.controller.dispatch('spectrograph', request, success=applied, failure=lambda payload: self.show_toast(payload_message(payload)))
     def _choose_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Save folder', str(self.output_dir))
         if folder:
@@ -4982,6 +5027,8 @@ class MainWindow(QMainWindow):
         self.cal_row_start.blockSignals(False)
         self.cal_row_end.blockSignals(False)
         self.cal_image.set_frame(array, float(frame.get('full_scale') or 65535))
+        self._cal_apply_display()
+        self.cal_export_image.setEnabled(True)
         self.cal_image.reset_view()  # a new frame always opens in full view (Backspace restores the old zoom)
         self.cal_image.set_roi(self.cal_row_start.value(), self.cal_row_end.value())
         source = frame.get('source') or frame.get('source_mode') or 'unknown'
@@ -5021,26 +5068,162 @@ class MainWindow(QMainWindow):
             return
         self._cal_profile = list(result.get('profile_counts') or [])
         self._cal_peaks = [float(value) for value in result.get('peaks_pixels') or []]
+        prominences = result.get('peak_prominences') or []
+        self._cal_peak_strength = dict(zip(self._cal_peaks, prominences)) if len(prominences) == len(self._cal_peaks) else {}
         saturated = int(result.get('saturated_pixels') or 0)
         if saturated:
             self.cal_roi_label.setText(f'{saturated} saturated pixels in ROI')
             self.cal_roi_label.show()
         else:
             self.cal_roi_label.hide()
-        self._assign_peaks_to_lines()
-        self.cal_feedback.setText(f'Extracted {len(self._cal_profile)} pixels · {len(self._cal_peaks)} peak(s)')
+        assigned = self._assign_peaks_to_lines()
+        self.cal_feedback.setText(self._cal_peaks_message(result, assigned))
         self._update_cal_plots()
         self._update_cal_controls()
     def _assign_peaks_to_lines(self):
-        if not self._cal_peaks or not self._cal_lines:
+        '''Pair the found peaks with the reference wavelengths (backend.line_matching): the reference list is only
+        standard wavelengths and may span far more than the chip; the centre wavelength set on the spectrograph
+        anchors the search, the dispersion and its direction are found from the peaks. Pixels a previous pairing
+        filled in are replaced; pixels typed or picked by hand are kept and the pairing must agree with them.
+        Lines that fall off the chip are hidden. Returns how many lines got a peak.'''
+        self._cal_match = None
+        if not self._cal_lines:
+            return 0
+        for line in self._cal_lines:
+            line['off_chip'] = False
+            if line.get('auto'):
+                line['pixel'] = None; line['auto'] = False
+        free_lines = [line for line in self._cal_lines if line.get('enabled') and line.get('pixel') is None and line.get('wavelength_nm') is not None]
+        fixed = [(float(line['pixel']), float(line['wavelength_nm'])) for line in self._cal_lines
+                 if line.get('enabled') and line.get('pixel') is not None and line.get('wavelength_nm') is not None]
+        free_peaks = [peak for peak in self._cal_peaks if all(abs(peak - pixel) >= 3 for pixel, _ in fixed)]
+        if not free_lines or not free_peaks:
+            self._refresh_line_widgets()
+            return 0
+        spectrograph = (self._cal_frame or {}).get('spectrograph') or self._snapshot.get('spectrograph') or {}
+        centre = spectrograph.get('center_nm')
+        if centre is None:
+            self._refresh_line_widgets()
+            return 0
+        strength = getattr(self, '_cal_peak_strength', {}) or {}
+        width = int(((self._cal_frame or {}).get('shape') or [1, 1024])[-1])
+        try:
+            match = match_lines(free_peaks, [float(line['wavelength_nm']) for line in free_lines], float(centre),
+                                [strength.get(peak, 1.0) for peak in free_peaks], fixed=fixed, width=width)
+        except Exception as error:  # a pairing failure must not break Find peaks
+            match = {'pairs': [], 'reason': f'pairing failed ({error})'}
+        if match.get('ambiguous'):
+            # Two different pairings fit about equally well: fill in neither rather than a possibly wrong one.
+            match = dict(match, pairs=[], reason='ambiguous')
+        self._cal_match = match
+        by_wavelength = {round(float(line['wavelength_nm']), 6): line for line in free_lines}
+        for pixel, wavelength in match.get('pairs') or []:
+            line = by_wavelength.get(round(wavelength, 6))
+            if line is not None:
+                line['pixel'] = float(pixel); line['auto'] = True
+        chip = match.get('chip_nm')
+        if chip and match.get('pairs'):
+            # A line more than ~2 px beyond either end of the chip cannot be on this frame.
+            margin = 2 * abs(float(match.get('dispersion_nm_per_px') or 0))
+            low, high = min(chip) - margin, max(chip) + margin
+            for line in free_lines:
+                if line.get('pixel') is None and not low <= float(line['wavelength_nm']) <= high:
+                    line['off_chip'] = True
+        self._repopulate_cal_table()
+        return len(match.get('pairs') or [])
+    def _cal_match_text(self):
+        '''One clause on the automatic pairing, or '' when nothing was paired automatically.'''
+        match = getattr(self, '_cal_match', None)
+        if not match:
+            return ''
+        if not match.get('pairs'):
+            why = ('several pairings fit about equally well' if match.get('reason') == 'ambiguous'
+                   else 'the peaks could not be paired with the reference lines automatically')
+            return f' · {why}: check the centre wavelength, or type the pixel of one or two lines you recognise and Find peaks again'
+        chip = match['chip_nm']; hidden = sum(1 for line in self._cal_lines if line.get('off_chip'))
+        typed = sum(1 for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None and not line.get('auto') and line.get('wavelength_nm') is not None)
+        return (f" · {len(match['pairs'])} reference lines paired automatically" + (f' (plus {typed} typed)' if typed else '')
+                + f": chip ≈ {chip[0]:.1f}–{chip[1]:.1f} nm, {abs(match['dispersion_nm_per_px']):.4f} nm/px"
+                + (f'; {hidden} lines off the chip hidden' if hidden else ''))
+    def _cal_peaks_message(self, result, assigned):
+        start, end = self._cal_rows_pair()
+        peaks = len(self._cal_peaks)
+        if peaks:
+            text = f'{peaks} peak(s) found in rows {start}–{end} (marked ▲)'
+            if not self._cal_lines:
+                return text + ' · import the lamp\'s reference wavelengths to pair them with lines'
+            if getattr(self, '_cal_match', None):
+                return text + self._cal_match_text()
+            enabled = [line for line in self._cal_lines if line.get('enabled')]
+            placed = sum(1 for line in enabled if line.get('pixel') is not None)
+            return text + f' · {placed} of {len(enabled)} reference lines have a peak'
+        # Nothing stands out: say how far the profile rises and where the light is on the chip.
+        rise = float(result.get('rise_counts') or 0.0); noise = float(result.get('noise_counts') or 0.0)
+        text = f'No lines found in rows {start}–{end}: the spectrum rises {rise:.0f} counts above its baseline (noise ≈ {noise:.1f} counts).'
+        band = self._cal_bright_rows()
+        if band and (band[1] < start or band[0] > end or band[1] - band[0] < (end - start) / 3):
+            text += f' The light falls on rows {band[0]}–{band[1]}.'
+        return text + ' Try the rows with the light, a longer exposure or more lamp light.'
+    def _cal_bright_rows(self):
+        '''(first, last) rows of the brightest band of the current frame, or None for a one-row frame or no clear band.'''
+        image = (self._cal_frame or {}).get('image')
+        if image is None or np.asarray(image).ndim != 2 or np.asarray(image).shape[0] < 3:
+            return None
+        rows = np.asarray(image, dtype=float).mean(axis=1)
+        floor = float(np.percentile(rows, 20)); peak = int(np.argmax(rows)); height = rows[peak] - floor
+        noise = float(np.median(np.abs(np.diff(rows)))) * 1.48 or 1.0
+        if height < 5 * noise:
+            return None
+        inside = rows >= floor + 0.3 * height
+        first = last = peak
+        while first > 0 and inside[first - 1]: first -= 1
+        while last < len(rows) - 1 and inside[last + 1]: last += 1
+        return first, last
+    def _cal_apply_display(self):
+        image = (self._cal_frame or {}).get('image')
+        if image is None:
             return
-        indices = sorted([index for index, line in enumerate(self._cal_lines) if line.get('enabled') and line.get('pixel') is None], key=lambda index: float(self._cal_lines[index].get('wavelength_nm') or 0))
-        if not indices:
+        low, high = self.cal_image.auto_display_range(image)
+        manual = self._cal_display_manual or (None, None)
+        low = manual[0] if manual[0] is not None else low
+        high = manual[1] if manual[1] is not None else high
+        if not high > low:
+            high = low + 1.0
+        self.cal_image.set_display_range(low, high)
+        self.cal_display_min.set_value_text(_format_map_value(low)); self.cal_display_max.set_value_text(_format_map_value(high))
+        self.cal_display_auto.setVisible(self._cal_display_manual is not None)
+    def _cal_display_edited(self, end, text):
+        edit_ = self.cal_display_max if end else self.cal_display_min
+        try:
+            value = parse_count(text)
+        except ValueError:
+            edit_.reject(); return
+        manual = list(self._cal_display_manual or (None, None)); manual[end] = value
+        image = (self._cal_frame or {}).get('image')
+        auto = self.cal_image.auto_display_range(image) if image is not None else (0.0, 65535.0)
+        low = manual[0] if manual[0] is not None else auto[0]; high = manual[1] if manual[1] is not None else auto[1]
+        if not high > low:
+            edit_.reject(); return
+        self._cal_display_manual = None if manual == [None, None] else tuple(manual)
+        edit_.accept(); self._cal_apply_display()
+    def _cal_display_auto(self):
+        self._cal_display_manual = None; self._cal_apply_display()
+    def _cal_export_image(self):
+        frame = self._cal_frame or {}
+        image = frame.get('image')
+        if image is None:
+            self.show_toast('Acquire a calibration frame first'); return
+        stamp = str(frame.get('captured_utc') or '').replace(':', '').replace('-', '')[:15] or 'frame'
+        default = str(self.output_dir / f'ccd-frame-{stamp}.csv')
+        path, chosen = QFileDialog.getSaveFileName(self, 'Export CCD frame', default, 'CSV, counts (*.csv);;TIFF, 16-bit (*.tif *.tiff)')
+        if not path:
             return
-        peaks = sorted(self._cal_peaks)
-        for index, peak in zip(indices, peaks[:len(indices)]):
-            self._cal_lines[index]['pixel'] = float(peak)
-        self._refresh_line_widgets()
+        try:
+            from .frame_export import write_frame
+            written = write_frame(path, np.asarray(image), frame, tiff='TIFF' in (chosen or '') or Path(path).suffix.lower() in ('.tif', '.tiff'))
+        except Exception as error:
+            self.show_toast(f'Export failed: {error}', 'error'); return
+        self.show_toast(f'CCD frame saved · {Path(written).name}', 'success')
     def _cal_rows_pair(self):
         start = int(self.cal_row_start.value())
         end = int(self.cal_row_end.value())
@@ -5073,23 +5256,31 @@ class MainWindow(QMainWindow):
             if line.get('enabled') and line.get('pixel') is not None and line.get('wavelength_nm') is not None:
                 pass
         pairs = []
+        unidentified = unpaired = 0
         for line in self._cal_lines:
             if not line.get('enabled'):
                 continue
-            if line.get('pixel') is None or line.get('wavelength_nm') is None:
-                self.cal_feedback.setText('Assign a peak pixel to every enabled reference line')
-                return
+            if line.get('wavelength_nm') is None:
+                unidentified += 1  # a found peak without a wavelength: not used
+                continue
+            if line.get('pixel') is None:
+                unpaired += 1  # a reference line no peak was paired with (often off the chip): not used
+                continue
             pairs.append({'enabled': True, 'pixel': float(line.get('pixel')), 'wavelength_nm': float(line.get('wavelength_nm'))})
+        if len({round(pair['wavelength_nm'], 9) for pair in pairs}) != len(pairs):
+            self.cal_feedback.setText('Two lines have the same wavelength; each line needs its own'); return
         degree = int(self.cal_order.currentData() or 2)
         if len(pairs) < degree + 2:
-            self.cal_feedback.setText(f'At least {degree + 2} enabled reference lines are required')
+            self.cal_feedback.setText(f'At least {degree + 2} lines with a pixel and a wavelength are required (now {len(pairs)})'
+                                      + (f'; {unidentified} peak(s) still have no wavelength' if unidentified else '')
+                                      + ('; Find peaks pairs the reference lines with peaks, or pick a pixel for each line' if unpaired and not pairs else ''))
             return
         start, end = self._cal_rows_pair()
         data = {'frame_id': self._cal_frame.get('frame_id'), 'row_start': start, 'row_end': end, 'degree': degree, 'convention': self.cal_convention.currentData() or 'air', 'reference_source': self._reference_source, 'reference_name': self._reference_name, 'pairs': pairs}
         self.cal_feedback.setText('Fitting polynomial mapping…')
         signature=json.dumps(data,sort_keys=True)
         def fitted(solution):
-            current_pairs=[{'enabled':True,'pixel':float(line['pixel']),'wavelength_nm':float(line['wavelength_nm'])} for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None]
+            current_pairs=[{'enabled':True,'pixel':float(line['pixel']),'wavelength_nm':float(line['wavelength_nm'])} for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None and line.get('wavelength_nm') is not None]
             current=dict(data,frame_id=(self._cal_frame or {}).get('frame_id'),row_start=self.cal_row_start.value(),row_end=self.cal_row_end.value(),degree=self.cal_order.currentData(),convention=self.cal_convention.currentData(),pairs=current_pairs,reference_source=self._reference_source,reference_name=self._reference_name)
             if json.dumps(current,sort_keys=True)==signature:self._cal_fitted(solution)
         self.controller.dispatch('calibration_fit', data, success=fitted, failure=lambda payload: self._cal_feedback_error(payload))
@@ -5228,6 +5419,7 @@ class MainWindow(QMainWindow):
         self.cal_image.set_roi(new_start, new_end)
         self.extract_calibration()
     def _reset_demo_reference(self, silent=False):
+        self._cal_peak_first = False
         if self._snapshot.get('source_mode') == 'hardware' and not silent:
             self.cal_feedback.setText('Import measured reference wavelengths for hardware calibration')
             return
@@ -5245,6 +5437,7 @@ class MainWindow(QMainWindow):
     def _load_demo_reference(self, silent=True):
         self._reset_demo_reference(silent=True)
     def _import_reference_csv(self):
+        self._cal_peak_first = False
         path, selected = QFileDialog.getOpenFileName(self, 'Import reference spectrum CSV', str(self.output_dir), 'CSV files (*.csv);;All files (*)')
         if not path:
             return
@@ -5280,9 +5473,34 @@ class MainWindow(QMainWindow):
             self._repopulate_cal_table()
             self._assign_peaks_to_lines()
             self._update_cal_plots()
-            self.cal_feedback.setText(f'Imported {len(rows)} measured reference line(s)')
+            self.cal_feedback.setText(f'Imported {len(rows)} measured reference line(s)' + self._cal_match_text())
         except Exception as error:
             self._cal_feedback_error({'message': str(error)})
+    def _cal_use_found_peaks(self):
+        peaks = sorted(self._cal_peaks or [])
+        if not peaks:
+            self.cal_feedback.setText('Find peaks first'); return
+        if self._cal_lines:
+            answer = QMessageBox.question(self, 'Use found peaks', f'Replace the {len(self._cal_lines)} line(s) in the table with the {len(peaks)} found peak(s)? '
+                                          'You then type the wavelength of each line you recognise.', QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer != QMessageBox.Yes:
+                return
+        self._cal_solution = None
+        self.cal_fit_state.setText('Draft')
+        self._cal_lines = [{'enabled': True, 'pixel': float(pixel), 'wavelength_nm': None, 'auto': False} for pixel in peaks]
+        self._cal_match = None
+        # Wavelengths typed for a real lamp are measured reference values (a real CCD frame needs those to be fitted).
+        self._cal_peak_first = True
+        self._reference_source = 'measured'
+        self._reference_imported = False
+        self._reference_name = 'Typed at found peaks'
+        self.cal_reference_name.setText(self._reference_name)
+        self._repopulate_cal_table()
+        self._update_cal_plots()
+        self.cal_feedback.setText(f'{len(peaks)} rows from the found peaks · type the wavelength of each line you recognise '
+                                  '(rows left at "-" are not used in the fit)')
+        if self._cal_row_widgets:
+            self.cal_table.selectRow(0); self._cal_row_widgets[0]['wavelength'].setFocus()
     def _cal_add_line(self):
         self._cal_solution=None
         self.cal_fit_state.setText('Draft')
@@ -5322,10 +5540,12 @@ class MainWindow(QMainWindow):
             pixel.setValue(float(line.get('pixel')) if line.get('pixel') is not None else -1.0)
             pixel.valueChanged.connect(lambda value, item=line: self._line_pixel_changed(item, value))
             wavelength = QDoubleSpinBox()
-            wavelength.setRange(0.001, 1000000.0)
+            # 0 shows "-": no wavelength yet (a found peak not identified); such rows are left out of the fit.
+            wavelength.setRange(0.0, 1000000.0)
             wavelength.setDecimals(3);wavelength.setButtonSymbols(QDoubleSpinBox.NoButtons);wavelength.setAlignment(Qt.AlignCenter);wavelength.setFixedHeight(28)
             wavelength.setSingleStep(0.1)
-            wavelength.setValue(float(line.get('wavelength_nm') or 0.001))
+            wavelength.setSpecialValueText('-')
+            wavelength.setValue(float(line.get('wavelength_nm') or 0.0))
             wavelength.valueChanged.connect(lambda value, item=line: self._line_wavelength_changed(item, value))
             delta = QTableWidgetItem('')
             remove = QPushButton('×')
@@ -5336,6 +5556,7 @@ class MainWindow(QMainWindow):
             self.cal_table.setCellWidget(row, 2, wavelength)
             delta.setTextAlignment(Qt.AlignCenter);self.cal_table.setItem(row, 3, delta)
             self.cal_table.setCellWidget(row, 4, remove)
+            self.cal_table.setRowHidden(row, bool(line.get('off_chip')))  # a reference line this frame cannot show
             self._cal_row_widgets.append({'check': check, 'pixel': pixel, 'wavelength': wavelength, 'delta': delta, 'line': line})
         self.cal_table.blockSignals(False)
         self._cal_table_updating = False
@@ -5351,7 +5572,7 @@ class MainWindow(QMainWindow):
             item['wavelength'].blockSignals(True)
             item['check'].setChecked(bool(line.get('enabled')))
             item['pixel'].setValue(float(line.get('pixel')) if line.get('pixel') is not None else -1.0)
-            item['wavelength'].setValue(float(line.get('wavelength_nm') or 0.001))
+            item['wavelength'].setValue(float(line.get('wavelength_nm') or 0.0))
             item['check'].blockSignals(False)
             item['pixel'].blockSignals(False)
             item['wavelength'].blockSignals(False)
@@ -5369,26 +5590,29 @@ class MainWindow(QMainWindow):
     def _line_pixel_changed(self, line, value):
         if self._cal_table_updating:
             return
-        line['pixel'] = None if value < -0.5 else float(value)
+        line['pixel'] = None if value < -0.5 else float(value); line['auto'] = False
         self._invalidate_cal_solution()
         self._update_deltas()
         self._update_cal_plots()
     def _line_wavelength_changed(self, line, value):
         if self._cal_table_updating:
             return
-        line['wavelength_nm'] = float(value)
+        line['wavelength_nm'] = float(value) if value > 0 else None
+        if line['wavelength_nm'] is not None and self._reference_source != 'measured' and getattr(self, '_cal_peak_first', False):
+            self._reference_source = 'measured'
         self._invalidate_cal_solution()
         self._update_deltas()
         self._update_cal_plots()
     def _update_line_count(self):
         enabled = sum(1 for line in self._cal_lines if line.get('enabled'))
-        self.cal_line_count.setText(f'{enabled} enabled lines')
+        paired = sum(1 for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None)
+        self.cal_line_count.setText(f'{enabled} enabled lines' + (f' · {paired} paired' if paired < enabled else ''))
         self._update_cal_controls()
     def _update_deltas(self):
         solution = self._cal_solution
         for item in self._cal_row_widgets:
             line = item['line']
-            if solution and line.get('pixel') is not None and solution.get('coefficients'):
+            if solution and line.get('pixel') is not None and line.get('wavelength_nm') is not None and solution.get('coefficients'):
                 pixel = float(line.get('pixel'))
                 origin = float(solution.get('pixel_origin') or 511.5)
                 scale = float(solution.get('pixel_scale') or 511.5)
@@ -5414,7 +5638,7 @@ class MainWindow(QMainWindow):
             line = self._cal_lines[0]
             self.cal_table.selectRow(0)
             self._cal_selected_line = line
-        line['pixel'] = float(pixel)
+        line['pixel'] = float(pixel); line['auto'] = False
         self._refresh_line_widgets()
         self._update_cal_plots()
     def _update_cal_plots(self):
@@ -5434,11 +5658,11 @@ class MainWindow(QMainWindow):
                 x_values = np.asarray(solution.get('wavelengths_nm'), dtype=float)
                 refs = [float(line.get('wavelength_nm')) for line in self._cal_lines if line.get('enabled') and line.get('wavelength_nm') is not None]
                 self.cal_spectrum_axis.setText('nm')
-                self.cal_spectrum.set_profile(values, x_values, 'wavelength', refs)
+                self.cal_spectrum.set_profile(values, x_values, 'wavelength', refs, self._cal_peaks)
             else:
                 self.cal_spectrum_axis.setText('pixel')
                 refs = [float(line.get('pixel')) for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None]
-                self.cal_spectrum.set_profile(values, None, 'pixel', refs)
+                self.cal_spectrum.set_profile(values, None, 'pixel', refs, self._cal_peaks)
         else:
             self.cal_spectrum.set_profile(None)
         self._update_deltas()
@@ -5459,6 +5683,11 @@ class MainWindow(QMainWindow):
         self.cal_row_start.setEnabled(rows_enabled)
         self.cal_row_end.setEnabled(rows_enabled)
         self.cal_find_peaks.setEnabled(self._cal_frame is not None and not frozen)
+        self.cal_use_peaks.setEnabled(bool(self._cal_peaks) and not frozen)
+        # "Illustrative" is true only of the demo lines, not of an imported or typed reference.
+        self.cal_table_note.setText('Δ = reference − model' + (' · Demo lines are illustrative.' if self._reference_source == 'synthetic' else
+                                    ' · Rows without a wavelength are not used in the fit.' if getattr(self, '_cal_peak_first', False) else
+                                    ' · Lines without a pixel are not used in the fit.' if getattr(self, '_reference_imported', False) else ''))
         self.cal_reference_file.setEnabled(not frozen)
         self.cal_demo_reference.setEnabled(not frozen and snapshot.get('source_mode') != 'hardware')
         self.cal_convention.setEnabled(not frozen)
@@ -5504,6 +5733,7 @@ class MainWindow(QMainWindow):
         self._cal_capture_id = None
         self._cal_timer.stop()
         self.cal_image.set_frame(None)
+        self.cal_export_image.setEnabled(False)
         self.cal_spectrum.set_profile(None)
         self.cal_mapping.set_data(self._cal_lines, None)
         self.cal_residual.set_data(self._cal_lines, None)

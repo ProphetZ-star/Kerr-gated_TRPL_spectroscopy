@@ -322,6 +322,18 @@ class Engine:
         self.calibration=empty;self.latest_axis=None;self.background=None
         self.calibration_workbench.invalidate();self.revision+=1
 
+    def recall_wavelength_calibration(self):
+        '''After the centre wavelength, grating or spectrometer changed: install the calibration saved for the new
+        setting, if there is one (hardware takes only a measured one). Returns a note for the user.'''
+        spec=self.spectrograph;setting=f"{float(spec['center_nm']):g} nm · {int(spec['grating'])} g/mm"
+        recalled=self.calibration_workbench.recall(spec)
+        if recalled is None or self.devices.mode=='hardware' and recalled['calibration'].get('source')!='measured':
+            return f'No saved calibration for {setting}: spectra are shown against pixel until one is installed'
+        self.calibration=recalled['calibration'];self.latest_axis=self.live_axis();self.revision+=1
+        self.calibration_workbench.persist(self.calibration,spec)
+        when=(recalled.get('saved_utc') or '')[:10]
+        return f'Restored the calibration saved for {setting}'+(f' on {when}' if when else '')
+
     def capture_hardware_frame(self,capture_id,data):
         try:
             image=self.camera.capture(data['exposure_s'],data['readout'],self.stop)
@@ -844,8 +856,10 @@ class Engine:
                     if spec.get('reported_settings') is not None:self.spectrograph=spec['reported_settings'].copy()
                     self.calibration_workbench.set_instrument(self.devices.links['spectrometer']['config'])
                     self.clear_wavelength_calibration()
-                    # Never restore an axis cached for another spectrometer after a source switch.
+                    # Never restore an axis cached for another spectrometer after a source switch; one saved for
+                    # this spectrometer and setting comes back.
                     self.mode_calibrations.clear()
+                    self.recall_wavelength_calibration()
                     self.set_response(dict(EMPTY_RESPONSE));self.mode_responses.clear()
                 if before!=self.devices.status():self.source_changed()
             return self.status()
@@ -912,9 +926,11 @@ class Engine:
                     except Exception as exc:raise HardwareError('spectrometer',str(exc)) from exc
                 else:applied=data
                 self.spectrograph=SpectrographConfig(**applied).model_dump()
+                note=None if slit_only else self.recall_wavelength_calibration()
                 self.calibration_workbench.persist(self.calibration,self.spectrograph)
                 # A measured response carries this setting's throughput; an imported one depends on wavelength only.
                 self.set_response(dict(EMPTY_RESPONSE) if self.response.get('source')=='measured' else self.response)
+                if note:return self.status()|dict(calibration_note=note)
             return self.status()
         if name=='calibration':
             self.idle(devices=False)

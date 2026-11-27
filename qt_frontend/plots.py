@@ -1944,6 +1944,8 @@ class CalibrationImagePlot(EditablePlot):
         self.set_x_label('')
         self.set_y_label('CCD row')
         self._full_scale = None
+        self._display = (55.0, 3355.0)  # counts drawn darkest / brightest
+        self._lookup_key = None
         self._set_lookup(65535)
         self.region.setBrush(pg.mkBrush(50,107,186,22));self.set_empty('No frame')
         self.bottom_axis.integer_ticks=True  # unlabelled CCD columns
@@ -1989,15 +1991,33 @@ class CalibrationImagePlot(EditablePlot):
         flag = '  ·  saturated' if self._full_scale is not None and value >= self._full_scale else ''
         return f'{text}  ·  {value} counts{flag}'
     def _set_lookup(self, full_scale):
-        # One LUT entry per count (levels 0..65535); entries at or above full scale take the saturation colour.
+        # One LUT entry per count (levels 0..65535) spread over the display range; entries at or above full scale
+        # take the saturation colour.
         full_scale = int(max(1, min(65535, round(full_scale))))
-        if full_scale == self._full_scale:
+        low, high = self._display
+        key = (full_scale, low, high)
+        if key == self._lookup_key:
             return
-        values=np.arange(65536,dtype=float);f=np.clip(np.maximum(0,values-55)/3300,0,1)**.55
+        values=np.arange(65536,dtype=float);f=np.clip((values-low)/max(1e-9,high-low),0,1)**.55
         lut=np.rint(np.column_stack((16+f*174,27+f*208,47+f*202))).astype(np.uint8)
         lut[full_scale:]=saturated_rgb()
         self.image_item.setLookupTable(lut)
-        self._full_scale = full_scale
+        self._full_scale = full_scale; self._lookup_key = key
+    @staticmethod
+    def auto_display_range(image):
+        '''Contrast that shows a frame: its 1st to 99.5th percentile (a few saturated pixels do not set it).'''
+        values = np.asarray(image, dtype=float)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            return (55.0, 3355.0)
+        low, high = (float(v) for v in np.percentile(values, [1.0, 99.5]))
+        return (low, high) if high > low else (low, low + 1.0)
+    def set_display_range(self, low, high):
+        '''Counts drawn darkest and brightest (the colour scale's minimum and maximum).'''
+        self._display = (float(low), float(high))
+        self._set_lookup(self._full_scale or 65535)
+    def display_range(self):
+        return self._display
     def set_frame(self, image, full_scale=65535):
         self.set_empty('No frame' if image is None else '')
         if image is None:
@@ -2047,7 +2067,7 @@ class CalibrationProfilePlot(EditablePlot):
             self.pixelPicked.emit(index)
         except Exception:
             pass
-    def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None):
+    def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None, peaks=None):
         self.set_empty('No spectrum' if profile is None else '')
         for item in self._items:
             try:
@@ -2071,6 +2091,16 @@ class CalibrationProfilePlot(EditablePlot):
         item = self.plotItem.plot(x, values, antialias=True,pen=pg.mkPen(colors['data'], width=1.6))
         self.tag_series(item, 'ccd')
         self._items.append(item)
+        if peaks:
+            # Found peaks (pixel positions): a marker just above each line top, whether or not a reference line is
+            # paired with it yet.
+            pixels = np.asarray(peaks, dtype=float)
+            px = np.interp(pixels, np.arange(len(values), dtype=float), x)
+            top = np.interp(pixels, np.arange(len(values), dtype=float), values)
+            span = float(np.nanmax(values) - np.nanmin(values)) or 1.0
+            marks = self.plotItem.plot(px, top + .04 * span, pen=None, symbol='t', symbolSize=8,
+                                       symbolBrush=colors['amber'], symbolPen=None)
+            self.tag_series(marks, 'peaks'); self._items.append(marks)
         for index,reference in enumerate(references or []):
             try:
                 line = pg.InfiniteLine(pos=float(reference), angle=90, movable=False, pen=pg.mkPen(colors['amber'], width=1, style=Qt.DashLine))

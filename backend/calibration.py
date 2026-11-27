@@ -102,48 +102,92 @@ def make_frame(exposure_s: float, seed: int) -> np.ndarray:
     return np.rint(counts).astype(np.int32)
 
 
+# A calibration lamp's lines differ in strength by orders of magnitude, so a line is judged against the noise and by
+# how far it stands out from its surroundings, not as a fraction of the strongest one.
+PEAK_SIGMAS = 8.0          # prominence of a line, in noise standard deviations
+PEAK_MIN_FRACTION = 0.01   # ... and at least this fraction of the strongest line above the baseline
+PEAK_SEPARATION = 6.0      # pixels between two lines
+
+
+def _profile_statistics(profile: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """(profile with one-pixel spikes removed, baseline, noise sigma). A hot pixel or cosmic ray is one pixel wide and
+    is not a lamp line; a 3-point median removes it. The baseline is the 20th percentile (lines fill a small part of
+    the chip) and the noise comes from pixel-to-pixel differences, which slow features do not affect."""
+    values = np.asarray(profile, dtype=np.float64)
+    padded = np.concatenate(([values[0]], values, [values[-1]]))
+    smooth = np.median(np.stack((padded[:-2], padded[1:-1], padded[2:])), axis=0)
+    baseline = float(np.percentile(smooth, 20))
+    differences = np.diff(values)
+    noise = float(1.4826 * np.median(np.abs(differences - np.median(differences))) / math.sqrt(2.0)) if differences.size else 0.0
+    return smooth, baseline, noise
+
+
 def _find_peaks(profile: np.ndarray) -> list[float]:
-    if profile.size < 3:
+    values = np.asarray(profile, dtype=np.float64)
+    if values.size < 5 or not np.all(np.isfinite(values)):
         return []
-    maximum = float(np.max(profile))
-    if not math.isfinite(maximum) or maximum <= 0.0:
-        return []
-    baseline = float(np.median(profile))
-    amplitude = maximum - baseline
+    smooth, baseline, noise = _profile_statistics(values)
+    amplitude = float(np.max(smooth)) - baseline
     if not math.isfinite(amplitude) or amplitude <= 0.0:
         return []
-    threshold = baseline + 0.12 * amplitude
+    needed = max(PEAK_SIGMAS * noise, PEAK_MIN_FRACTION * amplitude)
 
     candidates: list[tuple[float, float]] = []
-    for index in range(1, profile.size - 1):
-        y0 = float(profile[index - 1])
-        y1 = float(profile[index])
-        y2 = float(profile[index + 1])
-        if y1 <= threshold:
+    for index in range(1, values.size - 1):
+        y1 = smooth[index]
+        # Local maximum of the despiked profile (the last pixel of a flat, e.g. saturated, top).
+        if y1 < smooth[index - 1] or y1 <= smooth[index + 1]:
             continue
-        if y1 < y0 or y1 <= y2:
+        # Prominence: height above the higher of the two lowest points between it and the next higher ground.
+        left = index
+        while left > 0 and smooth[left - 1] <= y1:
+            left -= 1
+        right = index
+        while right < values.size - 1 and smooth[right + 1] <= y1:
+            right += 1
+        prominence = y1 - max(float(np.min(smooth[left:index + 1])), float(np.min(smooth[index:right + 1])))
+        if prominence < needed:
             continue
-        denominator = y0 - 2.0 * y1 + y2
-        if abs(denominator) <= 1.0e-15:
-            delta = 0.0
+        # Sub-pixel centre from the measured counts: the despiked maximum can sit a pixel off the measured top, so
+        # take the highest measured pixel nearby (a spike there was already removed from the candidates) first.
+        lo, hi = max(1, index - 2), min(values.size - 2, index + 2)
+        index = lo + int(np.argmax(values[lo:hi + 1]))
+        top = float(values[index])
+        first = index
+        while first > 0 and values[first - 1] == top:
+            first -= 1
+        last = index
+        while last < values.size - 1 and values[last + 1] == top:
+            last += 1
+        if last > first:
+            centre = 0.5 * (first + last)  # flat (saturated) top: its middle
         else:
-            delta = 0.5 * (y0 - y2) / denominator
-        if not math.isfinite(delta):
-            delta = 0.0
-        delta = max(-0.5, min(0.5, delta))
-        candidates.append((float(index) + delta, y1))
+            # Least-squares parabola through 7 pixels: noise moves the highest pixel by one now and then, which
+            # throws a 3-point vertex off by up to a pixel on lines a few pixels wide.
+            width = min(3, index, values.size - 1 - index)
+            offsets = np.arange(-width, width + 1, dtype=np.float64)
+            curvature, slope, _ = np.polyfit(offsets, values[index - width:index + width + 1], 2)
+            delta = -slope / (2.0 * curvature) if curvature < 0 else 0.0
+            centre = float(index) + (max(-1.5, min(1.5, delta)) if math.isfinite(delta) else 0.0)
+        candidates.append((centre, prominence))
 
     selected: list[tuple[float, float]] = []
-    for pixel_position, height in sorted(
-        candidates, key=lambda item: item[1], reverse=True
-    ):
-        if all(
-            abs(pixel_position - selected_pixel) >= 6.0
-            for selected_pixel, _ in selected
-        ):
+    for pixel_position, height in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if all(abs(pixel_position - selected_pixel) >= PEAK_SEPARATION for selected_pixel, _ in selected):
             selected.append((pixel_position, height))
     selected.sort(key=lambda item: item[0])
     return [float(pixel_position) for pixel_position, _ in selected]
+
+
+def _peak_prominences(profile: np.ndarray, peaks: list[float]) -> list[float]:
+    """Height above the local baseline of each found peak, for ranking (strongest first when lines are fewer)."""
+    smooth, baseline, _ = _profile_statistics(profile)
+    out = []
+    for pixel in peaks:
+        index = int(round(pixel))
+        window = smooth[max(0, index - 25):index + 26]
+        out.append(float(smooth[index] - min(float(np.min(window)), float(np.percentile(smooth, 50)))))
+    return out
 
 
 def extract_profile(frame: np.ndarray, row_start: int, row_end: int) -> dict:
@@ -159,11 +203,17 @@ def extract_profile(frame: np.ndarray, row_start: int, row_end: int) -> dict:
         raise ValueError('extracted profile contains non-finite values')
     peaks = _find_peaks(profile)
     saturated_pixels = int(np.count_nonzero(roi >= _MAX_COUNTS))
+    _, baseline, noise = _profile_statistics(profile)
     return {
         'row_start': start,
         'row_end': end,
         'profile_counts': [float(value) for value in profile],
         'peaks_pixels': peaks,
+        'peak_prominences': _peak_prominences(profile, peaks),
+        # For a "no lines found" explanation: how far the profile rises above its baseline, against its noise.
+        'baseline_counts': baseline,
+        'noise_counts': noise,
+        'rise_counts': float(np.max(profile) - baseline),
         'saturated_pixels': saturated_pixels,
     }
 

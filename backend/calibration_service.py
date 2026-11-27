@@ -13,6 +13,7 @@ from .models import CalibrationRequest, SpectrographConfig
 from .errors import CommandError
 
 _LOCKS={}
+LIBRARY_SIZE=64
 _LOCKS_GUARD=Lock()
 
 
@@ -30,6 +31,52 @@ class CalibrationWorkbench:
         self.frame = None
         self.solutions = {}
         self.warning = None
+
+    @property
+    def library_path(self):
+        '''Every calibration installed, one per spectrometer, centre wavelength and grating (installed-calibration.json
+        holds only the one in use): returning to a setting brings its calibration back.'''
+        return self.path.with_name('calibration-library.json' if self.path.name == 'installed-calibration.json' else 'simulation-calibration-library.json')
+
+    def library_key(self, spectrograph):
+        # The slit does not move wavelengths on the CCD, so it is not part of the key.
+        return f"{self.instrument['driver']}|{self.instrument.get('model', '')}|{float(spectrograph['center_nm']):.4f}|{int(spectrograph['grating'])}"
+
+    def _read_library(self):
+        try:
+            payload = json.loads(self.library_path.read_text(encoding='utf-8'))
+            return payload['entries'] if payload.get('version') == 1 and isinstance(payload.get('entries'), dict) else {}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return {}
+
+    def remember(self, calibration, spectrograph):
+        '''Keep a copy of an installed calibration for its setting (newest per setting; at most LIBRARY_SIZE settings).'''
+        if not calibration or calibration.get('wavelengths_nm') is None:
+            return
+        with self.persistence_lock:
+            entries = self._read_library()
+            key = self.library_key(spectrograph)
+            previous = entries.get(key) or {}
+            same = (previous.get('calibration') or {}).get('calibration_id') == calibration.get('calibration_id')
+            entries[key] = dict(calibration=calibration, center_nm=float(spectrograph['center_nm']), grating=int(spectrograph['grating']),
+                                instrument=self.instrument, saved_utc=previous.get('saved_utc') if same and previous.get('saved_utc') else timestamp())
+            if len(entries) > LIBRARY_SIZE:
+                for old in sorted(entries, key=lambda k: entries[k].get('saved_utc') or '')[:len(entries) - LIBRARY_SIZE]:
+                    del entries[old]
+            self.directory.mkdir(parents=True, exist_ok=True)
+            temporary = self.library_path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(dict(version=1, entries=entries), ensure_ascii=False, allow_nan=False), encoding='utf-8')
+            os.replace(temporary, self.library_path)
+
+    def recall(self, spectrograph):
+        '''The calibration saved for this spectrometer, centre wavelength and grating, with when it was installed; or None.'''
+        entry = self._read_library().get(self.library_key(spectrograph))
+        try:
+            calibration = entry['calibration']
+            CalibrationRequest(**{k: calibration[k] for k in ('calibration_id', 'source', 'wavelengths_nm')})
+            return dict(calibration=deepcopy(calibration), saved_utc=entry.get('saved_utc'))
+        except (TypeError, KeyError, ValueError):
+            return None
 
     def set_mode(self,mode):
         self.path=self.directory/('installed-calibration.json' if mode=='hardware' else 'installed-simulation-calibration.json')
@@ -70,6 +117,8 @@ class CalibrationWorkbench:
             elif (calibration['calibration_id'],calibration['source'])!=(None,None):
                 CalibrationRequest(**{k:calibration[k] for k in ('calibration_id','source','wavelengths_nm')})
             self.warning=None
+            try:self.remember(calibration, spectrograph)  # one installed before the library existed
+            except (OSError, ValueError):pass
             return calibration
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.warning = f'Saved calibration was not restored: {exc}'
@@ -96,6 +145,10 @@ class CalibrationWorkbench:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+        try:
+            self.remember(calibration, spectrograph)
+        except (OSError, ValueError) as exc:
+            self.warning = f'Calibration installed, but not added to the saved calibrations: {exc}'
 
     def persist_response(self, response, spectrograph):
         '''Save the installed intensity response (or an empty one) with the settings it was made for.'''
@@ -157,8 +210,10 @@ class CalibrationWorkbench:
     def require_frame(self, frame_id, spectrograph):
         if self.frame is None or self.frame['header']['frame_id'] != frame_id:
             raise CommandError('Calibration frame expired; acquire or reload the current frame')
-        if self.frame['header']['spectrograph'] != spectrograph:
-            raise CommandError('Spectrograph settings changed; acquire a new calibration frame')
+        # The slit width does not move wavelengths on the CCD (the worker keeps the calibration for a slit-only change).
+        optics = lambda setting: {k: v for k, v in (setting or {}).items() if k != 'slit_um'}
+        if optics(self.frame['header']['spectrograph']) != optics(spectrograph):
+            raise CommandError('Centre wavelength or grating changed; acquire a new calibration frame')
         return deepcopy(self.frame)
 
     def extract(self, data, spectrograph):
