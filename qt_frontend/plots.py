@@ -2067,7 +2067,9 @@ class CalibrationProfilePlot(EditablePlot):
             self.pixelPicked.emit(index)
         except Exception:
             pass
-    def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None, peaks=None):
+    def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None, peaks=None, reference_spectrum=None):
+        '''reference_spectrum: (positions, intensities, sigma), in the units of the x axis: the lamp's reference lines
+        drawn as a spectrum (a Gaussian of width sigma per line), scaled to the measured one, under the CCD trace.'''
         self.set_empty('No spectrum' if profile is None else '')
         for item in self._items:
             try:
@@ -2088,6 +2090,26 @@ class CalibrationProfilePlot(EditablePlot):
         else:
             x = np.arange(len(values), dtype=float)
             self._x_values = x
+        if reference_spectrum is not None:
+            try:
+                positions, intensities, sigma = reference_spectrum
+                positions = np.asarray(positions, float); intensities = np.asarray(intensities, float)
+                if len(positions) and sigma > 0:
+                    grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 4 * len(values))
+                    synthetic = np.zeros_like(grid)
+                    for position, height in zip(positions, intensities):
+                        near = np.abs(grid - position) < 6 * sigma
+                        synthetic[near] += height * np.exp(-0.5 * ((grid[near] - position) / sigma) ** 2)
+                    if synthetic.max() > 0:
+                        base = float(np.nanpercentile(values, 20)); top = float(np.nanmax(values))
+                        curve = base + (top - base) * synthetic / synthetic.max()
+                        fill = QColor(colors['blue']); fill.setAlpha(46)
+                        ref = self.plotItem.plot(grid, curve, antialias=True, pen=pg.mkPen(colors['blue'], width=1.1),
+                                                 fillLevel=base, brush=pg.mkBrush(fill))
+                        ref.setZValue(-5)
+                        self.tag_series(ref, 'reference_spectrum'); self._items.append(ref)
+            except Exception:
+                pass
         item = self.plotItem.plot(x, values, antialias=True,pen=pg.mkPen(colors['data'], width=1.6))
         self.tag_series(item, 'ccd')
         self._items.append(item)

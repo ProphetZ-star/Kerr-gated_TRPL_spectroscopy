@@ -2073,6 +2073,7 @@ class MainWindow(QMainWindow):
         legend.add('CCD', key='ccd')
         legend.add('Found peaks', color='amber', key='peaks')
         legend.add('Reference lines', dashed=True, key='references')
+        legend.add('Reference spectrum', color='blue', key='reference_spectrum')
         self.cal_legend = legend
         panel.add_tool(legend)
         self.cal_axis = Segmented([('Pixel', 'pixel'), ('nm', 'wavelength')])
@@ -5469,7 +5470,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            rows = []
+            rows = []; intensities = {}
             with open(path, 'r', encoding='utf-8', newline='') as stream:
                 reader = csv.reader(stream)
                 for row in reader:
@@ -5484,6 +5485,11 @@ class MainWindow(QMainWindow):
                         continue
                     if math.isfinite(wavelength) and wavelength > 0:
                         rows.append(wavelength)
+                        try:  # optional relative intensity: only for drawing the reference spectrum
+                            value = float(row[1]) if len(row) > 1 and row[1].strip() else None
+                            intensities[wavelength] = value if value is not None and math.isfinite(value) and value > 0 else None
+                        except ValueError:
+                            intensities[wavelength] = None
             if not rows:
                 raise ValueError('No reference wavelengths were found')
             if len(rows)>100:raise ValueError('Import at most 100 reference lines')
@@ -5492,7 +5498,7 @@ class MainWindow(QMainWindow):
             rows.sort()
             self._cal_solution=None
             self.cal_fit_state.setText('Draft')
-            self._cal_lines = [{'enabled': True, 'pixel': None, 'wavelength_nm': float(value)} for value in rows]
+            self._cal_lines = [{'enabled': True, 'pixel': None, 'wavelength_nm': float(value), 'intensity': intensities.get(value)} for value in rows]
             self._reference_source = 'measured'
             self._reference_imported = True
             self._reference_name = Path(path).name
@@ -5685,16 +5691,48 @@ class MainWindow(QMainWindow):
                 x_values = np.asarray(solution.get('wavelengths_nm'), dtype=float)
                 refs = [float(line.get('wavelength_nm')) for line in self._cal_lines if line.get('enabled') and line.get('wavelength_nm') is not None]
                 self.cal_spectrum_axis.setText('nm')
-                self.cal_spectrum.set_profile(values, x_values, 'wavelength', refs, self._cal_peaks)
+                self.cal_spectrum.set_profile(values, x_values, 'wavelength', refs, self._cal_peaks, self._cal_reference_spectrum('wavelength'))
             else:
                 self.cal_spectrum_axis.setText('pixel')
                 refs = [float(line.get('pixel')) for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None]
-                self.cal_spectrum.set_profile(values, None, 'pixel', refs, self._cal_peaks)
+                self.cal_spectrum.set_profile(values, None, 'pixel', refs, self._cal_peaks, self._cal_reference_spectrum('pixel'))
         else:
             self.cal_spectrum.set_profile(None)
         self._update_deltas()
         self._update_cal_controls()
         self._update_calibration_state()
+    def _cal_reference_spectrum(self, axis_mode):
+        '''The imported reference lines as (positions, intensities, sigma) on the plot's x axis, or None. Placing them
+        needs the pixel -> wavelength mapping: the fitted solution, else the automatic pairing of Find peaks.'''
+        lines = [line for line in self._cal_lines or [] if line.get('wavelength_nm') is not None]
+        if not lines or not getattr(self, '_reference_imported', False):
+            return None
+        width = len(self._cal_profile or []) or 1024
+        pixels = np.arange(width, dtype=float)
+        solution = self._cal_solution
+        if solution and solution.get('wavelengths_nm') and len(solution['wavelengths_nm']) == width:
+            grid = np.asarray(solution['wavelengths_nm'], float)
+        else:
+            match = getattr(self, '_cal_match', None) or {}
+            if not match.get('pairs') or not match.get('coefficients'):
+                return None
+            grid = np.polyval(np.asarray(match['coefficients'], float), (pixels - 511.5) / 511.5)
+        order = np.argsort(grid); low, high = grid[order[0]], grid[order[-1]]
+        dispersion = abs(float(grid[-1] - grid[0])) / max(width - 1, 1)
+        known = [line.get('intensity') for line in lines]
+        # Without intensities every line is drawn the same height.
+        default = 1.0 if not any(known) else min(value for value in known if value)
+        positions, heights = [], []
+        for line in lines:
+            wavelength = float(line['wavelength_nm'])
+            if not low <= wavelength <= high:
+                continue
+            positions.append(wavelength if axis_mode == 'wavelength' else float(np.interp(wavelength, grid[order], pixels[order])))
+            heights.append(float(line.get('intensity') or default))
+        if not positions:
+            return None
+        sigma_px = 4.0  # the lamp lines measured here are ~9 px FWHM
+        return positions, heights, sigma_px * (dispersion if axis_mode == 'wavelength' else 1.0)
     def _update_cal_controls(self):
         if self._pages.get('calibration') is None:return
         snapshot = self._snapshot or {}
