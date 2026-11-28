@@ -5086,12 +5086,13 @@ class MainWindow(QMainWindow):
         standard wavelengths and may span far more than the chip; the centre wavelength set on the spectrograph
         anchors the search, the dispersion and its direction are found from the peaks. Pixels a previous pairing
         filled in are replaced; pixels typed or picked by hand are kept and the pairing must agree with them.
-        Lines that fall off the chip are hidden. Returns how many lines got a peak.'''
+        Once some lines pair, the reference lines no peak was paired with are hidden from the table. Returns how many
+        lines got a peak.'''
         self._cal_match = None
         if not self._cal_lines:
             return 0
         for line in self._cal_lines:
-            line['off_chip'] = False
+            line['unmatched'] = False
             if line.get('auto'):
                 line['pixel'] = None; line['auto'] = False
         free_lines = [line for line in self._cal_lines if line.get('enabled') and line.get('pixel') is None and line.get('wavelength_nm') is not None]
@@ -5151,14 +5152,12 @@ class MainWindow(QMainWindow):
             line = by_wavelength.get(round(wavelength, 6))
             if line is not None:
                 line['pixel'] = float(pixel); line['auto'] = True
-        chip = match.get('chip_nm')
-        if chip and match.get('pairs'):
-            # A line more than ~2 px beyond either end of the chip cannot be on this frame.
-            margin = 2 * abs(float(match.get('dispersion_nm_per_px') or 0))
-            low, high = min(chip) - margin, max(chip) + margin
+        if match.get('pairs'):
+            # Lines no found peak was paired with (off the chip, or too weak on this frame) are not shown. When nothing
+            # pairs, every line stays visible so a pixel can be typed or picked by hand.
             for line in free_lines:
-                if line.get('pixel') is None and not low <= float(line['wavelength_nm']) <= high:
-                    line['off_chip'] = True
+                if line.get('pixel') is None:
+                    line['unmatched'] = True
         self._repopulate_cal_table()
         return len(match.get('pairs') or [])
     def _cal_match_text(self):
@@ -5177,11 +5176,11 @@ class MainWindow(QMainWindow):
             why = ('several pairings fit about equally well' if match.get('reason') == 'ambiguous'
                    else 'the peaks could not be paired with the reference lines automatically')
             return f' · {why}: check the centre wavelength, or type the pixel of one or two lines you recognise and Find peaks again'
-        chip = match['chip_nm']; hidden = sum(1 for line in self._cal_lines if line.get('off_chip'))
+        chip = match['chip_nm']; hidden = sum(1 for line in self._cal_lines if line.get('unmatched'))
         typed = sum(1 for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None and not line.get('auto') and line.get('wavelength_nm') is not None)
         return (f" · {len(match['pairs'])} reference lines paired automatically" + (f' (plus {typed} typed)' if typed else '')
                 + f": chip ≈ {chip[0]:.1f}–{chip[1]:.1f} nm, {abs(match['dispersion_nm_per_px']):.4f} nm/px"
-                + (f'; {hidden} lines off the chip hidden' if hidden else ''))
+                + (f'; {hidden} unmatched lines hidden' if hidden else ''))
     def _cal_peaks_message(self, result, assigned):
         start, end = self._cal_rows_pair()
         peaks = len(self._cal_peaks)
@@ -5598,7 +5597,7 @@ class MainWindow(QMainWindow):
             self.cal_table.setCellWidget(row, 2, wavelength)
             delta.setTextAlignment(Qt.AlignCenter);self.cal_table.setItem(row, 3, delta)
             self.cal_table.setCellWidget(row, 4, remove)
-            self.cal_table.setRowHidden(row, bool(line.get('off_chip')))  # a reference line this frame cannot show
+            self.cal_table.setRowHidden(row, bool(line.get('unmatched')))  # a reference line no peak was paired with
             self._cal_row_widgets.append({'check': check, 'pixel': pixel, 'wavelength': wavelength, 'delta': delta, 'line': line})
         self.cal_table.blockSignals(False)
         self._cal_table_updating = False
@@ -5646,8 +5645,9 @@ class MainWindow(QMainWindow):
         self._update_deltas()
         self._update_cal_plots()
     def _update_line_count(self):
-        enabled = sum(1 for line in self._cal_lines if line.get('enabled'))
-        paired = sum(1 for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None)
+        shown = [line for line in self._cal_lines if not line.get('unmatched')]
+        enabled = sum(1 for line in shown if line.get('enabled'))
+        paired = sum(1 for line in shown if line.get('enabled') and line.get('pixel') is not None)
         self.cal_line_count.setText(f'{enabled} enabled lines' + (f' · {paired} paired' if paired < enabled else ''))
         self._update_cal_controls()
     def _update_deltas(self):
@@ -5676,9 +5676,10 @@ class MainWindow(QMainWindow):
         if not self._cal_lines:
             return
         line = self._cal_selected_line
-        if line is None or line not in self._cal_lines:
-            line = self._cal_lines[0]
-            self.cal_table.selectRow(0)
+        if line is None or line not in self._cal_lines or line.get('unmatched'):
+            row = next((index for index, item in enumerate(self._cal_lines) if not item.get('unmatched')), 0)
+            line = self._cal_lines[row]
+            self.cal_table.selectRow(row)
             self._cal_selected_line = line
         line['pixel'] = float(pixel); line['auto'] = False
         self._refresh_line_widgets()
