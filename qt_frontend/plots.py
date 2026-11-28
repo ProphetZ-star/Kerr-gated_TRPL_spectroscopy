@@ -2091,9 +2091,11 @@ class CalibrationProfilePlot(EditablePlot):
             self.pixelPicked.emit(index)
         except Exception:
             pass
-    def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None, peaks=None, reference_spectrum=None):
+    def set_profile(self, profile, x_values=None, axis_mode='pixel', references=None, peaks=None, reference_spectrum=None,
+                    faint_references=None):
         '''reference_spectrum: (positions, intensities, sigma), in the units of the x axis: the lamp's reference lines
-        drawn as a spectrum (a Gaussian of width sigma per line), scaled to the measured one, under the CCD trace.'''
+        drawn as a spectrum (a Gaussian of width sigma per line), scaled to the measured one, under the CCD trace.
+        faint_references (x-axis units): reference lines no peak is paired with, drawn dashed and faded without a label.'''
         self.set_empty('No spectrum' if profile is None else '')
         for item in self._items:
             try:
@@ -2139,7 +2141,7 @@ class CalibrationProfilePlot(EditablePlot):
         self._items.append(item)
         if peaks:
             # Found peaks (pixel positions): a marker just above each line top, whether or not a reference line is
-            # paired with it yet.
+            # paired with it.
             pixels = np.asarray(peaks, dtype=float)
             px = np.interp(pixels, np.arange(len(values), dtype=float), x)
             top = np.interp(pixels, np.arange(len(values), dtype=float), values)
@@ -2147,6 +2149,14 @@ class CalibrationProfilePlot(EditablePlot):
             marks = self.plotItem.plot(px, top + .04 * span, pen=None, symbol='t', symbolSize=8,
                                        symbolBrush=colors['amber'], symbolPen=None)
             self.tag_series(marks, 'peaks'); self._items.append(marks)
+        faded = QColor(colors['amber']); faded.setAlpha(90)
+        for reference in faint_references or []:
+            # A reference line no peak is paired with: the same dashed line as a paired one, faded and unlabelled.
+            try:
+                line = pg.InfiniteLine(pos=float(reference), angle=90, movable=False, pen=pg.mkPen(faded, width=1, style=Qt.DashLine))
+                line.setZValue(-4); self.plotItem.addItem(line); self.tag_series(line, 'references'); self._items.append(line)
+            except Exception:
+                pass
         for index,reference in enumerate(references or []):
             try:
                 line = pg.InfiniteLine(pos=float(reference), angle=90, movable=False, pen=pg.mkPen(colors['amber'], width=1, style=Qt.DashLine))

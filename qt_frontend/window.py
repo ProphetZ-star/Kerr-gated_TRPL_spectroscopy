@@ -5086,13 +5086,12 @@ class MainWindow(QMainWindow):
         standard wavelengths and may span far more than the chip; the centre wavelength set on the spectrograph
         anchors the search, the dispersion and its direction are found from the peaks. Pixels a previous pairing
         filled in are replaced; pixels typed or picked by hand are kept and the pairing must agree with them.
-        Once some lines pair, the reference lines no peak was paired with are hidden from the table. Returns how many
-        lines got a peak.'''
+        Imported reference lines no peak was paired with are not shown in the table (see _cal_line_hidden); the
+        spectrum draws them faint. Returns how many lines got a peak.'''
         self._cal_match = None
         if not self._cal_lines:
             return 0
         for line in self._cal_lines:
-            line['unmatched'] = False
             if line.get('auto'):
                 line['pixel'] = None; line['auto'] = False
         free_lines = [line for line in self._cal_lines if line.get('enabled') and line.get('pixel') is None and line.get('wavelength_nm') is not None]
@@ -5152,12 +5151,6 @@ class MainWindow(QMainWindow):
             line = by_wavelength.get(round(wavelength, 6))
             if line is not None:
                 line['pixel'] = float(pixel); line['auto'] = True
-        if match.get('pairs'):
-            # Lines no found peak was paired with (off the chip, or too weak on this frame) are not shown. When nothing
-            # pairs, every line stays visible so a pixel can be typed or picked by hand.
-            for line in free_lines:
-                if line.get('pixel') is None:
-                    line['unmatched'] = True
         self._repopulate_cal_table()
         return len(match.get('pairs') or [])
     def _cal_match_text(self):
@@ -5169,14 +5162,14 @@ class MainWindow(QMainWindow):
             if match.get('coverage') is not None:
                 covered, low, high = match['coverage']
                 return (f' · the reference list has only {covered} line(s) in the ≈{low:.0f}–{high:.0f} nm this frame should show: '
-                        'import reference wavelengths for this range, or type the pixel of lines you recognise')
+                        'import reference wavelengths for this range, or Use found peaks and type the wavelengths you recognise')
             if match.get('located_nm') is not None:
                 return (f" · the lines fit a centre wavelength near {match['located_nm']:.0f} nm, not the {match['set_nm']:g} nm set in "
                         "the software: set Center wavelength to the spectrometer's setting and acquire the frame again")
             why = ('several pairings fit about equally well' if match.get('reason') == 'ambiguous'
                    else 'the peaks could not be paired with the reference lines automatically')
-            return f' · {why}: check the centre wavelength, or type the pixel of one or two lines you recognise and Find peaks again'
-        chip = match['chip_nm']; hidden = sum(1 for line in self._cal_lines if line.get('unmatched'))
+            return f' · {why}: check the centre wavelength, or Use found peaks and type the wavelengths of lines you recognise'
+        chip = match['chip_nm']; hidden = sum(1 for line in self._cal_lines if self._cal_line_hidden(line))
         typed = sum(1 for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None and not line.get('auto') and line.get('wavelength_nm') is not None)
         return (f" · {len(match['pairs'])} reference lines paired automatically" + (f' (plus {typed} typed)' if typed else '')
                 + f": chip ≈ {chip[0]:.1f}–{chip[1]:.1f} nm, {abs(match['dispersion_nm_per_px']):.4f} nm/px"
@@ -5506,7 +5499,8 @@ class MainWindow(QMainWindow):
             rows.sort()
             self._cal_solution=None
             self.cal_fit_state.setText('Draft')
-            self._cal_lines = [{'enabled': True, 'pixel': None, 'wavelength_nm': float(value), 'intensity': intensities.get(value)} for value in rows]
+            self._cal_lines = [{'enabled': True, 'pixel': None, 'wavelength_nm': float(value), 'intensity': intensities.get(value), 'imported': True}
+                               for value in rows]
             self._reference_source = 'measured'
             self._reference_imported = True
             self._reference_name = Path(path).name
@@ -5559,6 +5553,11 @@ class MainWindow(QMainWindow):
             self._cal_lines.remove(line)
         self._repopulate_cal_table()
         self._update_cal_plots()
+    @staticmethod
+    def _cal_line_hidden(line):
+        '''An imported reference line with no peak paired with it is left out of the table (the spectrum draws it
+        faint); lines added or typed by hand always show.'''
+        return bool(line.get('imported')) and line.get('pixel') is None
     def _repopulate_cal_table(self):
         self._cal_table_updating = True
         self.cal_table.blockSignals(True)
@@ -5597,7 +5596,7 @@ class MainWindow(QMainWindow):
             self.cal_table.setCellWidget(row, 2, wavelength)
             delta.setTextAlignment(Qt.AlignCenter);self.cal_table.setItem(row, 3, delta)
             self.cal_table.setCellWidget(row, 4, remove)
-            self.cal_table.setRowHidden(row, bool(line.get('unmatched')))  # a reference line no peak was paired with
+            self.cal_table.setRowHidden(row, self._cal_line_hidden(line))
             self._cal_row_widgets.append({'check': check, 'pixel': pixel, 'wavelength': wavelength, 'delta': delta, 'line': line})
         self.cal_table.blockSignals(False)
         self._cal_table_updating = False
@@ -5617,6 +5616,7 @@ class MainWindow(QMainWindow):
             item['check'].blockSignals(False)
             item['pixel'].blockSignals(False)
             item['wavelength'].blockSignals(False)
+            self.cal_table.setRowHidden(row, self._cal_line_hidden(line))
         self._cal_table_updating = False
         self._update_deltas()
         self._update_line_count()
@@ -5645,10 +5645,12 @@ class MainWindow(QMainWindow):
         self._update_deltas()
         self._update_cal_plots()
     def _update_line_count(self):
-        shown = [line for line in self._cal_lines if not line.get('unmatched')]
+        shown = [line for line in self._cal_lines if not self._cal_line_hidden(line)]
         enabled = sum(1 for line in shown if line.get('enabled'))
         paired = sum(1 for line in shown if line.get('enabled') and line.get('pixel') is not None)
-        self.cal_line_count.setText(f'{enabled} enabled lines' + (f' · {paired} paired' if paired < enabled else ''))
+        hidden = len(self._cal_lines) - len(shown)
+        self.cal_line_count.setText(f'{enabled} enabled lines' + (f' · {paired} paired' if paired < enabled else '')
+                                    + (f' · {hidden} unpaired hidden' if hidden else ''))
         self._update_cal_controls()
     def _update_deltas(self):
         solution = self._cal_solution
@@ -5676,8 +5678,10 @@ class MainWindow(QMainWindow):
         if not self._cal_lines:
             return
         line = self._cal_selected_line
-        if line is None or line not in self._cal_lines or line.get('unmatched'):
-            row = next((index for index, item in enumerate(self._cal_lines) if not item.get('unmatched')), 0)
+        if line is None or line not in self._cal_lines or self._cal_line_hidden(line):
+            row = next((index for index, item in enumerate(self._cal_lines) if not self._cal_line_hidden(item)), None)
+            if row is None:
+                self.cal_feedback.setText('No line in the table to give this pixel: Add a line, or Use found peaks'); return
             line = self._cal_lines[row]
             self.cal_table.selectRow(row)
             self._cal_selected_line = line
@@ -5697,36 +5701,54 @@ class MainWindow(QMainWindow):
             self.cal_metrics.set_values('-', '-', '-')
         if self._cal_profile:
             values = np.asarray(self._cal_profile, dtype=float)
-            if axis_mode == 'wavelength' and solution and solution.get('wavelengths_nm') and len(solution.get('wavelengths_nm')) == len(values):
-                x_values = np.asarray(solution.get('wavelengths_nm'), dtype=float)
-                refs = [float(line.get('wavelength_nm')) for line in self._cal_lines if line.get('enabled') and line.get('wavelength_nm') is not None]
-                self.cal_spectrum_axis.setText('nm')
-                self.cal_spectrum.set_profile(values, x_values, 'wavelength', refs, self._cal_peaks, self._cal_reference_spectrum('wavelength'))
+            wavelength_axis = (axis_mode == 'wavelength' and solution and solution.get('wavelengths_nm')
+                               and len(solution.get('wavelengths_nm')) == len(values))
+            mode = 'wavelength' if wavelength_axis else 'pixel'
+            enabled = [line for line in self._cal_lines if line.get('enabled')]
+            paired = [line for line in enabled if line.get('pixel') is not None]
+            if wavelength_axis:
+                refs = [float(line['wavelength_nm']) for line in paired if line.get('wavelength_nm') is not None]
             else:
-                self.cal_spectrum_axis.setText('pixel')
-                refs = [float(line.get('pixel')) for line in self._cal_lines if line.get('enabled') and line.get('pixel') is not None]
-                self.cal_spectrum.set_profile(values, None, 'pixel', refs, self._cal_peaks, self._cal_reference_spectrum('pixel'))
+                refs = [float(line['pixel']) for line in paired]
+            # Reference lines on this frame no peak is paired with: drawn faded.
+            faint = []
+            grid = self._cal_pixel_grid()
+            if grid is not None:
+                order = np.argsort(grid); low, high = grid[order[0]], grid[order[-1]]
+                pixels = np.arange(len(grid), dtype=float)
+                for line in enabled:
+                    wavelength = line.get('wavelength_nm')
+                    if line.get('pixel') is None and wavelength is not None and low <= float(wavelength) <= high:
+                        faint.append(float(wavelength) if wavelength_axis else float(np.interp(float(wavelength), grid[order], pixels[order])))
+            self.cal_spectrum_axis.setText('nm' if wavelength_axis else 'pixel')
+            self.cal_spectrum.set_profile(values, np.asarray(solution['wavelengths_nm'], dtype=float) if wavelength_axis else None, mode,
+                                          refs, self._cal_peaks, self._cal_reference_spectrum(mode), faint_references=faint)
         else:
             self.cal_spectrum.set_profile(None)
         self._update_deltas()
         self._update_cal_controls()
         self._update_calibration_state()
+    def _cal_pixel_grid(self):
+        '''Wavelength of each pixel of the profile: the fitted solution, else the automatic pairing of Find peaks;
+        None when neither is there.'''
+        width = len(self._cal_profile or []) or 1024
+        solution = self._cal_solution
+        if solution and solution.get('wavelengths_nm') and len(solution['wavelengths_nm']) == width:
+            return np.asarray(solution['wavelengths_nm'], float)
+        match = getattr(self, '_cal_match', None) or {}
+        if not match.get('pairs') or not match.get('coefficients'):
+            return None
+        return np.polyval(np.asarray(match['coefficients'], float), (np.arange(width, dtype=float) - 511.5) / 511.5)
     def _cal_reference_spectrum(self, axis_mode):
         '''The imported reference lines as (positions, intensities, sigma) on the plot's x axis, or None. Placing them
         needs the pixel -> wavelength mapping: the fitted solution, else the automatic pairing of Find peaks.'''
         lines = [line for line in self._cal_lines or [] if line.get('wavelength_nm') is not None]
         if not lines or not getattr(self, '_reference_imported', False):
             return None
-        width = len(self._cal_profile or []) or 1024
-        pixels = np.arange(width, dtype=float)
-        solution = self._cal_solution
-        if solution and solution.get('wavelengths_nm') and len(solution['wavelengths_nm']) == width:
-            grid = np.asarray(solution['wavelengths_nm'], float)
-        else:
-            match = getattr(self, '_cal_match', None) or {}
-            if not match.get('pairs') or not match.get('coefficients'):
-                return None
-            grid = np.polyval(np.asarray(match['coefficients'], float), (pixels - 511.5) / 511.5)
+        grid = self._cal_pixel_grid()
+        if grid is None:
+            return None
+        width = len(grid); pixels = np.arange(width, dtype=float)
         order = np.argsort(grid); low, high = grid[order[0]], grid[order[-1]]
         dispersion = abs(float(grid[-1] - grid[0])) / max(width - 1, 1)
         known = [line.get('intensity') for line in lines]
